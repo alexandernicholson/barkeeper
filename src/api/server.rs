@@ -115,7 +115,7 @@ impl BarkeepServer {
         let (apply_tx, apply_rx) = mpsc::channel(256);
 
         // Spawn the state machine apply loop.
-        spawn_state_machine(store.clone(), apply_rx).await;
+        spawn_state_machine(apply_rx).await;
 
         // Create the Rebar registry and peer PID map for the Raft actor.
         let registry = Arc::new(Mutex::new(Registry::new()));

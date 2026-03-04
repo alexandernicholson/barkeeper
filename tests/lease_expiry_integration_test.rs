@@ -39,7 +39,7 @@ async fn start_instance_with_lease_expiry() -> (SocketAddr, KvStoreActorHandle, 
     let store = spawn_kv_store_actor(&kv_runtime, kv_store).await;
 
     let (apply_tx, apply_rx) = mpsc::channel(256);
-    spawn_state_machine(store.clone(), apply_rx).await;
+    spawn_state_machine(apply_rx).await;
     let raft_handle = spawn_raft_node(config, apply_tx).await;
 
     let lease_manager = Arc::new(LeaseManager::new());
