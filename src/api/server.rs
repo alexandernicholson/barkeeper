@@ -4,16 +4,19 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 use tonic::transport::Server;
 
+use crate::api::auth_service::AuthService;
 use crate::api::cluster_service::ClusterService;
 use crate::api::gateway;
 use crate::api::kv_service::KvService;
 use crate::api::lease_service::LeaseService;
 use crate::api::maintenance_service::MaintenanceService;
 use crate::api::watch_service::WatchService;
+use crate::auth::manager::AuthManager;
 use crate::cluster::manager::ClusterManager;
 use crate::kv::state_machine::spawn_state_machine;
 use crate::kv::store::KvStore;
 use crate::lease::manager::LeaseManager;
+use crate::proto::etcdserverpb::auth_server::AuthServer;
 use crate::proto::etcdserverpb::cluster_server::ClusterServer;
 use crate::proto::etcdserverpb::kv_server::KvServer;
 use crate::proto::etcdserverpb::lease_server::LeaseServer;
@@ -80,6 +83,10 @@ impl BarkeepServer {
         let cluster_service =
             ClusterService::new(Arc::clone(&cluster_manager), cluster_id, member_id);
 
+        // Create the Auth manager and gRPC service.
+        let auth_manager = Arc::new(AuthManager::new());
+        let auth_service = AuthService::new(Arc::clone(&auth_manager), cluster_id, member_id);
+
         // Create the Maintenance gRPC service.
         let maintenance_service =
             MaintenanceService::new(Arc::clone(&store), cluster_id, member_id);
@@ -114,6 +121,7 @@ impl BarkeepServer {
             .add_service(LeaseServer::new(lease_service))
             .add_service(ClusterServer::new(cluster_service))
             .add_service(MaintenanceServer::new(maintenance_service))
+            .add_service(AuthServer::new(auth_service))
             .serve(addr)
             .await?;
 

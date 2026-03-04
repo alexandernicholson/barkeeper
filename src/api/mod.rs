@@ -1,3 +1,4 @@
+pub mod auth_service;
 pub mod cluster_service;
 pub mod gateway;
 pub mod kv_service;
