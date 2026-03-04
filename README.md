@@ -98,30 +98,23 @@ ETCDCTL_API=3 etcdctl --endpoints=127.0.0.1:2379 get hello
 
 barkeeper is structured as a Rebar actor tree with supervised processes:
 
-```
-BarkeepSupervisor (OneForAll)
-├── RaftProcess      — consensus engine (all writes go through Raft)
-├── StoreProcess     — MVCC KV store
-├── WatchProcess     — change notification with revision replay
-├── LeaseProcess     — TTL management (Raft-proposed expiry)
-├── ClusterProcess   — membership
-└── AuthProcess      — RBAC with enforcement
+```mermaid
+graph TD
+    S["BarkeepSupervisor<br>(OneForAll)"]
+    S --> R["RaftProcess<br>consensus engine"]
+    S --> St["StoreProcess<br>MVCC KV store"]
+    S --> W["WatchProcess<br>change notification with revision replay"]
+    S --> L["LeaseProcess<br>TTL management (Raft-proposed expiry)"]
+    S --> C["ClusterProcess<br>membership"]
+    S --> A["AuthProcess<br>RBAC with enforcement"]
 ```
 
-```
-Client Request
-    |
-    v
-gRPC Service / HTTP Gateway
-    |
-    v
-RaftNode Actor  (leader election, log replication)
-    |
-    v
-StateMachine Actor  (applies committed entries)
-    |
-    v
-KvStore  (MVCC store backed by redb)
+```mermaid
+graph TD
+    Client["Client Request"] --> API["gRPC Service / HTTP Gateway"]
+    API --> Raft["RaftNode Actor<br>(leader election, log replication)"]
+    Raft --> SM["StateMachine Actor<br>(applies committed entries)"]
+    SM --> KV["KvStore<br>(MVCC store backed by redb)"]
 ```
 
 **Rebar supervision** -- the `BarkeepSupervisor` uses a OneForAll restart strategy, meaning if any child process crashes, all processes are restarted to maintain consistent state.
@@ -200,6 +193,7 @@ Byte fields (key, value) are base64-encoded in JSON, matching etcd's HTTP gatewa
 | Document | Description |
 |----------|-------------|
 | [System Architecture](docs/architecture.md) | Internal architecture, actor model, and data flow |
+| [Deployment Guide](docs/deployment.md) | Deployment, multi-node clustering, TLS, Docker, systemd |
 | [Developer Guide](docs/developer-guide.md) | Building, testing, and contributing |
 | [Extension Guide](docs/extending.md) | Adding new services and actors |
 | [etcd Compatibility Reference](docs/etcd-compatibility.md) | API parity tracking with etcd v3 |

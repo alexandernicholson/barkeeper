@@ -37,51 +37,44 @@ goroutines.
 Barkeeper uses Rebar's `OneForAll` supervision strategy. If any child process
 crashes, all siblings are restarted to maintain consistent state.
 
-```
-                    BarkeepSupervisor (OneForAll)
-                    max_restarts=5, max_seconds=30
-                               |
-          +--------------------+--------------------+
-          |                    |                    |
-    RaftProcess          StateMachine          (future)
-    consensus engine     apply loop
-          |                    |
-          v                    v
-    LogStore (redb)       KvStore (redb)
-    raft.redb             kv.redb
+```mermaid
+graph TD
+    S["BarkeepSupervisor (OneForAll)<br>max_restarts=5, max_seconds=30"]
+    S --> R["RaftProcess<br>consensus engine"]
+    S --> SM["StateMachine<br>apply loop"]
+    S --> F["(future)"]
+    R --> LS["LogStore (redb)<br>raft.redb"]
+    SM --> KV["KvStore (redb)<br>kv.redb"]
 ```
 
 **Current actor layout:**
 
-```
-BarkeepSupervisor (OneForAll, max_restarts=5/30s)<br>
-|<br>
-+-- RaftProcess          -- Raft consensus engine (tokio::spawn)<br>
-|   +-- RaftCore         -- pure Event->Action state machine<br>
-|   +-- LogStore         -- durable log (redb: raft.redb)<br>
-|<br>
-+-- StateMachine         -- applies committed entries to KvStore<br>
-|   +-- KvStore          -- MVCC store (redb: kv.redb)<br>
-|<br>
-+-- LeaseExpiryTimer     -- supervised Rebar child (ChildEntry, Permanent)<br>
-|                           checks for expired leases, deletes keys, notifies watchers<br>
-|<br>
-+-- WatchHub             -- fan-out change notifications (Arc<WatchHub>)<br>
-+-- LeaseManager         -- TTL tracking, expiry detection (Arc<LeaseManager>)<br>
-+-- ClusterManager       -- membership tracking (Arc<ClusterManager>)<br>
-+-- AuthManager          -- RBAC users/roles/permissions (Arc<AuthManager>)<br>
+```mermaid
+graph TD
+    S["BarkeepSupervisor (OneForAll)<br>max_restarts=5/30s"]
+    S --> R["RaftProcess<br>Raft consensus engine (tokio::spawn)"]
+    R --> RC["RaftCore<br>pure Event-&gt;Action state machine"]
+    R --> LS["LogStore<br>durable log (redb: raft.redb)"]
+    S --> SM["StateMachine<br>applies committed entries to KvStore"]
+    SM --> KV["KvStore<br>MVCC store (redb: kv.redb)"]
+    S --> LET["LeaseExpiryTimer<br>supervised Rebar child (ChildEntry, Permanent)<br>checks for expired leases, deletes keys, notifies watchers"]
+    S --> WH["WatchHub<br>fan-out change notifications"]
+    S --> LM["LeaseManager<br>TTL tracking, expiry detection"]
+    S --> CM["ClusterManager<br>membership tracking"]
+    S --> AM["AuthManager<br>RBAC users/roles/permissions"]
 ```
 
 **Planned actor layout (full Rebar processes):**
 
-```
-BarkeepSupervisor (OneForAll)<br>
-+-- RaftProcess          -- consensus engine<br>
-+-- StoreProcess         -- MVCC KV store<br>
-+-- WatchProcess         -- change notification<br>
-+-- LeaseProcess         -- TTL management (partially migrated: expiry timer supervised)<br>
-+-- ClusterProcess       -- membership<br>
-+-- AuthProcess          -- RBAC<br>
+```mermaid
+graph TD
+    S["BarkeepSupervisor (OneForAll)"]
+    S --> R["RaftProcess<br>consensus engine"]
+    S --> St["StoreProcess<br>MVCC KV store"]
+    S --> W["WatchProcess<br>change notification"]
+    S --> L["LeaseProcess<br>TTL management (partially migrated)"]
+    S --> C["ClusterProcess<br>membership"]
+    S --> A["AuthProcess<br>RBAC"]
 ```
 
 Actor command enums are already defined in `src/actors/commands.rs`:
@@ -97,41 +90,15 @@ The service layer serializes a `KvCommand`, proposes it through `RaftHandle`,
 waits for commit confirmation, then applies the mutation to the store and
 notifies watchers.
 
-```
-Client (etcdctl / HTTP)
-        |
-        v
-+------------------+
-| gRPC / HTTP      |
-| KvService.put()  |
-+------------------+
-        |
-        v
-+------------------+
-| RaftHandle       |  <-- propose(serialized KvCommand)
-| .propose(data)   |
-+------------------+
-        |
-        | single-node: commits immediately
-        | multi-node: replicates to followers, waits for quorum
-        v
-+------------------+
-| ClientProposal   |
-| Result::Success  |
-+------------------+
-        |
-        | service applies after commit confirmation
-        v
-+------------------+
-| KvStore.put()    |
-| (redb txn)       |
-+------------------+
-        |
-        +-------> WatchHub.notify()
-        |         fan-out to matching watchers
-        |
-        +-------> LeaseManager.attach_key()
-                  (if lease != 0)
+```mermaid
+graph TD
+    Client["Client<br>(etcdctl / HTTP)"]
+    Client --> Service["gRPC / HTTP<br>KvService.put()"]
+    Service --> Raft["RaftHandle.propose(data)<br>propose(serialized KvCommand)"]
+    Raft -->|"single-node: commits immediately<br>multi-node: replicates, waits for quorum"| Result["ClientProposalResult::Success"]
+    Result -->|"service applies after commit"| KV["KvStore.put()<br>(redb txn)"]
+    KV --> Watch["WatchHub.notify()<br>fan-out to matching watchers"]
+    KV --> Lease["LeaseManager.attach_key()<br>(if lease != 0)"]
 ```
 
 The state machine (`spawn_state_machine`) receives committed entries for
@@ -145,27 +112,12 @@ application after Raft commit to avoid double-apply.
 Reads are served directly from the KV store without going through Raft.
 This matches etcd's serializable read behaviour (the default for `Range`).
 
-```
-Client (etcdctl / HTTP)
-        |
-        v
-+------------------+
-| gRPC / HTTP      |
-| KvService.range()|
-+------------------+
-        |
-        v
-+------------------+
-| KvStore.range()  |  <-- read-only redb txn
-| (redb read txn)  |      supports revision parameter
-+------------------+
-        |
-        v
-    RangeResult {
-        kvs: Vec<KeyValue>,
-        count: i64,
-        more: bool,
-    }
+```mermaid
+graph TD
+    Client["Client<br>(etcdctl / HTTP)"]
+    Client --> Service["gRPC / HTTP<br>KvService.range()"]
+    Service --> KV["KvStore.range()<br>read-only redb txn<br>supports revision parameter"]
+    KV --> Result["RangeResult<br>kvs: Vec&lt;KeyValue&gt;<br>count: i64<br>more: bool"]
 ```
 
 Range queries support:
@@ -183,43 +135,25 @@ Range queries support:
 Leases are tracked in-memory by the `LeaseManager`. Each lease has a TTL
 (seconds) and a set of attached keys. The expiry check runs on a timer.
 
-```
-Timer tick (periodic)
-        |
-        v
-+------------------------+
-| LeaseManager           |
-| .check_expired()       |
-+------------------------+
-        |
-        | returns Vec<ExpiredLease>
-        | each: { lease_id, keys: Vec<Vec<u8>> }
-        v
-+------------------------+
-| For each expired lease |
-|   KvStore.delete_range |
-|   per attached key     |
-+------------------------+
-        |
-        v
-+------------------------+
-| WatchHub.notify()      |
-| event_type=1 (DELETE)  |
-| for each deleted key   |
-+------------------------+
+```mermaid
+graph TD
+    Timer["Timer tick (periodic)"]
+    Timer --> Check["LeaseManager<br>.check_expired()"]
+    Check -->|"returns Vec&lt;ExpiredLease&gt;<br>each: lease_id + keys"| Delete["For each expired lease<br>KvStore.delete_range<br>per attached key"]
+    Delete --> Notify["WatchHub.notify()<br>event_type=1 (DELETE)<br>for each deleted key"]
 ```
 
 **LeaseManager internals:**
 
-```
-LeaseEntry {<br>
-    id: i64,<br>
-    ttl: i64,              // granted TTL in seconds<br>
-    granted_at: Instant,   // reset on keepalive<br>
-    keys: Vec<Vec<u8>>,    // attached keys<br>
-}<br>
-<br>
-Expired when: granted_at.elapsed().as_secs() >= ttl<br>
+```rust
+LeaseEntry {
+    id: i64,
+    ttl: i64,              // granted TTL in seconds
+    granted_at: Instant,   // reset on keepalive
+    keys: Vec<Vec<u8>>,    // attached keys
+}
+
+// Expired when: granted_at.elapsed().as_secs() >= ttl
 ```
 
 Lease lifecycle:
@@ -239,10 +173,10 @@ keys in redb. Every mutation creates a new revision, preserving history.
 
 ### Compound Key Format
 
-```
-+--------- user key bytes ----------+--+------- 8 bytes --------+
-|          "my-key"                 |\0| revision (big-endian u64)|
-+-----------------------------------+--+-------------------------+
+```mermaid
+block-beta
+    columns 3
+    A["user key bytes<br>'my-key'"] B["\\0"] C["revision<br>(8 bytes, big-endian u64)"]
 ```
 
 - The `\x00` separator byte divides the user key from the revision
@@ -313,14 +247,10 @@ The Raft implementation follows a clean separation between the pure state
 machine (`RaftCore`) and the side-effecting actor shell. `RaftCore` contains
 zero async code and no I/O -- it takes `Event` values and returns `Vec<Action>`.
 
-```
-                +------------------+
-                |    RaftCore      |
-                |  (pure, no I/O)  |
-                |                  |
-  Event ------->|  fn step(Event)  |-------> Vec<Action>
-                |    -> Vec<Action>|
-                +------------------+
+```mermaid
+graph LR
+    E["Event"] --> Core["RaftCore<br>(pure, no I/O)<br>fn step(Event) -&gt; Vec&lt;Action&gt;"]
+    Core --> A["Vec&lt;Action&gt;"]
 ```
 
 **Events (inputs):**
@@ -349,25 +279,25 @@ zero async code and no I/O -- it takes `Event` values and returns `Vec<Action>`.
 
 ### Raft State
 
-```
-RaftState {<br>
-    node_id: u64,<br>
-    role: Follower | Candidate | Leader,<br>
-    persistent: {           // survives restart (redb)<br>
-        current_term: u64,<br>
-        voted_for: Option<u64>,<br>
-    },<br>
-    volatile: {             // all servers<br>
-        commit_index: u64,<br>
-        last_applied: u64,<br>
-    },<br>
-    leader_state: Option<{  // leader only<br>
-        next_index: HashMap<u64, u64>,<br>
-        match_index: HashMap<u64, u64>,<br>
-    }>,<br>
-    voters: HashSet<u64>,<br>
-    learners: HashSet<u64>,<br>
-}<br>
+```rust
+RaftState {
+    node_id: u64,
+    role: Follower | Candidate | Leader,
+    persistent: {           // survives restart (redb)
+        current_term: u64,
+        voted_for: Option<u64>,
+    },
+    volatile: {             // all servers
+        commit_index: u64,
+        last_applied: u64,
+    },
+    leader_state: Option<{  // leader only
+        next_index: HashMap<u64, u64>,
+        match_index: HashMap<u64, u64>,
+    }>,
+    voters: HashSet<u64>,
+    learners: HashSet<u64>,
+}
 ```
 
 ### Log Store
@@ -400,14 +330,15 @@ pub trait RaftTransport: Send + Sync {
 
 ### Raft Messages
 
-```
-RaftMessage<br>
-+-- AppendEntriesReq    (leader -> followers)<br>
-+-- AppendEntriesResp   (followers -> leader)<br>
-+-- RequestVoteReq      (candidate -> all)<br>
-+-- RequestVoteResp     (all -> candidate)<br>
-+-- InstallSnapshotReq  (leader -> lagging follower, placeholder)<br>
-+-- InstallSnapshotResp (follower -> leader, placeholder)<br>
+```mermaid
+graph TD
+    RM["RaftMessage"]
+    RM --> AEReq["AppendEntriesReq<br>(leader -&gt; followers)"]
+    RM --> AEResp["AppendEntriesResp<br>(followers -&gt; leader)"]
+    RM --> RVReq["RequestVoteReq<br>(candidate -&gt; all)"]
+    RM --> RVResp["RequestVoteResp<br>(all -&gt; candidate)"]
+    RM --> ISReq["InstallSnapshotReq<br>(leader -&gt; lagging follower)"]
+    RM --> ISResp["InstallSnapshotResp<br>(follower -&gt; leader)"]
 ```
 
 ### Single-Node Fast Path
@@ -554,31 +485,18 @@ Module declarations and protobuf includes via `tonic::include_proto!` for
 
 ## Data Flow Summary
 
-```
-                         +---------------------------+
-                         |       Client (etcdctl)    |
-                         +---------------------------+
-                            |                    |
-                       gRPC :2379          HTTP :2380
-                            |                    |
-                            v                    v
-                    +------------+        +------------+
-                    | tonic gRPC |        | axum HTTP  |
-                    | services   |        | gateway    |
-                    +------------+        +------------+
-                            \                  /
-                             \   shared Arc   /
-                              v              v
-          +----------+   +----------+   +-----------+
-          | WatchHub |<--| KvStore  |-->| LeaseManager|
-          +----------+   +----------+   +-----------+
-               |               |               |
-               |          redb (kv.redb)        |
-               |               |           in-memory
-               v               v
-          watchers        +----------+
-          (mpsc)          | RaftNode |
-                          +----------+
-                               |
-                          redb (raft.redb)
+```mermaid
+graph TD
+    Client["Client (etcdctl)"]
+    Client -->|"gRPC :2379"| GRPC["tonic gRPC<br>services"]
+    Client -->|"HTTP :2380"| HTTP["axum HTTP<br>gateway"]
+    GRPC -->|"shared Arc"| KV["KvStore"]
+    HTTP -->|"shared Arc"| KV
+    KV --> WH["WatchHub"]
+    KV --> LM["LeaseManager"]
+    WH --> W["watchers<br>(mpsc)"]
+    KV --> KVDB["redb (kv.redb)"]
+    KV --> Raft["RaftNode"]
+    Raft --> RDB["redb (raft.redb)"]
+    LM --> MEM["in-memory"]
 ```

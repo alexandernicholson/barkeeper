@@ -398,14 +398,13 @@ Each subsystem runs as its own async task communicating through typed
 `tokio::sync::mpsc` channels. Command enums in `actors/commands.rs` define
 the message vocabulary:
 
-```
-                                                       +-- RaftCmd -----> RaftProcess
-                                                       |
-  gRPC/HTTP request --> KvService/Gateway -->-----------+-- StoreCmd ---> StateMachine
-                                                       |
-                                                       +-- WatchCmd ---> WatchHub
-                                                       |
-                                                       +-- LeaseCmd ---> LeaseManager
+```mermaid
+graph LR
+    Req["gRPC/HTTP request"] --> Svc["KvService / Gateway"]
+    Svc --> RC["RaftCmd"] --> RP["RaftProcess"]
+    Svc --> SC["StoreCmd"] --> SM["StateMachine"]
+    Svc --> WC["WatchCmd"] --> WH["WatchHub"]
+    Svc --> LC["LeaseCmd"] --> LM["LeaseManager"]
 ```
 
 Each command enum carries a `oneshot::Sender` for the response, giving

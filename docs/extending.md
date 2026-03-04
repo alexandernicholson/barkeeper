@@ -222,18 +222,12 @@ async fn my_process_loop(cmd_rx: &mut mpsc::Receiver<MyCmd>) {
 
 The architecture for an actor process looks like this:
 
-```
-                       mpsc::channel(256)
-                      +-----------------+
-  Callers ----------->| cmd_tx | cmd_rx |-------> tokio::spawn loop
-  (services,          +-----------------+           |
-   other actors)            |                       v
-                            |              match on MyCmd variants
-                            |                       |
-                            |              oneshot::Sender::send()
-                            |                       |
-                            v                       v
-                      mpsc::Sender<MyCmd>    reply to caller
+```mermaid
+graph LR
+    Callers["Callers<br>(services, other actors)"] -->|"mpsc::channel(256)"| Chan["cmd_tx / cmd_rx"]
+    Chan --> Loop["tokio::spawn loop<br>match on MyCmd variants"]
+    Loop -->|"oneshot::Sender::send()"| Reply["reply to caller"]
+    Chan --> Sender["mpsc::Sender&lt;MyCmd&gt;"]
 ```
 
 Key conventions:
@@ -320,16 +314,17 @@ Raft core via `Event` variants (e.g., `Event::AppendEntries`,
 
 The data flow:
 
-```
-  Node A                              Node B
-  ------                              ------
-  RaftCore                            RaftCore
-    | Action::SendMessage               ^
-    v                                   |
-  RaftProcess                     RaftProcess
-    | transport.send(B, msg)        cmd_rx.recv()
-    v                                   ^
-  RaftTransport impl  --- network -->  inbound channel
+```mermaid
+graph LR
+    subgraph Node_A["Node A"]
+        CA["RaftCore"] -->|"Action::SendMessage"| PA["RaftProcess"]
+        PA -->|"transport.send(B, msg)"| TA["RaftTransport impl"]
+    end
+    subgraph Node_B["Node B"]
+        IB["inbound channel"] -->|"cmd_rx.recv()"| PB["RaftProcess"]
+        PB --> CB["RaftCore"]
+    end
+    TA -->|"network"| IB
 ```
 
 ### Production implementation: GrpcRaftTransport
