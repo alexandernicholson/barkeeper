@@ -4,12 +4,15 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 use tonic::transport::Server;
 
+use crate::api::cluster_service::ClusterService;
 use crate::api::kv_service::KvService;
 use crate::api::lease_service::LeaseService;
 use crate::api::watch_service::WatchService;
+use crate::cluster::manager::ClusterManager;
 use crate::kv::state_machine::spawn_state_machine;
 use crate::kv::store::KvStore;
 use crate::lease::manager::LeaseManager;
+use crate::proto::etcdserverpb::cluster_server::ClusterServer;
 use crate::proto::etcdserverpb::kv_server::KvServer;
 use crate::proto::etcdserverpb::lease_server::LeaseServer;
 use crate::proto::etcdserverpb::watch_server::WatchServer;
@@ -56,6 +59,19 @@ impl BarkeepServer {
         let lease_manager = Arc::new(LeaseManager::new());
         let lease_service = LeaseService::new(Arc::clone(&lease_manager), cluster_id, member_id);
 
+        // Create the Cluster manager and gRPC service.
+        let cluster_manager = Arc::new(ClusterManager::new(cluster_id));
+        cluster_manager
+            .add_initial_member(
+                member_id,
+                String::new(),
+                vec![format!("http://{}", addr)],
+                vec![format!("http://{}", addr)],
+            )
+            .await;
+        let cluster_service =
+            ClusterService::new(Arc::clone(&cluster_manager), cluster_id, member_id);
+
         tracing::info!(%addr, "starting gRPC server");
 
         // Start the tonic gRPC server.
@@ -63,6 +79,7 @@ impl BarkeepServer {
             .add_service(KvServer::new(kv_service))
             .add_service(WatchServer::new(watch_service))
             .add_service(LeaseServer::new(lease_service))
+            .add_service(ClusterServer::new(cluster_service))
             .serve(addr)
             .await?;
 
