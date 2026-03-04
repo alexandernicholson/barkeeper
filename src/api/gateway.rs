@@ -20,7 +20,7 @@ use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
 use serde::{Deserialize, Serialize, Serializer};
 
-use crate::auth::manager::AuthManager;
+use crate::auth::actor::AuthActorHandle;
 use crate::proto::etcdserverpb::{alarm_request::AlarmAction, AlarmMember, AlarmType};
 use crate::cluster::actor::ClusterActorHandle;
 use crate::kv::state_machine::KvCommand;
@@ -68,7 +68,7 @@ pub struct GatewayState {
     pub watch_hub: Arc<WatchHub>,
     pub lease_manager: Arc<LeaseManager>,
     pub cluster_manager: ClusterActorHandle,
-    pub auth_manager: Arc<AuthManager>,
+    pub auth_manager: AuthActorHandle,
     pub cluster_id: u64,
     pub member_id: u64,
     pub raft_term: Arc<AtomicU64>,
@@ -499,7 +499,7 @@ pub fn create_router(
     cluster_id: u64,
     member_id: u64,
     raft_term: Arc<AtomicU64>,
-    auth_manager: Arc<AuthManager>,
+    auth_manager: AuthActorHandle,
     alarms: Arc<Mutex<Vec<AlarmMember>>>,
 ) -> Router {
     let state = GatewayState {

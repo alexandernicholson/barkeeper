@@ -14,7 +14,7 @@ use serde_json::Value;
 use tokio::sync::mpsc;
 
 use barkeeper::api::gateway;
-use barkeeper::auth::manager::AuthManager;
+use barkeeper::auth::actor::spawn_auth_actor;
 use barkeeper::cluster::actor::spawn_cluster_actor;
 use barkeeper::kv::state_machine::spawn_state_machine;
 use barkeeper::kv::store::KvStore;
@@ -54,7 +54,8 @@ async fn start_test_instance() -> (SocketAddr, tempfile::TempDir) {
         .await;
 
     let watch_hub = Arc::new(WatchHub::with_store(Arc::clone(&store)));
-    let auth_manager = Arc::new(AuthManager::new());
+    let auth_runtime = rebar_core::runtime::Runtime::new(1);
+    let auth_manager = spawn_auth_actor(&auth_runtime).await;
 
     let app = gateway::create_router(
         raft_handle.clone(),
@@ -65,7 +66,7 @@ async fn start_test_instance() -> (SocketAddr, tempfile::TempDir) {
         1,
         1,
         Arc::clone(&raft_handle.current_term),
-        Arc::clone(&auth_manager),
+        auth_manager,
         Arc::new(std::sync::Mutex::new(vec![])),
     );
 

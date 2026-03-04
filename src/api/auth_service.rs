@@ -3,7 +3,8 @@ use std::sync::Arc;
 
 use tonic::{Request, Response, Status};
 
-use crate::auth::manager::{AuthManager, Permission};
+use crate::auth::actor::AuthActorHandle;
+use crate::auth::manager::Permission;
 use crate::proto::etcdserverpb::auth_server::Auth;
 use crate::proto::etcdserverpb::{
     AuthDisableRequest, AuthDisableResponse, AuthEnableRequest, AuthEnableResponse,
@@ -20,14 +21,14 @@ use crate::proto::etcdserverpb::{
 
 /// gRPC Auth service implementing the etcd Auth API.
 pub struct AuthService {
-    manager: Arc<AuthManager>,
+    manager: AuthActorHandle,
     cluster_id: u64,
     member_id: u64,
     raft_term: Arc<AtomicU64>,
 }
 
 impl AuthService {
-    pub fn new(manager: Arc<AuthManager>, cluster_id: u64, member_id: u64, raft_term: Arc<AtomicU64>) -> Self {
+    pub fn new(manager: AuthActorHandle, cluster_id: u64, member_id: u64, raft_term: Arc<AtomicU64>) -> Self {
         AuthService {
             manager,
             cluster_id,

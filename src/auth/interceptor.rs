@@ -5,23 +5,22 @@
 
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use http::{HeaderValue, Request, Response};
 use tonic::body::BoxBody;
 use tower::{Layer, Service};
 
-use super::manager::AuthManager;
+use super::actor::AuthActorHandle;
 
 /// Tower layer that wraps services with auth enforcement.
 #[derive(Clone)]
 pub struct GrpcAuthLayer {
-    auth_manager: Arc<AuthManager>,
+    auth_manager: AuthActorHandle,
 }
 
 impl GrpcAuthLayer {
-    pub fn new(auth_manager: Arc<AuthManager>) -> Self {
+    pub fn new(auth_manager: AuthActorHandle) -> Self {
         GrpcAuthLayer { auth_manager }
     }
 }
@@ -32,7 +31,7 @@ impl<S> Layer<S> for GrpcAuthLayer {
     fn layer(&self, inner: S) -> Self::Service {
         GrpcAuthService {
             inner,
-            auth_manager: Arc::clone(&self.auth_manager),
+            auth_manager: self.auth_manager.clone(),
         }
     }
 }
@@ -41,7 +40,7 @@ impl<S> Layer<S> for GrpcAuthLayer {
 #[derive(Clone)]
 pub struct GrpcAuthService<S> {
     inner: S,
-    auth_manager: Arc<AuthManager>,
+    auth_manager: AuthActorHandle,
 }
 
 type BoxFuture<T> = Pin<Box<dyn Future<Output = T> + Send>>;
@@ -65,7 +64,7 @@ where
         // Swap the clone so we keep the ready state.
         std::mem::swap(&mut self.inner, &mut inner);
 
-        let auth_manager = Arc::clone(&self.auth_manager);
+        let auth_manager = self.auth_manager.clone();
 
         Box::pin(async move {
             let path = req.uri().path().to_string();

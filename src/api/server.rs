@@ -24,8 +24,8 @@ use crate::api::kv_service::KvService;
 use crate::api::lease_service::LeaseService;
 use crate::api::maintenance_service::MaintenanceService;
 use crate::api::watch_service::WatchService;
+use crate::auth::actor::spawn_auth_actor;
 use crate::auth::interceptor::GrpcAuthLayer;
-use crate::auth::manager::AuthManager;
 use crate::cluster::actor::spawn_cluster_actor;
 use crate::cluster::swim_service::SwimService;
 use crate::config::ClusterConfig;
@@ -232,9 +232,10 @@ impl BarkeepServer {
         let cluster_service =
             ClusterService::new(cluster_manager.clone(), cluster_id, member_id, Arc::clone(&raft_term));
 
-        // Create the Auth manager and gRPC service.
-        let auth_manager = Arc::new(AuthManager::new());
-        let auth_service = AuthService::new(Arc::clone(&auth_manager), cluster_id, member_id, Arc::clone(&raft_term));
+        // Spawn the Auth actor on a standalone Rebar runtime and get a handle.
+        let auth_runtime = rebar_core::runtime::Runtime::new(config.node_id);
+        let auth_manager = spawn_auth_actor(&auth_runtime).await;
+        let auth_service = AuthService::new(auth_manager.clone(), cluster_id, member_id, Arc::clone(&raft_term));
 
         // Create the Maintenance gRPC service.
         let maintenance_service =
@@ -300,7 +301,7 @@ impl BarkeepServer {
             cluster_id,
             member_id,
             Arc::clone(&raft_term),
-            Arc::clone(&auth_manager),
+            auth_manager.clone(),
             alarms,
         );
 
@@ -323,7 +324,7 @@ impl BarkeepServer {
         tracing::info!(%addr, "starting gRPC server");
 
         // Build the tonic gRPC server with auth enforcement layer.
-        let auth_layer = GrpcAuthLayer::new(Arc::clone(&auth_manager));
+        let auth_layer = GrpcAuthLayer::new(auth_manager);
 
         let mut server = Server::builder();
 

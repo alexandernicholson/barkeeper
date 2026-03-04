@@ -64,6 +64,105 @@ pub enum LeaseCmd {
 
 pub use crate::lease::manager::ExpiredLease;
 
+use crate::auth::manager::{Permission, Role, User};
+
+/// Commands sent to the AuthActor.
+pub enum AuthCmd {
+    /// Enable authentication.
+    AuthEnable {
+        reply: oneshot::Sender<()>,
+    },
+    /// Disable authentication.
+    AuthDisable {
+        reply: oneshot::Sender<()>,
+    },
+    /// Check whether authentication is enabled.
+    IsEnabled {
+        reply: oneshot::Sender<bool>,
+    },
+    /// Authenticate a user by name and password.
+    Authenticate {
+        name: String,
+        password: String,
+        reply: oneshot::Sender<Option<String>>,
+    },
+    /// Validate a token. Returns the username if valid.
+    ValidateToken {
+        token: String,
+        reply: oneshot::Sender<Option<String>>,
+    },
+    /// Add a new user.
+    UserAdd {
+        name: String,
+        password: String,
+        reply: oneshot::Sender<bool>,
+    },
+    /// Delete a user by name.
+    UserDelete {
+        name: String,
+        reply: oneshot::Sender<bool>,
+    },
+    /// Get a user by name.
+    UserGet {
+        name: String,
+        reply: oneshot::Sender<Option<User>>,
+    },
+    /// List all user names (sorted).
+    UserList {
+        reply: oneshot::Sender<Vec<String>>,
+    },
+    /// Change a user's password.
+    UserChangePassword {
+        name: String,
+        password: String,
+        reply: oneshot::Sender<bool>,
+    },
+    /// Grant a role to a user.
+    UserGrantRole {
+        name: String,
+        role: String,
+        reply: oneshot::Sender<bool>,
+    },
+    /// Revoke a role from a user.
+    UserRevokeRole {
+        name: String,
+        role: String,
+        reply: oneshot::Sender<bool>,
+    },
+    /// Add a new role.
+    RoleAdd {
+        name: String,
+        reply: oneshot::Sender<bool>,
+    },
+    /// Delete a role by name.
+    RoleDelete {
+        name: String,
+        reply: oneshot::Sender<bool>,
+    },
+    /// Get a role by name.
+    RoleGet {
+        name: String,
+        reply: oneshot::Sender<Option<Role>>,
+    },
+    /// List all role names (sorted).
+    RoleList {
+        reply: oneshot::Sender<Vec<String>>,
+    },
+    /// Grant a permission to a role.
+    RoleGrantPermission {
+        name: String,
+        permission: Permission,
+        reply: oneshot::Sender<bool>,
+    },
+    /// Revoke a permission from a role by matching key and range_end.
+    RoleRevokePermission {
+        name: String,
+        key: Vec<u8>,
+        range_end: Vec<u8>,
+        reply: oneshot::Sender<bool>,
+    },
+}
+
 /// Commands sent to the ClusterActor.
 pub enum ClusterCmd {
     /// Add the initial local member (bootstrap).
