@@ -1,9 +1,9 @@
 use barkeeper::api::server::BarkeepServer;
+use barkeeper::cluster::discovery;
 use barkeeper::config::ClusterConfig;
 use barkeeper::raft::node::RaftConfig;
 use barkeeper::tls::TlsConfig;
 use clap::Parser;
-use std::collections::HashMap;
 use std::net::SocketAddr;
 
 #[derive(Parser)]
@@ -75,28 +75,6 @@ struct Cli {
     listen_peer_urls: String,
 }
 
-/// Parse `--initial-cluster` value into a map of node_id -> peer URL.
-///
-/// Expected format: "1=http://10.0.0.1:2380,2=http://10.0.0.2:2380"
-fn parse_initial_cluster(raw: &str) -> Result<HashMap<u64, String>, String> {
-    let mut peers = HashMap::new();
-    for entry in raw.split(',') {
-        let entry = entry.trim();
-        if entry.is_empty() {
-            continue;
-        }
-        let (id_str, url) = entry
-            .split_once('=')
-            .ok_or_else(|| format!("invalid cluster entry (expected id=url): '{}'", entry))?;
-        let id: u64 = id_str
-            .trim()
-            .parse()
-            .map_err(|e| format!("invalid node id '{}': {}", id_str, e))?;
-        peers.insert(id, url.trim().to_string());
-    }
-    Ok(peers)
-}
-
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt::init();
@@ -111,17 +89,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         self_signed_cert_validity: cli.self_signed_cert_validity,
     };
 
-    // Parse cluster configuration.
+    // Parse cluster configuration using the discovery module.
     let cluster_config = if let Some(ref raw) = cli.initial_cluster {
-        let peers = parse_initial_cluster(raw)?;
+        let (mode, peers) = discovery::parse_initial_cluster(raw, None, 2380)?;
         let peer_ids: Vec<u64> = peers.keys().filter(|id| **id != cli.node_id).copied().collect();
+
+        let listen_peer_addr: SocketAddr = cli.listen_peer_urls
+            .trim_start_matches("http://")
+            .trim_start_matches("https://")
+            .parse()
+            .expect("invalid --listen-peer-urls address");
+
         tracing::info!(
             node_id = cli.node_id,
             peer_count = peer_ids.len(),
-            listen_peer_url = %cli.listen_peer_urls,
+            %listen_peer_addr,
             "multi-node cluster mode"
         );
-        // Set Raft peers from the cluster config (excluding self).
+
         let config = RaftConfig {
             node_id: cli.node_id,
             data_dir: cli.data_dir,
@@ -131,8 +116,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         (
             config,
             ClusterConfig {
+                mode: Some(mode),
                 peers,
-                listen_peer_url: cli.listen_peer_urls,
+                listen_peer_addr: Some(listen_peer_addr),
+                raw_initial_cluster: Some(raw.clone()),
                 initial_cluster_state: cli.initial_cluster_state,
             },
         )

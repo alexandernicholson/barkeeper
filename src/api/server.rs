@@ -6,9 +6,12 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 use tonic::transport::Server;
 
+use rebar::DistributedRuntime;
+use rebar_cluster::connection::manager::{ConnectionManager, TransportConnector};
 use rebar_cluster::registry::orset::Registry;
+use rebar_cluster::swim::SwimConfig;
+use rebar_cluster::transport::{TransportConnection, TransportError};
 use rebar_core::process::{ExitReason, ProcessId};
-use rebar_core::runtime::Runtime;
 use rebar_core::supervisor::engine::{start_supervisor, ChildEntry};
 use rebar_core::supervisor::spec::{ChildSpec, RestartStrategy, RestartType, SupervisorSpec};
 
@@ -22,6 +25,7 @@ use crate::api::watch_service::WatchService;
 use crate::auth::interceptor::GrpcAuthLayer;
 use crate::auth::manager::AuthManager;
 use crate::cluster::manager::ClusterManager;
+use crate::cluster::swim_service::SwimService;
 use crate::config::ClusterConfig;
 use crate::kv::state_machine::spawn_state_machine;
 use crate::kv::store::KvStore;
@@ -32,10 +36,27 @@ use crate::proto::etcdserverpb::kv_server::KvServer;
 use crate::proto::etcdserverpb::lease_server::LeaseServer;
 use crate::proto::etcdserverpb::maintenance_server::MaintenanceServer;
 use crate::proto::etcdserverpb::watch_server::WatchServer;
-use crate::raft::grpc_transport::RaftTransportServer;
 use crate::raft::node::{spawn_raft_node_rebar, RaftConfig};
 use crate::tls::TlsConfig;
 use crate::watch::hub::WatchHub;
+
+/// TCP connector for the ConnectionManager.
+///
+/// Wraps `rebar_cluster::transport::tcp::TcpTransport` to implement the
+/// `TransportConnector` trait required by `ConnectionManager`.
+struct TcpConnector;
+
+#[async_trait::async_trait]
+impl TransportConnector for TcpConnector {
+    async fn connect(
+        &self,
+        addr: SocketAddr,
+    ) -> Result<Box<dyn TransportConnection>, TransportError> {
+        let transport = rebar_cluster::transport::TcpTransport::new();
+        let conn = transport.connect(addr).await?;
+        Ok(Box::new(conn))
+    }
+}
 
 /// The top-level barkeeper gRPC server.
 pub struct BarkeepServer;
@@ -45,9 +66,9 @@ impl BarkeepServer {
     ///
     /// This creates the data directory, opens the KV store, spawns the Raft
     /// node and state machine, and starts the tonic gRPC server. When
-    /// `cluster_config` specifies peers, a gRPC-based Raft transport is used
-    /// for inter-node communication and a peer listener is started on
-    /// `listen_peer_url`.
+    /// `cluster_config` specifies peers, TCP transport is used for inter-node
+    /// communication via the DistributedRuntime and SWIM is bootstrapped for
+    /// cluster membership.
     pub async fn start(
         config: RaftConfig,
         addr: SocketAddr,
@@ -61,14 +82,25 @@ impl BarkeepServer {
         // Open the shared KV store.
         let store = Arc::new(KvStore::open(format!("{}/kv.redb", config.data_dir))?);
 
-        // Initialize the Rebar runtime and supervisor.
-        let runtime = Arc::new(Runtime::new(config.node_id));
+        // Initialize the DistributedRuntime with TCP transport.
+        let connector = Box::new(TcpConnector);
+        let cm = ConnectionManager::new(connector);
+        let mut distributed_runtime = DistributedRuntime::new(config.node_id, cm);
+
+        // Get a reference to the runtime for spawning before the
+        // DistributedRuntime is moved into the outbound processing task.
+        let runtime = distributed_runtime.runtime();
 
         let supervisor_spec = SupervisorSpec::new(RestartStrategy::OneForAll)
             .max_restarts(5)
             .max_seconds(30);
 
-        let supervisor = start_supervisor(runtime.clone(), supervisor_spec, vec![]).await;
+        let supervisor = start_supervisor(
+            Arc::new(rebar_core::runtime::Runtime::new(config.node_id)),
+            supervisor_spec,
+            vec![],
+        )
+        .await;
 
         tracing::info!("started Rebar supervisor");
 
@@ -87,39 +119,57 @@ impl BarkeepServer {
         let raft_handle = spawn_raft_node_rebar(
             config.clone(),
             apply_tx,
-            &runtime,
+            runtime,
             Arc::clone(&registry),
             Arc::clone(&peers),
         )
         .await;
         let raft_term = Arc::clone(&raft_handle.current_term);
 
-        // If clustered, start the peer gRPC listener for inbound Raft messages.
+        // If clustered, connect to peers and start SWIM.
         if cluster_config.is_clustered() {
-            let peer_addr: SocketAddr = cluster_config
-                .listen_peer_url
-                .trim_start_matches("http://")
-                .trim_start_matches("https://")
-                .parse()
-                .expect("invalid --listen-peer-urls address");
+            let cm = distributed_runtime.connection_manager_mut();
+            for (node_id, addr) in &cluster_config.peers {
+                if *node_id != config.node_id {
+                    if let Err(e) = cm.on_node_discovered(*node_id, *addr).await {
+                        tracing::warn!(
+                            node_id = node_id,
+                            %addr,
+                            error = %e,
+                            "failed to connect to peer on startup"
+                        );
+                    }
+                }
+            }
 
-            let raft_transport_server =
-                RaftTransportServer::new(raft_handle.inbound_tx.clone());
+            // Initialize SWIM service for membership discovery.
+            let swim_config = SwimConfig::default();
+            let mut swim = SwimService::new(config.node_id, swim_config);
+            for (node_id, addr) in &cluster_config.peers {
+                if *node_id != config.node_id {
+                    swim.add_seed(*node_id, *addr);
+                }
+            }
 
-            tracing::info!(%peer_addr, "starting peer gRPC listener for Raft transport");
+            if let Some(peer_addr) = cluster_config.listen_peer_addr {
+                tracing::info!(%peer_addr, "TCP peer transport configured");
+            }
 
-            tokio::spawn(async move {
-                Server::builder()
-                    .add_service(
-                        crate::proto::raftpb::raft_transport_server::RaftTransportServer::new(
-                            raft_transport_server,
-                        ),
-                    )
-                    .serve(peer_addr)
-                    .await
-                    .expect("peer gRPC server failed");
-            });
+            tracing::info!(
+                peer_count = cluster_config.peers.len().saturating_sub(1),
+                "SWIM membership initialized with seed peers"
+            );
         }
+
+        // Spawn the outbound message processing loop.
+        tokio::spawn(async move {
+            loop {
+                if !distributed_runtime.process_outbound().await {
+                    // No message was pending; yield to avoid busy-spinning.
+                    tokio::task::yield_now().await;
+                }
+            }
+        });
 
         // Create the Watch hub and gRPC service.
         let cluster_id = 1;
