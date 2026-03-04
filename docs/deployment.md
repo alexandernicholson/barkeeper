@@ -58,9 +58,12 @@ graph TD
         N2["Node 2<br>10.0.0.2:2379/2380"]
         N3["Node 3<br>10.0.0.3:2379/2380"]
     end
-    N1 <-->|"Raft gRPC<br>:2380"| N2
-    N2 <-->|"Raft gRPC<br>:2380"| N3
-    N1 <-->|"Raft gRPC<br>:2380"| N3
+    N1 <-->|"Rebar TCP<br>msgpack :2380"| N2
+    N2 <-->|"Rebar TCP<br>msgpack :2380"| N3
+    N1 <-->|"Rebar TCP<br>msgpack :2380"| N3
+    N1 <-.->|"SWIM gossip"| N2
+    N2 <-.->|"SWIM gossip"| N3
+    N1 <-.->|"SWIM gossip"| N3
     Client["Client"] -->|"gRPC :2379<br>HTTP :2380"| N1
     Client -->|"gRPC :2379<br>HTTP :2380"| N2
     Client -->|"gRPC :2379<br>HTTP :2380"| N3
@@ -154,8 +157,20 @@ graph TD
 | `--node-id` | Unique numeric ID for this node (must be unique across the cluster) |
 | `--name` | Human-readable name for this node |
 | `--listen-peer-urls` | URL to listen on for peer Raft traffic (default: `http://localhost:2380`) |
-| `--initial-cluster` | Comma-separated list of all cluster members: `ID=PEER_URL,...` |
+| `--initial-cluster` | Comma-separated list of all cluster members (`ID=PEER_URL,...`), or a bare hostname to trigger DNS SRV autodiscovery (e.g. `barkeeper.default.svc.cluster.local`) |
 | `--initial-cluster-state` | `new` for bootstrapping a fresh cluster, `existing` to join an existing cluster |
+
+#### DNS mode (Kubernetes)
+
+When `--initial-cluster` is a bare hostname with no `=` character, barkeeper
+switches to DNS SRV autodiscovery mode. It resolves `_peer._tcp.<hostname>`
+SRV records and uses the returned addresses to seed the SWIM membership ring.
+This is the recommended approach for Kubernetes StatefulSet deployments where
+pod IP addresses are assigned dynamically.
+
+```bash
+--initial-cluster "barkeeper.default.svc.cluster.local"
+```
 
 ### Adding a Node to an Existing Cluster
 
@@ -413,6 +428,124 @@ etcdctl --endpoints=127.0.0.1:2379 member list
 
 ---
 
+## Kubernetes
+
+barkeeper supports automatic cluster formation on Kubernetes using a headless
+Service and StatefulSet. The DNS autodiscovery mode eliminates the need to
+hardcode pod IPs in `--initial-cluster`.
+
+### Headless Service
+
+Create a headless Service (clusterIP: None) so that DNS resolves to individual
+pod IPs:
+
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: barkeeper
+  namespace: default
+spec:
+  clusterIP: None
+  selector:
+    app: barkeeper
+  ports:
+    - name: client
+      port: 2379
+      targetPort: 2379
+    - name: peer
+      port: 2380
+      targetPort: 2380
+```
+
+### StatefulSet
+
+```yaml
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: barkeeper
+  namespace: default
+spec:
+  serviceName: barkeeper
+  replicas: 3
+  selector:
+    matchLabels:
+      app: barkeeper
+  template:
+    metadata:
+      labels:
+        app: barkeeper
+    spec:
+      containers:
+        - name: barkeeper
+          image: barkeeper:latest
+          args:
+            - --name=$(POD_NAME)
+            - --node-id=$(ORDINAL)
+            - --listen-client-urls=0.0.0.0:2379
+            - --listen-peer-urls=http://0.0.0.0:2380
+            - --initial-cluster=barkeeper.default.svc.cluster.local
+            - --initial-cluster-state=new
+            - --data-dir=/data
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: ORDINAL
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.labels['apps.kubernetes.io/pod-index']
+          ports:
+            - containerPort: 2379
+              name: client
+            - containerPort: 2380
+              name: peer
+          volumeMounts:
+            - name: data
+              mountPath: /data
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: [ReadWriteOnce]
+        resources:
+          requests:
+            storage: 10Gi
+```
+
+### How DNS mode works
+
+1. Each pod starts with `--initial-cluster barkeeper.default.svc.cluster.local`.
+2. barkeeper detects the bare hostname (no `ID=URL` prefix) and performs a DNS
+   SRV lookup for `_peer._tcp.barkeeper.default.svc.cluster.local`.
+3. Kubernetes returns A/AAAA records for each running pod.
+4. barkeeper uses these addresses to seed the SWIM membership ring.
+5. SWIM gossip propagates cluster membership to all nodes; Raft configuration
+   follows as nodes become reachable.
+
+### Graceful scale-down with NodeDrain
+
+Before removing a pod (e.g. during a rolling update or scale-down), trigger
+the three-phase NodeDrain protocol:
+
+```bash
+# Initiate drain on the node being removed
+curl -s -X POST http://<pod-ip>:2380/v3/maintenance/drain -d '{}'
+```
+
+NodeDrain phases:
+
+1. **Leadership transfer** -- if the draining node is the Raft leader, it
+   steps down and waits for another node to win the election.
+2. **Configuration removal** -- the node proposes a Raft config change to
+   remove itself from the voter set; waits for quorum acknowledgment.
+3. **SWIM departure** -- broadcasts a Leave message to the SWIM ring and
+   closes all TCP connections cleanly.
+
+---
+
 ## Backup and Restore
 
 ### Snapshot
@@ -496,4 +629,5 @@ curl -s http://127.0.0.1:2380/v3/maintenance/defragment -d '{}' | jq .
 | Port | Protocol | Purpose |
 |------|----------|---------|
 | 2379 | gRPC | Client API (etcdctl, gRPC clients) |
-| 2380 | HTTP | HTTP/JSON gateway + peer Raft traffic |
+| 2380 | HTTP | HTTP/JSON gateway |
+| 2380 | TCP | Peer Raft traffic (Rebar TCP frames, msgpack) + SWIM gossip |

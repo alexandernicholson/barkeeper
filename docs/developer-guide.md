@@ -48,11 +48,14 @@ cd barkeeper
 cargo build --release
 ```
 
-The build step compiles four proto files (`proto/etcdserverpb/rpc.proto`,
-`proto/etcdserverpb/kv.proto`, `proto/authpb/auth.proto`,
-`proto/raftpb/raft_transport.proto`) via `tonic-build` in `build.rs`. The
-generated Rust code is placed in the `target/` directory and included at
-compile time through `tonic::include_proto!()` in `src/lib.rs`.
+The build step compiles three proto files (`proto/etcdserverpb/rpc.proto`,
+`proto/etcdserverpb/kv.proto`, `proto/authpb/auth.proto`) via `tonic-build`
+in `build.rs`. The generated Rust code is placed in the `target/` directory
+and included at compile time through `tonic::include_proto!()` in `src/lib.rs`.
+
+Inter-node Raft messaging uses msgpack serialization over Rebar TCP frames
+rather than a separate gRPC service, so there is no `raft_transport.proto`
+to compile.
 
 ---
 
@@ -76,7 +79,7 @@ By default the server listens on:
 | `--data-dir`           | `data.barkeeper`  | Directory for redb data files            |
 | `--node-id`            | `1`              | Raft node identifier                     |
 | `--listen-peer-urls`   | `http://localhost:2380` | URL for peer traffic              |
-| `--initial-cluster`    |                  | Comma-separated cluster members (`1=http://10.0.0.1:2380,...`) |
+| `--initial-cluster`    |                  | Comma-separated cluster members (`1=http://10.0.0.1:2380,...`), or a bare hostname for DNS SRV autodiscovery |
 | `--initial-cluster-state` | `new`         | `new` for fresh cluster, `existing` to join |
 | `--auto-tls`           | `false`          | Auto-generate self-signed certs for client connections |
 | `--cert-file`          |                  | Path to client server TLS cert file      |
@@ -271,9 +274,7 @@ barkeeper/
 |   |   |-- rpc.proto       #   KV, Watch, Lease, Cluster, Maintenance, Auth services
 |   |   |-- kv.proto        #   KeyValue and Event message types (mvccpb)
 |   |-- authpb/
-|   |   |-- auth.proto      #   User, Permission, Role message types
-|   |-- raftpb/
-|       |-- raft_transport.proto  # gRPC Raft transport service definition
+|       |-- auth.proto      #   User, Permission, Role message types
 |
 |-- src/
 |   |-- main.rs             # CLI entry point (clap argument parsing, TLS + cluster flags)
@@ -302,7 +303,7 @@ barkeeper/
 |   |   |-- messages.rs     #   Raft RPC message types (AppendEntries, RequestVote, InstallSnapshot)
 |   |   |-- log_store.rs    #   Durable Raft log backed by redb
 |   |   |-- transport.rs    #   RaftTransport trait + LocalTransport for in-process testing
-|   |   |-- grpc_transport.rs  # GrpcRaftTransport + RaftTransportServer for multi-node clusters
+|   |   |-- rebar_transport.rs  # RebarTcpTransport for multi-node clusters (msgpack over Rebar TCP frames)
 |   |   |-- snapshot.rs     #   Snapshot metadata types
 |   |
 |   |-- watch/              # Watch notification system
@@ -313,6 +314,8 @@ barkeeper/
 |   |
 |   |-- cluster/            # Cluster membership
 |   |   |-- manager.rs      #   In-memory cluster membership manager
+|   |   |-- swim.rs         #   SWIM MembershipList actor (gossip-based failure detection)
+|   |   |-- registry.rs     #   Registry actor (OR-Set CRDT distributed process name resolution)
 |   |
 |   |-- auth/               # Authentication and authorization
 |   |   |-- manager.rs      #   RBAC auth manager (bcrypt passwords, token validation)

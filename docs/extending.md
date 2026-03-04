@@ -295,8 +295,8 @@ pub enum RaftMessage {
 }
 ```
 
-Messages are serialized to JSON via `serde_json` and can be encoded into
-`rmpv::Value::Binary` for Rebar messaging using the provided
+Messages are serialized with msgpack and can be encoded into
+`rmpv::Value::Binary` for Rebar TCP frames using the provided
 `encode_raft_message()` / `decode_raft_message()` helpers in
 `src/raft/messages.rs`.
 
@@ -327,16 +327,17 @@ graph LR
     TA -->|"network"| IB
 ```
 
-### Production implementation: GrpcRaftTransport
+### Production implementation: RebarTcpTransport
 
-The `GrpcRaftTransport` in `src/raft/grpc_transport.rs` implements the
-`RaftTransport` trait using gRPC for multi-node clusters. It uses the
-`RaftTransport` service defined in `proto/raftpb/raft_transport.proto`.
+The `RebarTcpTransport` in `src/raft/rebar_transport.rs` implements the
+`RaftTransport` trait using Rebar's `DistributedRuntime` for multi-node
+clusters. Raft messages are msgpack-encoded and carried over Rebar TCP frames.
 
-The client side (`GrpcRaftTransport`) maps node IDs to gRPC endpoints and
-sends messages via the `SendMessage` RPC. The server side
-(`RaftTransportServer`) receives inbound messages and pushes them to the
-Raft node's inbound channel.
+The transport maps node IDs to Rebar actor addresses. When the Raft core emits
+an `Action::SendMessage { to, message }`, the transport encodes the message
+with `encode_raft_message()` and dispatches it via the Rebar runtime to the
+target node's `RaftProcess`. Inbound messages arrive through the Rebar message
+inbox and are fed into the Raft core as `Event` variants.
 
 The transport is configured via CLI flags:
 
@@ -344,6 +345,16 @@ The transport is configured via CLI flags:
 ./target/release/barkeeper \
   --node-id 1 \
   --initial-cluster "1=http://10.0.0.1:2380,2=http://10.0.0.2:2380" \
+  --listen-peer-urls "http://0.0.0.0:2380"
+```
+
+For Kubernetes deployments, use DNS autodiscovery instead of listing peers
+explicitly:
+
+```bash
+./target/release/barkeeper \
+  --node-id 1 \
+  --initial-cluster "barkeeper.default.svc.cluster.local" \
   --listen-peer-urls "http://0.0.0.0:2380"
 ```
 

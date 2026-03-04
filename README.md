@@ -9,7 +9,8 @@ barkeeper implements the etcd v3 API surface -- both gRPC and HTTP/JSON gateway 
 | Component | Status |
 |-----------|--------|
 | etcd v3 API | All KV, Watch, Lease, Cluster, Maintenance, Auth endpoints working |
-| Raft Consensus | All writes go through Raft; multi-node via gRPC transport |
+| Raft Consensus | All writes go through Raft; multi-node via Rebar TCP transport |
+| SWIM Membership | Cluster membership and failure detection via SWIM protocol |
 | TLS | Auto-TLS and manual certificate support |
 | Auth Enforcement | HTTP middleware + gRPC interceptor (bcrypt passwords) |
 | Watch Notifications | Working, with revision-based replay |
@@ -21,7 +22,7 @@ barkeeper implements the etcd v3 API surface -- both gRPC and HTTP/JSON gateway 
 - **etcd v3 gRPC API** -- KV (Range, Put, DeleteRange, Txn, Compact), Watch, Lease, Cluster, Maintenance, Auth services
 - **HTTP/JSON gateway** -- REST endpoints matching etcd's grpc-gateway (`/v3/kv/put`, `/v3/kv/range`, `/v3/kv/compaction`, etc.)
 - **Raft consensus on all writes** -- every KV mutation (put, delete, txn, compact) is proposed through Raft before being applied
-- **Multi-node clustering** -- gRPC-based `RaftTransport` with cluster bootstrap CLI for forming and joining clusters
+- **Multi-node clustering** -- Rebar `DistributedRuntime` with TCP transport for inter-node Raft messaging; SWIM protocol for cluster membership discovery and failure detection
 - **TLS support** -- auto-TLS (self-signed certificates generated at startup) and manual certificate configuration
 - **Auth enforcement** -- when auth is enabled, HTTP middleware and gRPC interceptors validate tokens; bcrypt password hashing
 - **MVCC key-value store** -- multi-version concurrency control with revision history and compaction
@@ -33,7 +34,11 @@ barkeeper implements the etcd v3 API surface -- both gRPC and HTTP/JSON gateway 
 - **Cluster membership** -- member list, add, remove, update, promote
 - **Auth (RBAC)** -- user/role/permission management with enforcement
 - **Snapshots** -- chunked streaming snapshot over gRPC and HTTP for backup/recovery
-- **Transport layer** -- gRPC-based Raft message transport for multi-node clusters
+- **Transport layer** -- Rebar TCP frames with msgpack serialization for multi-node Raft messaging
+- **SWIM cluster membership** -- gossip-based failure detection and member discovery via SWIM protocol
+- **DNS autodiscovery** -- Kubernetes StatefulSet support via DNS SRV resolution (bare hostname in `--initial-cluster` triggers DNS mode)
+- **NodeDrain** -- three-phase graceful shutdown protocol for safe node removal
+- **Registry** -- OR-Set CRDT for distributed process name resolution
 - **Pure Rust** -- no C dependencies; storage via redb, not boltdb
 
 ## Quick Start
@@ -107,19 +112,27 @@ graph TD
     S --> L["LeaseProcess<br>TTL management (Raft-proposed expiry)"]
     S --> C["ClusterProcess<br>membership"]
     S --> A["AuthProcess<br>RBAC with enforcement"]
+    S --> SWIM["SWIM MembershipList<br>cluster discovery and failure detection"]
+    S --> Reg["Registry<br>OR-Set CRDT process name resolution"]
 ```
 
 ```mermaid
 graph TD
     Client["Client Request"] --> API["gRPC Service / HTTP Gateway"]
     API --> Raft["RaftNode Actor<br>(leader election, log replication)"]
+    Raft -->|"msgpack over Rebar TCP frames"| Peers["Peer Nodes<br>(Rebar DistributedRuntime)"]
     Raft --> SM["StateMachine Actor<br>(applies committed entries)"]
     SM --> KV["KvStore<br>(MVCC store backed by redb)"]
+    SWIM["SWIM Protocol"] -->|"membership events"| Raft
 ```
 
 **Rebar supervision** -- the `BarkeepSupervisor` uses a OneForAll restart strategy, meaning if any child process crashes, all processes are restarted to maintain consistent state.
 
 **Raft consensus** is implemented from scratch as a Rebar actor. A `RaftCore` pure state machine processes events and produces actions (persist, append, apply, send messages). The `RaftNode` actor wraps it with timers, channels, and a transport layer.
+
+**SWIM membership** -- cluster membership discovery and failure detection use the SWIM gossip protocol. The `SWIM MembershipList` actor maintains a live view of cluster nodes and drives Raft reconfiguration when members join or leave. On Kubernetes, a bare hostname in `--initial-cluster` triggers DNS SRV resolution against the headless service to seed the SWIM ring.
+
+**Rebar DistributedRuntime** -- inter-node Raft messages travel over TCP using Rebar frames with msgpack serialization, replacing the previous gRPC transport layer. The `Registry` actor provides an OR-Set CRDT for distributed process name resolution across the cluster.
 
 **State machine** receives committed log entries from Raft and applies KvCommands (Put, DeleteRange, Txn, Compact) to the KvStore.
 
@@ -131,6 +144,88 @@ graph TD
 
 **Storage** uses [redb](https://github.com/cberner/redb), a pure-Rust embedded database with ACID transactions. No C dependencies (unlike boltdb/bbolt used by etcd).
 
+## Kubernetes Deployment
+
+barkeeper supports automatic cluster formation on Kubernetes via DNS autodiscovery. Pass a bare hostname (no `ID=URL` prefix) to `--initial-cluster` and barkeeper will perform DNS SRV lookups against a headless service to discover peers.
+
+### Headless Service
+
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: barkeeper
+  namespace: default
+spec:
+  clusterIP: None
+  selector:
+    app: barkeeper
+  ports:
+    - name: client
+      port: 2379
+    - name: peer
+      port: 2380
+```
+
+### StatefulSet
+
+```yaml
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: barkeeper
+  namespace: default
+spec:
+  serviceName: barkeeper
+  replicas: 3
+  selector:
+    matchLabels:
+      app: barkeeper
+  template:
+    metadata:
+      labels:
+        app: barkeeper
+    spec:
+      containers:
+        - name: barkeeper
+          image: barkeeper:latest
+          args:
+            - --name=$(POD_NAME)
+            - --node-id=$(ORDINAL)
+            - --listen-client-urls=0.0.0.0:2379
+            - --listen-peer-urls=http://0.0.0.0:2380
+            - --initial-cluster=barkeeper.default.svc.cluster.local
+            - --initial-cluster-state=new
+            - --data-dir=/data
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: ORDINAL
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.labels['apps.kubernetes.io/pod-index']
+          ports:
+            - containerPort: 2379
+              name: client
+            - containerPort: 2380
+              name: peer
+          volumeMounts:
+            - name: data
+              mountPath: /data
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: [ReadWriteOnce]
+        resources:
+          requests:
+            storage: 10Gi
+```
+
+When `--initial-cluster` is a bare hostname (`barkeeper.default.svc.cluster.local`), barkeeper resolves DNS SRV records for `_peer._tcp.<hostname>` to discover all StatefulSet pods and seeds the SWIM membership ring automatically.
+
 ## CLI Flags
 
 | Flag | Default | Description |
@@ -140,7 +235,7 @@ graph TD
 | `--listen-client-urls` | `127.0.0.1:2379` | gRPC listen address (HTTP gateway binds to port+1) |
 | `--node-id` | `1` | Raft node ID |
 | `--listen-peer-urls` | `http://localhost:2380` | URL to listen on for peer traffic |
-| `--initial-cluster` | | Comma-separated cluster members (`1=http://10.0.0.1:2380,2=http://10.0.0.2:2380`) |
+| `--initial-cluster` | | Comma-separated cluster members (`1=http://10.0.0.1:2380,2=http://10.0.0.2:2380`), or a bare hostname to trigger DNS SRV autodiscovery (e.g. `barkeeper.default.svc.cluster.local`) |
 | `--initial-cluster-state` | `new` | `new` for fresh cluster, `existing` to join |
 | `--auto-tls` | `false` | Auto-generate self-signed certs for client connections |
 | `--cert-file` | | Path to client server TLS cert file |

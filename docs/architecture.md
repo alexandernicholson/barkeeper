@@ -62,6 +62,8 @@ graph TD
     S --> LM["LeaseManager<br>TTL tracking, expiry detection"]
     S --> CM["ClusterManager<br>membership tracking"]
     S --> AM["AuthManager<br>RBAC users/roles/permissions"]
+    S --> SWIM["SWIM MembershipList<br>cluster discovery and failure detection"]
+    S --> Reg["Registry<br>OR-Set CRDT distributed process name resolution"]
 ```
 
 **Planned actor layout (full Rebar processes):**
@@ -80,6 +82,13 @@ graph TD
 Actor command enums are already defined in `src/actors/commands.rs`:
 `RaftCmd`, `StoreCmd`, `WatchCmd`, `LeaseCmd`. Each uses `oneshot::Sender`
 for request-response patterns.
+
+The `SWIM MembershipList` actor runs independently alongside the supervisor
+tree. It gossips with peer nodes to maintain a live cluster view and notifies
+the `RaftProcess` when membership changes (nodes joining or leaving). The
+`Registry` actor holds an OR-Set CRDT replicated across all nodes via the
+Rebar `DistributedRuntime`, providing eventually-consistent distributed
+process name resolution.
 
 ---
 
@@ -323,10 +332,35 @@ pub trait RaftTransport: Send + Sync {
 
 **Implementations:**
 
-| Transport            | Use Case                              |
-|----------------------|---------------------------------------|
-| `LocalTransport`     | In-process multi-node testing         |
-| `GrpcRaftTransport`  | Multi-node clusters over gRPC         |
+| Transport                    | Use Case                                           |
+|------------------------------|----------------------------------------------------|
+| `LocalTransport`             | In-process multi-node testing                      |
+| `RebarTcpTransport`          | Multi-node clusters via Rebar DistributedRuntime   |
+
+Inter-node Raft messages are serialized with msgpack and carried over Rebar
+TCP frames by the `RebarTcpTransport`. The Rebar `DistributedRuntime` manages
+the underlying TCP connections and multiplexes frames from different message
+types on the same connection. This replaces the previous gRPC-based transport.
+
+### SWIM Membership Flow
+
+Cluster membership is maintained by the SWIM protocol rather than static
+`--initial-cluster` peer lists (except during initial bootstrap):
+
+1. On startup, each node seeds its SWIM ring from `--initial-cluster` peer
+   addresses (or DNS SRV records when a bare hostname is supplied).
+2. The `SWIM MembershipList` actor begins gossiping with reachable peers,
+   exchanging membership state via periodic probe messages.
+3. When a new node joins or an existing node becomes unreachable, SWIM
+   propagates the change through the ring using a combination of direct
+   probes and indirect probes via random intermediaries.
+4. Membership change events (NodeJoined, NodeLeft, NodeSuspected) are
+   delivered to the `RaftProcess`, which proposes configuration changes
+   to the Raft log to keep consensus membership in sync.
+5. The `NodeDrain` three-phase graceful shutdown protocol coordinates safe
+   node removal: the draining node first transfers leadership (if leader),
+   then removes itself from the Raft configuration, then stops SWIM gossip
+   and closes TCP connections.
 
 ### Raft Messages
 
@@ -361,10 +395,11 @@ follower acknowledgment.
 | HTTP Gateway         | grpc-gateway            | axum (custom handler)               |
 | Serialization        | protobuf                | prost (protobuf) + serde_json       |
 | Async Runtime        | goroutine scheduler     | tokio                               |
-| Inter-node Transport | gRPC streaming           | GrpcRaftTransport (gRPC)            |
+| Inter-node Transport | gRPC streaming           | RebarTcpTransport (Rebar TCP frames, msgpack) |
+| Cluster Membership   | peer URL exchange        | SWIM protocol (gossip-based)        |
+| Cluster Discovery    | peer URL exchange        | `--initial-cluster` CLI flag or DNS SRV autodiscovery |
 | MVCC                 | Custom B-tree            | Compound keys in redb               |
 | TLS                  | Manual + auto            | Manual + auto-TLS (rcgen)           |
-| Cluster Discovery    | peer URL exchange        | `--initial-cluster` CLI flag        |
 
 ---
 
@@ -426,8 +461,9 @@ CLI entry point using clap. Parses `--name`, `--data-dir`,
   get_range, truncate_after, hard state persistence.
 - **`transport.rs`** -- `RaftTransport` trait and `LocalTransport`
   (in-process testing).
-- **`grpc_transport.rs`** -- `GrpcRaftTransport` (client) and
-  `RaftTransportServer` (server) for multi-node clusters over gRPC.
+- **`rebar_transport.rs`** -- `RebarTcpTransport` for multi-node clusters via
+  Rebar `DistributedRuntime`; Raft messages are msgpack-encoded and carried
+  over Rebar TCP frames.
 - **`snapshot.rs`** -- `SnapshotMeta` and `Snapshot` types for point-in-time
   state machine captures.
 
@@ -458,6 +494,12 @@ CLI entry point using clap. Parses `--name`, `--data-dir`,
 - **`manager.rs`** -- In-memory `ClusterManager`. Tracks members with peer/client
   URLs. Methods: `add_initial_member`, `add_member`, `remove_member`,
   `update_member`, `promote_member`, `list_members`.
+- **`swim.rs`** -- `SWIM MembershipList` actor. Implements the SWIM gossip
+  protocol for cluster membership discovery and failure detection. Emits
+  `MembershipEvent` notifications consumed by `RaftProcess`.
+- **`registry.rs`** -- `Registry` actor backed by an OR-Set CRDT. Provides
+  distributed process name resolution replicated across the cluster via
+  the Rebar `DistributedRuntime`.
 
 ### `src/auth/`
 
