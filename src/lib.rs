@@ -19,4 +19,7 @@ pub mod proto {
     pub mod authpb {
         tonic::include_proto!("authpb");
     }
+    pub mod raftpb {
+        tonic::include_proto!("raftpb");
+    }
 }
