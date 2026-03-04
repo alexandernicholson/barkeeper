@@ -103,4 +103,35 @@ impl LeaseManager {
             }
         }
     }
+
+    /// Check for expired leases. Returns expired leases and removes them.
+    pub async fn check_expired(&self) -> Vec<ExpiredLease> {
+        let mut leases = self.leases.lock().await;
+        let mut expired = Vec::new();
+
+        let expired_ids: Vec<i64> = leases
+            .iter()
+            .filter(|(_, entry)| {
+                entry.granted_at.elapsed().as_secs() as i64 >= entry.ttl
+            })
+            .map(|(id, _)| *id)
+            .collect();
+
+        for id in expired_ids {
+            if let Some(entry) = leases.remove(&id) {
+                expired.push(ExpiredLease {
+                    lease_id: id,
+                    keys: entry.keys,
+                });
+            }
+        }
+
+        expired
+    }
+}
+
+/// An expired lease and its attached keys.
+pub struct ExpiredLease {
+    pub lease_id: i64,
+    pub keys: Vec<Vec<u8>>,
 }

@@ -58,8 +58,4 @@ pub enum LeaseCmd {
     },
 }
 
-/// An expired lease and its attached keys.
-pub struct ExpiredLease {
-    pub lease_id: i64,
-    pub keys: Vec<Vec<u8>>,
-}
+pub use crate::lease::manager::ExpiredLease;
