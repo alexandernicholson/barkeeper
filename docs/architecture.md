@@ -24,7 +24,7 @@ goroutines.
 | API       | gRPC | HTTP Gateway |
 |-----------|------|--------------|
 | KV        | Yes  | Yes          |
-| Watch     | Yes  | Planned      |
+| Watch     | Yes  | No (gRPC streaming only) |
 | Lease     | Yes  | Yes          |
 | Cluster   | Yes  | Yes          |
 | Maintenance | Yes | Yes        |
