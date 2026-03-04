@@ -5,10 +5,13 @@ use tokio::sync::mpsc;
 use tonic::transport::Server;
 
 use crate::api::kv_service::KvService;
+use crate::api::lease_service::LeaseService;
 use crate::api::watch_service::WatchService;
 use crate::kv::state_machine::spawn_state_machine;
 use crate::kv::store::KvStore;
+use crate::lease::manager::LeaseManager;
 use crate::proto::etcdserverpb::kv_server::KvServer;
+use crate::proto::etcdserverpb::lease_server::LeaseServer;
 use crate::proto::etcdserverpb::watch_server::WatchServer;
 use crate::raft::node::{spawn_raft_node, RaftConfig};
 use crate::watch::hub::WatchHub;
@@ -49,12 +52,17 @@ impl BarkeepServer {
         let watch_hub = Arc::new(WatchHub::new());
         let watch_service = WatchService::new(Arc::clone(&watch_hub), cluster_id, member_id);
 
+        // Create the Lease manager and gRPC service.
+        let lease_manager = Arc::new(LeaseManager::new());
+        let lease_service = LeaseService::new(Arc::clone(&lease_manager), cluster_id, member_id);
+
         tracing::info!(%addr, "starting gRPC server");
 
         // Start the tonic gRPC server.
         Server::builder()
             .add_service(KvServer::new(kv_service))
             .add_service(WatchServer::new(watch_service))
+            .add_service(LeaseServer::new(lease_service))
             .serve(addr)
             .await?;
 
