@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 
@@ -20,11 +22,11 @@ pub enum KvCommand {
 
 /// Applies committed Raft entries to the KV store.
 pub struct StateMachine {
-    store: KvStore,
+    store: Arc<KvStore>,
 }
 
 impl StateMachine {
-    pub fn new(store: KvStore) -> Self {
+    pub fn new(store: Arc<KvStore>) -> Self {
         StateMachine { store }
     }
 
@@ -76,11 +78,15 @@ impl StateMachine {
     pub fn store(&self) -> &KvStore {
         &self.store
     }
+
+    pub fn store_arc(&self) -> Arc<KvStore> {
+        Arc::clone(&self.store)
+    }
 }
 
 /// Spawn the state machine apply loop.
 pub async fn spawn_state_machine(
-    store: KvStore,
+    store: Arc<KvStore>,
     mut apply_rx: mpsc::Receiver<Vec<LogEntry>>,
 ) {
     let sm = StateMachine::new(store);
