@@ -32,9 +32,6 @@ pub async fn spawn_cluster_actor(runtime: &Runtime, cluster_id: u64) -> ClusterA
             tokio::select! {
                 Some(cmd) = cmd_rx.recv() => {
                     match cmd {
-                        ClusterCmd::ClusterId { reply } => {
-                            let _ = reply.send(cluster_id);
-                        }
                         ClusterCmd::AddInitialMember { id, name, peer_urls, client_urls, reply } => {
                             let member = Member {
                                 id,
@@ -156,64 +153,64 @@ impl ClusterActorHandle {
         client_urls: Vec<String>,
     ) {
         let (reply, rx) = oneshot::channel();
-        let _ = self.cmd_tx.send(ClusterCmd::AddInitialMember {
+        self.cmd_tx.send(ClusterCmd::AddInitialMember {
             id,
             name,
             peer_urls,
             client_urls,
             reply,
-        }).await;
-        let _ = rx.await;
+        }).await.expect("cluster actor dead");
+        rx.await.expect("cluster actor dropped");
     }
 
     /// List all members, including SWIM-discovered peers.
     pub async fn member_list(&self) -> Vec<Member> {
         let (reply, rx) = oneshot::channel();
-        let _ = self.cmd_tx.send(ClusterCmd::MemberList { reply }).await;
-        rx.await.unwrap_or_default()
+        self.cmd_tx.send(ClusterCmd::MemberList { reply }).await.expect("cluster actor dead");
+        rx.await.expect("cluster actor dropped")
     }
 
     /// Add a new member. Returns the newly created member.
     pub async fn member_add(&self, peer_urls: Vec<String>, is_learner: bool) -> Member {
         let (reply, rx) = oneshot::channel();
-        let _ = self.cmd_tx.send(ClusterCmd::MemberAdd {
+        self.cmd_tx.send(ClusterCmd::MemberAdd {
             peer_urls,
             is_learner,
             reply,
-        }).await;
+        }).await.expect("cluster actor dead");
         rx.await.expect("cluster actor dropped")
     }
 
     /// Remove a member by ID. Returns true if the member existed.
     pub async fn member_remove(&self, id: u64) -> bool {
         let (reply, rx) = oneshot::channel();
-        let _ = self.cmd_tx.send(ClusterCmd::MemberRemove { id, reply }).await;
-        rx.await.unwrap_or(false)
+        self.cmd_tx.send(ClusterCmd::MemberRemove { id, reply }).await.expect("cluster actor dead");
+        rx.await.expect("cluster actor dropped")
     }
 
     /// Update a member's peer URLs. Returns true if the member existed.
     pub async fn member_update(&self, id: u64, peer_urls: Vec<String>) -> bool {
         let (reply, rx) = oneshot::channel();
-        let _ = self.cmd_tx.send(ClusterCmd::MemberUpdate {
+        self.cmd_tx.send(ClusterCmd::MemberUpdate {
             id,
             peer_urls,
             reply,
-        }).await;
-        rx.await.unwrap_or(false)
+        }).await.expect("cluster actor dead");
+        rx.await.expect("cluster actor dropped")
     }
 
     /// Promote a learner to a voting member. Returns true if the member
     /// existed and was a learner.
     pub async fn member_promote(&self, id: u64) -> bool {
         let (reply, rx) = oneshot::channel();
-        let _ = self.cmd_tx.send(ClusterCmd::MemberPromote { id, reply }).await;
-        rx.await.unwrap_or(false)
+        self.cmd_tx.send(ClusterCmd::MemberPromote { id, reply }).await.expect("cluster actor dead");
+        rx.await.expect("cluster actor dropped")
     }
 
     /// Attach a SWIM membership sync for peer discovery.
     pub async fn set_membership_sync(&self, sync: Arc<std::sync::Mutex<MembershipSync>>) {
         let (reply, rx) = oneshot::channel();
-        let _ = self.cmd_tx.send(ClusterCmd::SetMembershipSync { sync, reply }).await;
-        let _ = rx.await;
+        self.cmd_tx.send(ClusterCmd::SetMembershipSync { sync, reply }).await.expect("cluster actor dead");
+        rx.await.expect("cluster actor dropped");
     }
 }

@@ -66,10 +66,6 @@ pub use crate::lease::manager::ExpiredLease;
 
 /// Commands sent to the ClusterActor.
 pub enum ClusterCmd {
-    /// Query the cluster ID.
-    ClusterId {
-        reply: oneshot::Sender<u64>,
-    },
     /// Add the initial local member (bootstrap).
     AddInitialMember {
         id: u64,

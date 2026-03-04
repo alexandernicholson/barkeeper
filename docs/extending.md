@@ -495,7 +495,8 @@ async fn start_test_instance() -> (SocketAddr, tempfile::TempDir) {
     let raft_handle = spawn_raft_node(config, apply_tx, None).await;
 
     let lease_manager = Arc::new(LeaseManager::new());
-    let cluster_manager = Arc::new(ClusterManager::new(1));
+    let cluster_runtime = rebar_core::runtime::Runtime::new(1);
+    let cluster_manager = spawn_cluster_actor(&cluster_runtime, 1).await;
     cluster_manager
         .add_initial_member(1, "test-node".to_string(), vec![], vec![])
         .await;
