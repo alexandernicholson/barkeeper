@@ -1,12 +1,13 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use tokio::sync::mpsc;
 use tonic::transport::Server;
 
-use rebar_core::process::ExitReason;
+use rebar_cluster::registry::orset::Registry;
+use rebar_core::process::{ExitReason, ProcessId};
 use rebar_core::runtime::Runtime;
 use rebar_core::supervisor::engine::{start_supervisor, ChildEntry};
 use rebar_core::supervisor::spec::{ChildSpec, RestartStrategy, RestartType, SupervisorSpec};
@@ -31,9 +32,8 @@ use crate::proto::etcdserverpb::kv_server::KvServer;
 use crate::proto::etcdserverpb::lease_server::LeaseServer;
 use crate::proto::etcdserverpb::maintenance_server::MaintenanceServer;
 use crate::proto::etcdserverpb::watch_server::WatchServer;
-use crate::raft::grpc_transport::{GrpcRaftTransport, RaftTransportServer};
-use crate::raft::node::{spawn_raft_node, RaftConfig};
-use crate::raft::transport::RaftTransport;
+use crate::raft::grpc_transport::RaftTransportServer;
+use crate::raft::node::{spawn_raft_node_rebar, RaftConfig};
 use crate::tls::TlsConfig;
 use crate::watch::hub::WatchHub;
 
@@ -78,22 +78,20 @@ impl BarkeepServer {
         // Spawn the state machine apply loop.
         spawn_state_machine(Arc::clone(&store), apply_rx).await;
 
-        // Build transport based on cluster configuration.
-        let transport: Option<Arc<dyn RaftTransport>> = if cluster_config.is_clustered() {
-            // Multi-node: build peer map excluding self.
-            let mut peer_map = HashMap::new();
-            for (id, url) in &cluster_config.peers {
-                if *id != config.node_id {
-                    peer_map.insert(*id, url.clone());
-                }
-            }
-            Some(Arc::new(GrpcRaftTransport::new(config.node_id, peer_map)))
-        } else {
-            None
-        };
+        // Create the Rebar registry and peer PID map for the Raft actor.
+        let registry = Arc::new(Mutex::new(Registry::new()));
+        let peers: Arc<Mutex<HashMap<u64, ProcessId>>> =
+            Arc::new(Mutex::new(HashMap::new()));
 
-        // Spawn the Raft node.
-        let raft_handle = spawn_raft_node(config.clone(), apply_tx, transport).await;
+        // Spawn the Raft node as a Rebar distributed actor.
+        let raft_handle = spawn_raft_node_rebar(
+            config.clone(),
+            apply_tx,
+            &runtime,
+            Arc::clone(&registry),
+            Arc::clone(&peers),
+        )
+        .await;
         let raft_term = Arc::clone(&raft_handle.current_term);
 
         // If clustered, start the peer gRPC listener for inbound Raft messages.
