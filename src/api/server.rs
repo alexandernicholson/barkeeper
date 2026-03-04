@@ -28,6 +28,7 @@ use crate::proto::etcdserverpb::lease_server::LeaseServer;
 use crate::proto::etcdserverpb::maintenance_server::MaintenanceServer;
 use crate::proto::etcdserverpb::watch_server::WatchServer;
 use crate::raft::node::{spawn_raft_node, RaftConfig};
+use crate::tls::TlsConfig;
 use crate::watch::hub::WatchHub;
 
 /// The top-level barkeeper gRPC server.
@@ -42,6 +43,7 @@ impl BarkeepServer {
         config: RaftConfig,
         addr: SocketAddr,
         name: String,
+        tls_config: TlsConfig,
     ) -> Result<(), Box<dyn std::error::Error>> {
         // Create data directory.
         std::fs::create_dir_all(&config.data_dir)?;
@@ -91,14 +93,36 @@ impl BarkeepServer {
         );
         let lease_service = LeaseService::new(Arc::clone(&lease_manager), cluster_id, member_id, Arc::clone(&raft_term));
 
+        // Resolve TLS cert/key paths (auto-generate if --auto-tls).
+        let tls_paths = if tls_config.is_enabled() {
+            let (cert_path, key_path) = if tls_config.auto_tls {
+                let (c, k) = crate::tls::generate_self_signed(
+                    &config.data_dir,
+                    tls_config.self_signed_cert_validity,
+                )?;
+                tracing::info!(cert = %c, key = %k, "auto-TLS: using self-signed certificates");
+                (c, k)
+            } else {
+                (
+                    tls_config.cert_file.clone().unwrap(),
+                    tls_config.key_file.clone().unwrap(),
+                )
+            };
+            Some((cert_path, key_path))
+        } else {
+            None
+        };
+
+        let scheme = if tls_paths.is_some() { "https" } else { "http" };
+
         // Create the Cluster manager and gRPC service.
         let cluster_manager = Arc::new(ClusterManager::new(cluster_id));
         cluster_manager
             .add_initial_member(
                 member_id,
                 name,
-                vec![format!("http://{}", addr)],
-                vec![format!("http://{}", addr)],
+                vec![format!("{}://{}", scheme, addr)],
+                vec![format!("{}://{}", scheme, addr)],
             )
             .await;
         let cluster_service =
@@ -156,7 +180,13 @@ impl BarkeepServer {
             Arc::clone(&auth_manager),
         );
 
-        tracing::info!(%http_addr, "starting HTTP gateway");
+        tracing::info!(%http_addr, %scheme, "starting HTTP gateway");
+        if tls_paths.is_some() {
+            // NOTE: HTTP/JSON gateway TLS is not yet implemented. The
+            // gateway continues to listen on plaintext while the gRPC
+            // endpoint is TLS-secured. Use the gRPC API for TLS clients.
+            tracing::warn!(%http_addr, "HTTP gateway does not yet support TLS; listening on plaintext");
+        }
         tokio::spawn(async move {
             let listener = tokio::net::TcpListener::bind(http_addr)
                 .await
@@ -171,7 +201,14 @@ impl BarkeepServer {
         // Start the tonic gRPC server with auth enforcement layer.
         let auth_layer = GrpcAuthLayer::new(Arc::clone(&auth_manager));
 
-        Server::builder()
+        let mut server = Server::builder();
+
+        if let Some((ref cert_path, ref key_path)) = tls_paths {
+            let tonic_tls = crate::tls::build_tonic_tls(cert_path, key_path)?;
+            server = server.tls_config(tonic_tls)?;
+        }
+
+        server
             .layer(auth_layer)
             .add_service(KvServer::new(kv_service))
             .add_service(WatchServer::new(watch_service))

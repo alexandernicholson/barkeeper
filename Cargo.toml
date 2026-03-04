@@ -15,7 +15,7 @@ rebar-cluster = { git = "https://github.com/alexandernicholson/rebar.git", branc
 redb = "2"
 
 # gRPC
-tonic = "0.12"
+tonic = { version = "0.12", features = ["tls"] }
 prost = "0.13"
 prost-types = "0.13"
 
@@ -48,6 +48,13 @@ async-trait = "0.1"
 
 # Auth
 bcrypt = "0.15"
+
+# TLS
+rcgen = "0.13"
+tokio-rustls = "0.26"
+rustls = { version = "0.23", features = ["ring"] }
+rustls-pemfile = "2"
+time = "0.3"
 
 # Utilities
 rand = "0.8"

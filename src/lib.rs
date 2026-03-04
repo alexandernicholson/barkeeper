@@ -7,6 +7,7 @@ pub mod auth;
 pub mod api;
 pub mod config;
 pub mod actors;
+pub mod tls;
 
 pub mod proto {
     pub mod mvccpb {
