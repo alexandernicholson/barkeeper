@@ -414,9 +414,6 @@ CLI entry point using clap. Parses `--name`, `--data-dir`,
 - **`commands.rs`** -- Command enums for actor communication: `RaftCmd`,
   `StoreCmd`, `WatchCmd`, `LeaseCmd`. Each wraps a `oneshot::Sender` for
   request-response.
-- **`raft_process.rs`** -- RaftCore wrapped as a tokio actor with typed
-  `mpsc::Sender<RaftCmd>` interface. Implements the full propose-commit-apply
-  pipeline bridging `RaftCmd::Propose` to `StoreCmd::Apply`.
 
 ### `src/api/`
 

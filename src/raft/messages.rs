@@ -1,4 +1,3 @@
-use rmpv::Value;
 use serde::{Deserialize, Serialize};
 
 /// A single entry in the Raft log.
@@ -102,20 +101,6 @@ pub enum ClientProposalResult {
     Success { index: u64, revision: i64 },
     NotLeader { leader_id: Option<u64> },
     Error(String),
-}
-
-/// Encodes a Raft message into rmpv::Value for Rebar messaging.
-pub fn encode_raft_message(msg: &RaftMessage) -> Value {
-    let bytes = serde_json::to_vec(msg).expect("raft message serialization");
-    Value::Binary(bytes)
-}
-
-/// Decodes a Raft message from rmpv::Value.
-pub fn decode_raft_message(val: &Value) -> Option<RaftMessage> {
-    match val {
-        Value::Binary(bytes) => serde_json::from_slice(bytes).ok(),
-        _ => None,
-    }
 }
 
 /// Serialize a RaftMessage to an rmpv::Value for Rebar frame transport.

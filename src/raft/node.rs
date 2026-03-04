@@ -272,7 +272,11 @@ pub async fn spawn_raft_node_rebar(
     peers: Arc<Mutex<HashMap<u64, ProcessId>>>,
 ) -> RaftHandle {
     let (proposal_tx, proposal_rx) = mpsc::channel::<ClientProposal>(256);
-    let (inbound_tx, _inbound_rx) = mpsc::channel::<(u64, RaftMessage)>(256);
+    // The Rebar version receives messages via ctx.recv() from the actor
+    // mailbox, not via the mpsc channel. Create a closed channel so that
+    // sends to inbound_tx immediately fail (signaling callers).
+    let (inbound_tx, inbound_rx) = mpsc::channel::<(u64, RaftMessage)>(1);
+    drop(inbound_rx);
     let current_term = Arc::new(AtomicU64::new(0));
     let applied_index = Arc::new(AtomicU64::new(0));
     let term_ref = Arc::clone(&current_term);

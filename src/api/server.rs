@@ -161,6 +161,17 @@ impl BarkeepServer {
                 peer_count = cluster_config.peers.len().saturating_sub(1),
                 "SWIM membership initialized with seed peers"
             );
+
+            // Spawn the SWIM protocol tick loop.
+            tokio::spawn(async move {
+                let mut interval = tokio::time::interval(Duration::from_secs(1));
+                loop {
+                    interval.tick().await;
+                    if let Some(probe_target) = swim.tick() {
+                        tracing::trace!(probe_target, "SWIM probing node");
+                    }
+                }
+            });
         }
 
         // Create the Watch hub and gRPC service.
@@ -344,8 +355,8 @@ impl BarkeepServer {
             _ = async {
                 loop {
                     if !distributed_runtime.process_outbound().await {
-                        // No message was pending; yield to avoid busy-spinning.
-                        tokio::task::yield_now().await;
+                        // No message was pending; sleep briefly to avoid busy-spinning.
+                        tokio::time::sleep(Duration::from_millis(1)).await;
                     }
                 }
             } => {}

@@ -233,7 +233,7 @@ graph LR
 Key conventions:
 - Channel buffer size is 256 (matching `RaftCmd` and `StoreCmd`).
 - The process loop uses `tokio::select!` to multiplex commands with timers
-  or other async sources (see `raft_process.rs` for election/heartbeat timers).
+  or other async sources (see `raft/node.rs` for election/heartbeat timers).
 - The spawn function returns `mpsc::Sender<MyCmd>` which callers clone as needed.
 
 ### Step 3: Register with the supervisor
@@ -260,27 +260,19 @@ Add your module:
 
 ```rust
 pub mod commands;
-pub mod raft_process;
 pub mod my_process;  // <-- new
 ```
 
 ---
 
-## 3. Implementing a Custom RaftTransport
+## 3. Inter-Node Raft Transport
 
-The `RaftTransport` trait in `src/raft/transport.rs` abstracts how Raft
-messages are sent between nodes. Implementing a custom transport allows you
-to use different networking layers.
+Inter-node Raft messaging uses Rebar's `DistributedRuntime` with TCP
+frames. There is no separate transport trait — the Raft actor
+(`spawn_raft_node_rebar` in `src/raft/node.rs`) sends messages directly
+via the Rebar `ProcessContext::send()` API.
 
-### The trait
-
-```rust
-#[async_trait::async_trait]
-pub trait RaftTransport: Send + Sync {
-    /// Send a Raft message to the node identified by `to`.
-    async fn send(&self, to: u64, message: RaftMessage);
-}
-```
+### Message flow
 
 `RaftMessage` is an enum wrapping all Raft RPCs:
 
@@ -295,102 +287,34 @@ pub enum RaftMessage {
 }
 ```
 
-Messages are serialized with msgpack and can be encoded into
-`rmpv::Value::Binary` for Rebar TCP frames using the provided
-`encode_raft_message()` / `decode_raft_message()` helpers in
-`src/raft/messages.rs`.
+Messages are serialized with msgpack using `raft_message_to_value()` and
+`raft_message_from_value()` in `src/raft/messages.rs`.
 
-### The send/recv pattern
+When the Raft core emits `Action::SendMessage { to, message }`, the actor
+looks up the target node's `ProcessId` from a shared peer map and calls
+`ctx.send(pid, payload)`. The Rebar `DistributedRouter` routes local
+messages directly and remote messages over TCP frames.
 
-The transport is injected into `spawn_raft_process()` as
-`Option<Arc<dyn RaftTransport>>`. When the Raft core emits an
-`Action::SendMessage { to, message }`, the process loop calls
-`transport.send(to, message)`.
-
-For receiving, the existing `LocalTransport` registers each node with an
-`mpsc::Sender<(u64, RaftMessage)>`. Inbound messages are fed back into the
-Raft core via `Event` variants (e.g., `Event::AppendEntries`,
-`Event::RequestVote`).
-
-The data flow:
+Inbound messages arrive through the Rebar actor mailbox via `ctx.recv()`.
 
 ```mermaid
 graph LR
     subgraph Node_A["Node A"]
-        CA["RaftCore"] -->|"Action::SendMessage"| PA["RaftProcess"]
-        PA -->|"transport.send(B, msg)"| TA["RaftTransport impl"]
+        CA["RaftCore"] -->|"Action::SendMessage"| PA["Rebar Actor"]
+        PA -->|"ctx.send(pid, payload)"| RA["DistributedRouter"]
     end
     subgraph Node_B["Node B"]
-        IB["inbound channel"] -->|"cmd_rx.recv()"| PB["RaftProcess"]
-        PB --> CB["RaftCore"]
+        RB["DistributedRouter"] -->|"deliver to mailbox"| PB["Rebar Actor"]
+        PB -->|"ctx.recv()"| CB["RaftCore"]
     end
-    TA -->|"network"| IB
+    RA -->|"TCP frame"| RB
 ```
 
-### Production implementation: RebarTcpTransport
+### Peer discovery
 
-The `RebarTcpTransport` in `src/raft/rebar_transport.rs` implements the
-`RaftTransport` trait using Rebar's `DistributedRuntime` for multi-node
-clusters. Raft messages are msgpack-encoded and carried over Rebar TCP frames.
-
-The transport maps node IDs to Rebar actor addresses. When the Raft core emits
-an `Action::SendMessage { to, message }`, the transport encodes the message
-with `encode_raft_message()` and dispatches it via the Rebar runtime to the
-target node's `RaftProcess`. Inbound messages arrive through the Rebar message
-inbox and are fed into the Raft core as `Event` variants.
-
-The transport is configured via CLI flags:
-
-```bash
-./target/release/barkeeper \
-  --node-id 1 \
-  --initial-cluster "1=http://10.0.0.1:2380,2=http://10.0.0.2:2380" \
-  --listen-peer-urls "http://0.0.0.0:2380"
-```
-
-For Kubernetes deployments, use DNS autodiscovery instead of listing peers
-explicitly:
-
-```bash
-./target/release/barkeeper \
-  --node-id 1 \
-  --initial-cluster "barkeeper.default.svc.cluster.local" \
-  --listen-peer-urls "http://0.0.0.0:2380"
-```
-
-### Example: custom transport
-
-To implement a different transport (e.g., QUIC), implement the
-`RaftTransport` trait:
-
-```rust
-use std::sync::Arc;
-use async_trait::async_trait;
-use crate::raft::messages::RaftMessage;
-use crate::raft::transport::RaftTransport;
-
-pub struct MyTransport { /* ... */ }
-
-#[async_trait]
-impl RaftTransport for MyTransport {
-    async fn send(&self, to: u64, message: RaftMessage) {
-        // Serialize and send to the target node.
-    }
-}
-```
-
-### In-process testing: LocalTransport
-
-The `LocalTransport` in `src/raft/transport.rs` routes messages in-process
-using a `HashMap<u64, mpsc::Sender<(u64, RaftMessage)>>`. It is used for
-testing multi-node clusters in a single process:
-
-```rust
-let transport = LocalTransport::new();
-transport.register(1, node1_tx).await;
-transport.register(2, node2_tx).await;
-// Messages from node 1 to node 2 go through the in-memory channel.
-```
+Each Raft actor registers itself in a shared `Registry` (OR-Set CRDT) as
+`raft:{node_id}`. Peer PIDs are resolved from the registry and stored in
+a `HashMap<u64, ProcessId>` shared via `Arc<Mutex<...>>`
 
 ---
 

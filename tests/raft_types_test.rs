@@ -40,8 +40,8 @@ fn test_raft_message_encode_decode() {
         last_log_index: 10,
         last_log_term: 4,
     });
-    let encoded = encode_raft_message(&msg);
-    let decoded = decode_raft_message(&encoded).unwrap();
+    let encoded = raft_message_to_value(&msg);
+    let decoded = raft_message_from_value(&encoded).unwrap();
     match decoded {
         RaftMessage::RequestVoteReq(req) => {
             assert_eq!(req.term, 5);

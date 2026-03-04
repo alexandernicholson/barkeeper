@@ -54,8 +54,7 @@ in `build.rs`. The generated Rust code is placed in the `target/` directory
 and included at compile time through `tonic::include_proto!()` in `src/lib.rs`.
 
 Inter-node Raft messaging uses msgpack serialization over Rebar TCP frames
-rather than a separate gRPC service, so there is no `raft_transport.proto`
-to compile.
+rather than a separate gRPC service.
 
 ---
 
@@ -323,7 +322,6 @@ barkeeper/
 |   |
 |   |-- actors/             # Rebar actor layer
 |       |-- commands.rs     #   Typed command enums for actor communication
-|       |-- raft_process.rs #   RaftProcess actor wrapping RaftCore for supervised execution
 |
 |-- tests/                  # Integration and unit test files (see table above)
 |
