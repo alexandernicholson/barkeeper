@@ -3,7 +3,7 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 
-use super::store::KvStore;
+use super::store::{KvStore, TxnCompare, TxnOp};
 use crate::raft::messages::{LogEntry, LogEntryData};
 
 /// Commands that can be applied to the KV store via Raft.
@@ -17,6 +17,14 @@ pub enum KvCommand {
     DeleteRange {
         key: Vec<u8>,
         range_end: Vec<u8>,
+    },
+    Txn {
+        compares: Vec<TxnCompare>,
+        success: Vec<TxnOp>,
+        failure: Vec<TxnOp>,
+    },
+    Compact {
+        revision: i64,
     },
 }
 
@@ -70,6 +78,31 @@ impl StateMachine {
                     Err(e) => {
                         tracing::error!(error = %e, "failed to apply delete");
                     }
+                }
+            }
+            KvCommand::Txn {
+                compares,
+                success,
+                failure,
+            } => match self.store.txn(compares, success, failure) {
+                Ok(result) => {
+                    tracing::debug!(
+                        succeeded = result.succeeded,
+                        revision = result.revision,
+                        responses = result.responses.len(),
+                        "applied txn"
+                    );
+                }
+                Err(e) => {
+                    tracing::error!(error = %e, "failed to apply txn");
+                }
+            },
+            KvCommand::Compact { revision } => match self.store.compact(revision) {
+                Ok(()) => {
+                    tracing::debug!(revision = revision, "applied compact");
+                }
+                Err(e) => {
+                    tracing::error!(error = %e, "failed to apply compact");
                 }
             }
         }

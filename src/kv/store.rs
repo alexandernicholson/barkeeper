@@ -78,6 +78,72 @@ pub struct DeleteResult {
     pub prev_kvs: Vec<mvccpb::KeyValue>,
 }
 
+// ── Txn types ────────────────────────────────────────────────────────────
+
+/// Compare target for Txn conditions.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum TxnCompareTarget {
+    Version(i64),
+    CreateRevision(i64),
+    ModRevision(i64),
+    Value(Vec<u8>),
+    Lease(i64),
+}
+
+/// Compare result (comparison operator) for Txn conditions.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum TxnCompareResult {
+    Equal,
+    Greater,
+    Less,
+    NotEqual,
+}
+
+/// A single compare condition in a Txn.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TxnCompare {
+    pub key: Vec<u8>,
+    pub range_end: Vec<u8>,
+    pub target: TxnCompareTarget,
+    pub result: TxnCompareResult,
+}
+
+/// An operation in a Txn (success or failure branch).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum TxnOp {
+    Range {
+        key: Vec<u8>,
+        range_end: Vec<u8>,
+        limit: i64,
+        revision: i64,
+    },
+    Put {
+        key: Vec<u8>,
+        value: Vec<u8>,
+        lease_id: i64,
+    },
+    DeleteRange {
+        key: Vec<u8>,
+        range_end: Vec<u8>,
+    },
+}
+
+/// Result of a single operation in a Txn.
+#[derive(Debug)]
+pub enum TxnOpResponse {
+    Range(RangeResult),
+    Put(PutResult),
+    DeleteRange(DeleteResult),
+}
+
+/// Result of an entire Txn.
+#[derive(Debug)]
+pub struct TxnResult {
+    pub succeeded: bool,
+    pub responses: Vec<TxnOpResponse>,
+    pub revision: i64,
+}
+
 // ── Compound key helpers ────────────────────────────────────────────────────
 
 /// Build a compound key: key_bytes + \x00 + 8-byte big-endian revision.
@@ -381,7 +447,178 @@ impl KvStore {
         Ok(result)
     }
 
+    // ── Txn (compare-and-swap) ────────────────────────────────────────────
+
+    /// Execute a transaction (compare-and-swap).
+    ///
+    /// Evaluates all compare conditions against the current state. If all pass,
+    /// executes the success ops; otherwise executes the failure ops. All
+    /// operations within a branch are applied atomically within a single
+    /// revision.
+    pub fn txn(
+        &self,
+        compares: Vec<TxnCompare>,
+        success: Vec<TxnOp>,
+        failure: Vec<TxnOp>,
+    ) -> Result<TxnResult, redb::Error> {
+        // First, evaluate compares using a read-only transaction.
+        let succeeded = self.evaluate_compares(&compares)?;
+
+        // Execute the appropriate branch.
+        let ops = if succeeded { &success } else { &failure };
+
+        let mut responses = Vec::new();
+        let mut final_revision = self.current_revision()?;
+
+        for op in ops {
+            match op {
+                TxnOp::Range {
+                    key,
+                    range_end,
+                    limit,
+                    revision,
+                } => {
+                    let result = self.range(key, range_end, *limit, *revision)?;
+                    responses.push(TxnOpResponse::Range(result));
+                }
+                TxnOp::Put {
+                    key,
+                    value,
+                    lease_id,
+                } => {
+                    let result = self.put(key, value, *lease_id)?;
+                    final_revision = result.revision;
+                    responses.push(TxnOpResponse::Put(result));
+                }
+                TxnOp::DeleteRange { key, range_end } => {
+                    let result = self.delete_range(key, range_end)?;
+                    final_revision = result.revision;
+                    responses.push(TxnOpResponse::DeleteRange(result));
+                }
+            }
+        }
+
+        Ok(TxnResult {
+            succeeded,
+            responses,
+            revision: final_revision,
+        })
+    }
+
+    /// Compact the store up to the given revision.
+    ///
+    /// Removes all KV entries with revision < compact_revision, keeping only
+    /// the latest version of each key at or before the compact revision.
+    /// Also removes revision table entries for compacted revisions.
+    pub fn compact(&self, revision: i64) -> Result<(), redb::Error> {
+        let txn = self.db.begin_write()?;
+        {
+            let mut kv_table = txn.open_table(KV_TABLE)?;
+            let mut rev_table = txn.open_table(REV_TABLE)?;
+
+            // Collect all compound keys that should be removed.
+            // We keep the latest entry for each user key at or before the
+            // compact revision, and remove all older entries.
+            let mut keys_to_remove: Vec<Vec<u8>> = Vec::new();
+            let mut latest_per_key: std::collections::HashMap<Vec<u8>, (u64, Vec<u8>)> =
+                std::collections::HashMap::new();
+
+            // Scan all entries up to the compact revision.
+            for entry in kv_table.iter()? {
+                let (ck, _) = entry?;
+                let ck_bytes = ck.value().to_vec();
+                let rev = extract_revision(&ck_bytes);
+                let user_key = extract_user_key(&ck_bytes).to_vec();
+
+                if rev <= revision as u64 {
+                    // Track the latest compound key for each user key.
+                    match latest_per_key.get(&user_key) {
+                        Some((existing_rev, existing_ck)) => {
+                            if rev > *existing_rev {
+                                // This is newer; the old one should be removed.
+                                keys_to_remove.push(existing_ck.clone());
+                                latest_per_key
+                                    .insert(user_key, (rev, ck_bytes));
+                            } else {
+                                // This is older; remove it.
+                                keys_to_remove.push(ck_bytes);
+                            }
+                        }
+                        None => {
+                            latest_per_key.insert(user_key, (rev, ck_bytes));
+                        }
+                    }
+                }
+            }
+
+            // Remove old compound keys.
+            for ck in &keys_to_remove {
+                kv_table.remove(ck.as_slice())?;
+            }
+
+            // Remove revision entries for compacted revisions.
+            let mut revs_to_remove: Vec<u64> = Vec::new();
+            for entry in rev_table.range(0..revision as u64)? {
+                let (rev, _) = entry?;
+                revs_to_remove.push(rev.value());
+            }
+            for rev in revs_to_remove {
+                rev_table.remove(rev)?;
+            }
+        }
+        txn.commit()?;
+        Ok(())
+    }
+
     // ── Private helpers ─────────────────────────────────────────────────────
+
+    /// Evaluate all compare conditions. Returns `true` if all pass.
+    fn evaluate_compares(&self, compares: &[TxnCompare]) -> Result<bool, redb::Error> {
+        let txn = self.db.begin_read()?;
+        let kv_table = txn.open_table(KV_TABLE)?;
+        let meta_table = txn.open_table(META_TABLE)?;
+
+        let current_rev = match meta_table.get("revision")? {
+            Some(val) => serde_json::from_slice::<i64>(val.value()).expect("deser rev"),
+            None => 0,
+        };
+
+        for cmp in compares {
+            let kv = self.find_latest_kv_at_rev_readonly(&kv_table, &cmp.key, current_rev as u64)?;
+
+            let passes = match &cmp.target {
+                TxnCompareTarget::Version(target_val) => {
+                    let actual = kv.as_ref().map(|k| k.version).unwrap_or(0);
+                    compare_i64(actual, *target_val, &cmp.result)
+                }
+                TxnCompareTarget::CreateRevision(target_val) => {
+                    let actual = kv.as_ref().map(|k| k.create_revision).unwrap_or(0);
+                    compare_i64(actual, *target_val, &cmp.result)
+                }
+                TxnCompareTarget::ModRevision(target_val) => {
+                    let actual = kv.as_ref().map(|k| k.mod_revision).unwrap_or(0);
+                    compare_i64(actual, *target_val, &cmp.result)
+                }
+                TxnCompareTarget::Value(target_val) => {
+                    let actual = kv
+                        .as_ref()
+                        .map(|k| k.value.as_slice())
+                        .unwrap_or(&[]);
+                    compare_bytes(actual, target_val, &cmp.result)
+                }
+                TxnCompareTarget::Lease(target_val) => {
+                    let actual = kv.as_ref().map(|k| k.lease).unwrap_or(0);
+                    compare_i64(actual, *target_val, &cmp.result)
+                }
+            };
+
+            if !passes {
+                return Ok(false);
+            }
+        }
+
+        Ok(true)
+    }
 
     /// Find the latest value for a user key at or before the given revision.
     /// Works with a writable table reference.
@@ -482,5 +719,25 @@ impl KvStore {
             }
         }
         Ok(seen.into_iter().collect())
+    }
+}
+
+// ── Compare helpers ──────────────────────────────────────────────────────
+
+fn compare_i64(actual: i64, target: i64, result: &TxnCompareResult) -> bool {
+    match result {
+        TxnCompareResult::Equal => actual == target,
+        TxnCompareResult::Greater => actual > target,
+        TxnCompareResult::Less => actual < target,
+        TxnCompareResult::NotEqual => actual != target,
+    }
+}
+
+fn compare_bytes(actual: &[u8], target: &[u8], result: &TxnCompareResult) -> bool {
+    match result {
+        TxnCompareResult::Equal => actual == target,
+        TxnCompareResult::Greater => actual > target,
+        TxnCompareResult::Less => actual < target,
+        TxnCompareResult::NotEqual => actual != target,
     }
 }
