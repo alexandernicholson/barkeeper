@@ -4,6 +4,10 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 use tonic::transport::Server;
 
+use rebar_core::runtime::Runtime;
+use rebar_core::supervisor::engine::start_supervisor;
+use rebar_core::supervisor::spec::{SupervisorSpec, RestartStrategy};
+
 use crate::api::auth_service::AuthService;
 use crate::api::cluster_service::ClusterService;
 use crate::api::gateway;
@@ -43,6 +47,17 @@ impl BarkeepServer {
 
         // Open the shared KV store.
         let store = Arc::new(KvStore::open(format!("{}/kv.redb", config.data_dir))?);
+
+        // Initialize the Rebar runtime and supervisor.
+        let runtime = Arc::new(Runtime::new(config.node_id));
+
+        let supervisor_spec = SupervisorSpec::new(RestartStrategy::OneForAll)
+            .max_restarts(5)
+            .max_seconds(30);
+
+        let _supervisor = start_supervisor(runtime.clone(), supervisor_spec, vec![]).await;
+
+        tracing::info!("started Rebar supervisor");
 
         // Create the apply channel between Raft and the state machine.
         let (apply_tx, apply_rx) = mpsc::channel(256);
