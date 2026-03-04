@@ -18,6 +18,7 @@ use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
 use serde::{Deserialize, Serialize, Serializer};
 
+use crate::auth::manager::AuthManager;
 use crate::cluster::manager::ClusterManager;
 use crate::kv::state_machine::KvCommand;
 use crate::kv::store::{KvStore, TxnCompare, TxnCompareResult, TxnCompareTarget, TxnOp, TxnOpResponse};
@@ -64,6 +65,7 @@ pub struct GatewayState {
     pub watch_hub: Arc<WatchHub>,
     pub lease_manager: Arc<LeaseManager>,
     pub cluster_manager: Arc<ClusterManager>,
+    pub auth_manager: Arc<AuthManager>,
     pub cluster_id: u64,
     pub member_id: u64,
     pub raft_term: Arc<AtomicU64>,
@@ -434,12 +436,14 @@ pub fn create_router(
     cluster_id: u64,
     member_id: u64,
     raft_term: Arc<AtomicU64>,
+    auth_manager: Arc<AuthManager>,
 ) -> Router {
     let state = GatewayState {
         store,
         watch_hub,
         lease_manager,
         cluster_manager,
+        auth_manager,
         cluster_id,
         member_id,
         raft_term,
@@ -458,6 +462,24 @@ pub fn create_router(
         .route("/v3/lease/leases", post(handle_lease_leases))
         .route("/v3/cluster/member/list", post(handle_cluster_member_list))
         .route("/v3/maintenance/status", post(handle_maintenance_status))
+        // Auth endpoints
+        .route("/v3/auth/enable", post(handle_auth_enable))
+        .route("/v3/auth/disable", post(handle_auth_disable))
+        .route("/v3/auth/status", post(handle_auth_status))
+        .route("/v3/auth/authenticate", post(handle_auth_authenticate))
+        .route("/v3/auth/user/add", post(handle_auth_user_add))
+        .route("/v3/auth/user/get", post(handle_auth_user_get))
+        .route("/v3/auth/user/list", post(handle_auth_user_list))
+        .route("/v3/auth/user/delete", post(handle_auth_user_delete))
+        .route("/v3/auth/user/changepw", post(handle_auth_user_change_password))
+        .route("/v3/auth/user/grant", post(handle_auth_user_grant_role))
+        .route("/v3/auth/user/revoke", post(handle_auth_user_revoke_role))
+        .route("/v3/auth/role/add", post(handle_auth_role_add))
+        .route("/v3/auth/role/get", post(handle_auth_role_get))
+        .route("/v3/auth/role/list", post(handle_auth_role_list))
+        .route("/v3/auth/role/delete", post(handle_auth_role_delete))
+        .route("/v3/auth/role/grant", post(handle_auth_role_grant_permission))
+        .route("/v3/auth/role/revoke", post(handle_auth_role_revoke_permission))
         .with_state(state)
 }
 
@@ -1007,4 +1029,511 @@ async fn handle_maintenance_status(
         raft_applied_index: state.raft_handle.applied_index(),
         db_size_in_use: db_size,
     })
+}
+
+// ── Auth JSON request / response types ──────────────────────────────────────
+
+#[derive(Debug, Deserialize, Default)]
+struct AuthEnableReq {}
+
+#[derive(Debug, Serialize)]
+struct AuthEnableResp {
+    header: JsonResponseHeader,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct AuthDisableReq {}
+
+#[derive(Debug, Serialize)]
+struct AuthDisableResp {
+    header: JsonResponseHeader,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct AuthStatusReq {}
+
+#[derive(Debug, Serialize)]
+struct AuthStatusResp {
+    header: JsonResponseHeader,
+    enabled: bool,
+    #[serde(rename = "authRevision", serialize_with = "ser_str_u64")]
+    auth_revision: u64,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct AuthenticateReq {
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    password: String,
+}
+
+#[derive(Debug, Serialize)]
+struct AuthenticateResp {
+    header: JsonResponseHeader,
+    token: String,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct AuthUserAddReq {
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    password: String,
+}
+
+#[derive(Debug, Serialize)]
+struct AuthUserAddResp {
+    header: JsonResponseHeader,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct AuthUserGetReq {
+    #[serde(default)]
+    name: String,
+}
+
+#[derive(Debug, Serialize)]
+struct AuthUserGetResp {
+    header: JsonResponseHeader,
+    roles: Vec<String>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct AuthUserListReq {}
+
+#[derive(Debug, Serialize)]
+struct AuthUserListResp {
+    header: JsonResponseHeader,
+    users: Vec<String>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct AuthUserDeleteReq {
+    #[serde(default)]
+    name: String,
+}
+
+#[derive(Debug, Serialize)]
+struct AuthUserDeleteResp {
+    header: JsonResponseHeader,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct AuthUserChangePasswordReq {
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    password: String,
+}
+
+#[derive(Debug, Serialize)]
+struct AuthUserChangePasswordResp {
+    header: JsonResponseHeader,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct AuthUserGrantRoleReq {
+    #[serde(default)]
+    user: String,
+    #[serde(default)]
+    role: String,
+}
+
+#[derive(Debug, Serialize)]
+struct AuthUserGrantRoleResp {
+    header: JsonResponseHeader,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct AuthUserRevokeRoleReq {
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    role: String,
+}
+
+#[derive(Debug, Serialize)]
+struct AuthUserRevokeRoleResp {
+    header: JsonResponseHeader,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct AuthRoleAddReq {
+    #[serde(default)]
+    name: String,
+}
+
+#[derive(Debug, Serialize)]
+struct AuthRoleAddResp {
+    header: JsonResponseHeader,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct AuthRoleGetReq {
+    #[serde(default)]
+    role: String,
+}
+
+#[derive(Debug, Serialize)]
+struct AuthRoleGetResp {
+    header: JsonResponseHeader,
+    perm: Vec<JsonPermission>,
+}
+
+#[derive(Debug, Serialize)]
+struct JsonPermission {
+    #[serde(rename = "permType")]
+    perm_type: i32,
+    key: String,
+    range_end: String,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct AuthRoleListReq {}
+
+#[derive(Debug, Serialize)]
+struct AuthRoleListResp {
+    header: JsonResponseHeader,
+    roles: Vec<String>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct AuthRoleDeleteReq {
+    #[serde(default)]
+    role: String,
+}
+
+#[derive(Debug, Serialize)]
+struct AuthRoleDeleteResp {
+    header: JsonResponseHeader,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct AuthRoleGrantPermissionReq {
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    perm: Option<JsonPermissionReq>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct JsonPermissionReq {
+    #[serde(rename = "permType", default)]
+    perm_type: i32,
+    #[serde(default)]
+    key: String,
+    #[serde(default)]
+    range_end: String,
+}
+
+#[derive(Debug, Serialize)]
+struct AuthRoleGrantPermissionResp {
+    header: JsonResponseHeader,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct AuthRoleRevokePermissionReq {
+    #[serde(default)]
+    role: String,
+    #[serde(default)]
+    key: String,
+    #[serde(default)]
+    range_end: String,
+}
+
+#[derive(Debug, Serialize)]
+struct AuthRoleRevokePermissionResp {
+    header: JsonResponseHeader,
+}
+
+// ── Auth Handlers ───────────────────────────────────────────────────────────
+
+async fn handle_auth_enable(
+    State(state): State<GatewayState>,
+    body: axum::body::Bytes,
+) -> impl IntoResponse {
+    let _: AuthEnableReq = parse_json(&body);
+    state.auth_manager.auth_enable().await;
+    axum::Json(AuthEnableResp {
+        header: state.make_header(0),
+    })
+}
+
+async fn handle_auth_disable(
+    State(state): State<GatewayState>,
+    body: axum::body::Bytes,
+) -> impl IntoResponse {
+    let _: AuthDisableReq = parse_json(&body);
+    state.auth_manager.auth_disable().await;
+    axum::Json(AuthDisableResp {
+        header: state.make_header(0),
+    })
+}
+
+async fn handle_auth_status(
+    State(state): State<GatewayState>,
+    body: axum::body::Bytes,
+) -> impl IntoResponse {
+    let _: AuthStatusReq = parse_json(&body);
+    let enabled = state.auth_manager.is_enabled().await;
+    axum::Json(AuthStatusResp {
+        header: state.make_header(0),
+        enabled,
+        auth_revision: 0,
+    })
+}
+
+async fn handle_auth_authenticate(
+    State(state): State<GatewayState>,
+    body: axum::body::Bytes,
+) -> impl IntoResponse {
+    let req: AuthenticateReq = parse_json(&body);
+    match state.auth_manager.authenticate(&req.name, &req.password).await {
+        Some(token) => axum::Json(AuthenticateResp {
+            header: state.make_header(0),
+            token,
+        })
+        .into_response(),
+        None => json_error(StatusCode::UNAUTHORIZED, "invalid credentials").into_response(),
+    }
+}
+
+async fn handle_auth_user_add(
+    State(state): State<GatewayState>,
+    body: axum::body::Bytes,
+) -> impl IntoResponse {
+    let req: AuthUserAddReq = parse_json(&body);
+    if req.name.is_empty() {
+        return json_error(StatusCode::BAD_REQUEST, "user name cannot be empty").into_response();
+    }
+    let added = state.auth_manager.user_add(req.name, req.password).await;
+    if !added {
+        return json_error(StatusCode::CONFLICT, "user already exists").into_response();
+    }
+    axum::Json(AuthUserAddResp {
+        header: state.make_header(0),
+    })
+    .into_response()
+}
+
+async fn handle_auth_user_get(
+    State(state): State<GatewayState>,
+    body: axum::body::Bytes,
+) -> impl IntoResponse {
+    let req: AuthUserGetReq = parse_json(&body);
+    match state.auth_manager.user_get(&req.name).await {
+        Some(user) => axum::Json(AuthUserGetResp {
+            header: state.make_header(0),
+            roles: user.roles,
+        })
+        .into_response(),
+        None => json_error(StatusCode::NOT_FOUND, format!("user {} not found", req.name))
+            .into_response(),
+    }
+}
+
+async fn handle_auth_user_list(
+    State(state): State<GatewayState>,
+    body: axum::body::Bytes,
+) -> impl IntoResponse {
+    let _: AuthUserListReq = parse_json(&body);
+    let users = state.auth_manager.user_list().await;
+    axum::Json(AuthUserListResp {
+        header: state.make_header(0),
+        users,
+    })
+}
+
+async fn handle_auth_user_delete(
+    State(state): State<GatewayState>,
+    body: axum::body::Bytes,
+) -> impl IntoResponse {
+    let req: AuthUserDeleteReq = parse_json(&body);
+    let deleted = state.auth_manager.user_delete(&req.name).await;
+    if !deleted {
+        return json_error(StatusCode::NOT_FOUND, format!("user {} not found", req.name))
+            .into_response();
+    }
+    axum::Json(AuthUserDeleteResp {
+        header: state.make_header(0),
+    })
+    .into_response()
+}
+
+async fn handle_auth_user_change_password(
+    State(state): State<GatewayState>,
+    body: axum::body::Bytes,
+) -> impl IntoResponse {
+    let req: AuthUserChangePasswordReq = parse_json(&body);
+    let changed = state.auth_manager.user_change_password(&req.name, req.password).await;
+    if !changed {
+        return json_error(StatusCode::NOT_FOUND, format!("user {} not found", req.name))
+            .into_response();
+    }
+    axum::Json(AuthUserChangePasswordResp {
+        header: state.make_header(0),
+    })
+    .into_response()
+}
+
+async fn handle_auth_user_grant_role(
+    State(state): State<GatewayState>,
+    body: axum::body::Bytes,
+) -> impl IntoResponse {
+    let req: AuthUserGrantRoleReq = parse_json(&body);
+    let granted = state.auth_manager.user_grant_role(&req.user, &req.role).await;
+    if !granted {
+        return json_error(
+            StatusCode::BAD_REQUEST,
+            "user not found or role already granted",
+        )
+        .into_response();
+    }
+    axum::Json(AuthUserGrantRoleResp {
+        header: state.make_header(0),
+    })
+    .into_response()
+}
+
+async fn handle_auth_user_revoke_role(
+    State(state): State<GatewayState>,
+    body: axum::body::Bytes,
+) -> impl IntoResponse {
+    let req: AuthUserRevokeRoleReq = parse_json(&body);
+    let revoked = state.auth_manager.user_revoke_role(&req.name, &req.role).await;
+    if !revoked {
+        return json_error(
+            StatusCode::BAD_REQUEST,
+            "user not found or role not granted",
+        )
+        .into_response();
+    }
+    axum::Json(AuthUserRevokeRoleResp {
+        header: state.make_header(0),
+    })
+    .into_response()
+}
+
+async fn handle_auth_role_add(
+    State(state): State<GatewayState>,
+    body: axum::body::Bytes,
+) -> impl IntoResponse {
+    let req: AuthRoleAddReq = parse_json(&body);
+    if req.name.is_empty() {
+        return json_error(StatusCode::BAD_REQUEST, "role name cannot be empty").into_response();
+    }
+    let added = state.auth_manager.role_add(req.name).await;
+    if !added {
+        return json_error(StatusCode::CONFLICT, "role already exists").into_response();
+    }
+    axum::Json(AuthRoleAddResp {
+        header: state.make_header(0),
+    })
+    .into_response()
+}
+
+async fn handle_auth_role_get(
+    State(state): State<GatewayState>,
+    body: axum::body::Bytes,
+) -> impl IntoResponse {
+    let req: AuthRoleGetReq = parse_json(&body);
+    match state.auth_manager.role_get(&req.role).await {
+        Some(role) => {
+            let perm = role
+                .permissions
+                .into_iter()
+                .map(|p| JsonPermission {
+                    perm_type: p.perm_type,
+                    key: encode_b64(&p.key),
+                    range_end: encode_b64(&p.range_end),
+                })
+                .collect();
+            axum::Json(AuthRoleGetResp {
+                header: state.make_header(0),
+                perm,
+            })
+            .into_response()
+        }
+        None => json_error(StatusCode::NOT_FOUND, format!("role {} not found", req.role))
+            .into_response(),
+    }
+}
+
+async fn handle_auth_role_list(
+    State(state): State<GatewayState>,
+    body: axum::body::Bytes,
+) -> impl IntoResponse {
+    let _: AuthRoleListReq = parse_json(&body);
+    let roles = state.auth_manager.role_list().await;
+    axum::Json(AuthRoleListResp {
+        header: state.make_header(0),
+        roles,
+    })
+}
+
+async fn handle_auth_role_delete(
+    State(state): State<GatewayState>,
+    body: axum::body::Bytes,
+) -> impl IntoResponse {
+    let req: AuthRoleDeleteReq = parse_json(&body);
+    let deleted = state.auth_manager.role_delete(&req.role).await;
+    if !deleted {
+        return json_error(StatusCode::NOT_FOUND, format!("role {} not found", req.role))
+            .into_response();
+    }
+    axum::Json(AuthRoleDeleteResp {
+        header: state.make_header(0),
+    })
+    .into_response()
+}
+
+async fn handle_auth_role_grant_permission(
+    State(state): State<GatewayState>,
+    body: axum::body::Bytes,
+) -> impl IntoResponse {
+    let req: AuthRoleGrantPermissionReq = parse_json(&body);
+    let perm = match req.perm {
+        Some(p) => crate::auth::manager::Permission {
+            perm_type: p.perm_type,
+            key: decode_b64(&Some(p.key)),
+            range_end: decode_b64(&Some(p.range_end)),
+        },
+        None => {
+            return json_error(StatusCode::BAD_REQUEST, "permission is required").into_response()
+        }
+    };
+    let granted = state.auth_manager.role_grant_permission(&req.name, perm).await;
+    if !granted {
+        return json_error(StatusCode::NOT_FOUND, format!("role {} not found", req.name))
+            .into_response();
+    }
+    axum::Json(AuthRoleGrantPermissionResp {
+        header: state.make_header(0),
+    })
+    .into_response()
+}
+
+async fn handle_auth_role_revoke_permission(
+    State(state): State<GatewayState>,
+    body: axum::body::Bytes,
+) -> impl IntoResponse {
+    let req: AuthRoleRevokePermissionReq = parse_json(&body);
+    let key = decode_b64(&Some(req.key));
+    let range_end = decode_b64(&Some(req.range_end));
+    let revoked = state
+        .auth_manager
+        .role_revoke_permission(&req.role, &key, &range_end)
+        .await;
+    if !revoked {
+        return json_error(
+            StatusCode::BAD_REQUEST,
+            "role not found or permission not granted",
+        )
+        .into_response();
+    }
+    axum::Json(AuthRoleRevokePermissionResp {
+        header: state.make_header(0),
+    })
+    .into_response()
 }

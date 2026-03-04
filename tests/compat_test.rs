@@ -15,6 +15,7 @@ use serde_json::{json, Value};
 use tokio::sync::mpsc;
 
 use barkeeper::api::gateway;
+use barkeeper::auth::manager::AuthManager;
 use barkeeper::cluster::manager::ClusterManager;
 use barkeeper::kv::state_machine::spawn_state_machine;
 use barkeeper::kv::store::KvStore;
@@ -48,6 +49,7 @@ async fn start_test_instance() -> (SocketAddr, tempfile::TempDir) {
         .await;
 
     let watch_hub = Arc::new(WatchHub::with_store(Arc::clone(&store)));
+    let auth_manager = Arc::new(AuthManager::new());
 
     // Spawn lease expiry timer — checks every 500ms for expired leases.
     {
@@ -88,6 +90,7 @@ async fn start_test_instance() -> (SocketAddr, tempfile::TempDir) {
         1,
         1,
         Arc::clone(&raft_handle.current_term),
+        Arc::clone(&auth_manager),
     );
 
     let http_port = portpicker::pick_unused_port().expect("no free port");

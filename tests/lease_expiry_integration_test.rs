@@ -12,6 +12,7 @@ use tokio::sync::mpsc;
 use tokio::time::{sleep, Duration};
 
 use barkeeper::api::gateway;
+use barkeeper::auth::manager::AuthManager;
 use barkeeper::cluster::manager::ClusterManager;
 use barkeeper::kv::state_machine::spawn_state_machine;
 use barkeeper::kv::store::KvStore;
@@ -67,7 +68,8 @@ async fn start_instance_with_lease_expiry() -> (SocketAddr, Arc<KvStore>, Arc<Le
         }
     });
 
-    // IMPORTANT: create_router signature is (raft, store, watch_hub, lease_manager, cluster_manager, cluster_id, member_id, raft_term)
+    let auth_manager = Arc::new(AuthManager::new());
+
     let app = gateway::create_router(
         raft_handle.clone(),
         Arc::clone(&store),
@@ -76,6 +78,7 @@ async fn start_instance_with_lease_expiry() -> (SocketAddr, Arc<KvStore>, Arc<Le
         Arc::clone(&cluster_manager),
         1, 1,
         Arc::clone(&raft_handle.current_term),
+        Arc::clone(&auth_manager),
     );
 
     let port = portpicker::pick_unused_port().unwrap();

@@ -152,6 +152,7 @@ impl BarkeepServer {
             cluster_id,
             member_id,
             Arc::clone(&raft_term),
+            Arc::clone(&auth_manager),
         );
 
         tracing::info!(%http_addr, "starting HTTP gateway");
