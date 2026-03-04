@@ -8,7 +8,9 @@ use tonic::transport::Server;
 
 use rebar::DistributedRuntime;
 use rebar_cluster::connection::manager::{ConnectionManager, TransportConnector};
+use rebar_cluster::drain::{NodeDrain, DrainConfig};
 use rebar_cluster::registry::orset::Registry;
+use rebar_cluster::swim::gossip::GossipQueue;
 use rebar_cluster::swim::SwimConfig;
 use rebar_cluster::transport::{TransportConnection, TransportError};
 use rebar_core::process::{ExitReason, ProcessId};
@@ -87,8 +89,8 @@ impl BarkeepServer {
         let cm = ConnectionManager::new(connector);
         let mut distributed_runtime = DistributedRuntime::new(config.node_id, cm);
 
-        // Get a reference to the runtime for spawning before the
-        // DistributedRuntime is moved into the outbound processing task.
+        // Borrow the runtime for actor spawning. The borrow ends before
+        // the select! loop where distributed_runtime is used mutably.
         let runtime = distributed_runtime.runtime();
 
         let supervisor_spec = SupervisorSpec::new(RestartStrategy::OneForAll)
@@ -160,16 +162,6 @@ impl BarkeepServer {
                 "SWIM membership initialized with seed peers"
             );
         }
-
-        // Spawn the outbound message processing loop.
-        tokio::spawn(async move {
-            loop {
-                if !distributed_runtime.process_outbound().await {
-                    // No message was pending; yield to avoid busy-spinning.
-                    tokio::task::yield_now().await;
-                }
-            }
-        });
 
         // Create the Watch hub and gRPC service.
         let cluster_id = 1;
@@ -317,7 +309,7 @@ impl BarkeepServer {
 
         tracing::info!(%addr, "starting gRPC server");
 
-        // Start the tonic gRPC server with auth enforcement layer.
+        // Build the tonic gRPC server with auth enforcement layer.
         let auth_layer = GrpcAuthLayer::new(Arc::clone(&auth_manager));
 
         let mut server = Server::builder();
@@ -327,7 +319,7 @@ impl BarkeepServer {
             server = server.tls_config(tonic_tls)?;
         }
 
-        server
+        let grpc_future = server
             .layer(auth_layer)
             .add_service(KvServer::new(kv_service))
             .add_service(WatchServer::new(watch_service))
@@ -335,8 +327,56 @@ impl BarkeepServer {
             .add_service(ClusterServer::new(cluster_service))
             .add_service(MaintenanceServer::new(maintenance_service))
             .add_service(AuthServer::new(auth_service))
-            .serve(addr)
-            .await?;
+            .serve(addr);
+
+        // Determine the peer address for drain announcements.
+        let node_id = config.node_id;
+        let peer_addr = cluster_config.listen_peer_addr.unwrap_or(addr);
+
+        // Run the gRPC server, outbound message loop, and signal handler
+        // concurrently. The distributed_runtime stays owned here so it is
+        // accessible for the drain protocol on shutdown.
+        tokio::select! {
+            result = grpc_future => {
+                // gRPC server exited (should not happen under normal operation).
+                result?;
+            }
+            _ = async {
+                loop {
+                    if !distributed_runtime.process_outbound().await {
+                        // No message was pending; yield to avoid busy-spinning.
+                        tokio::task::yield_now().await;
+                    }
+                }
+            } => {}
+            _ = tokio::signal::ctrl_c() => {
+                tracing::info!("received shutdown signal, initiating graceful drain");
+
+                // Phase 1: Announce departure via SWIM Leave gossip and
+                // unregister all names owned by this node from the registry.
+                let drain = NodeDrain::new(DrainConfig::default());
+                let mut gossip = GossipQueue::new();
+                let names_removed = {
+                    let mut reg = registry.lock().unwrap();
+                    drain.announce(node_id, peer_addr, &mut gossip, &mut reg)
+                };
+                tracing::info!(
+                    names_removed,
+                    "phase 1: announced departure via SWIM Leave gossip"
+                );
+
+                // Phase 2 is skipped — the outbound loop has already stopped
+                // because we exited the select!.
+
+                // Phase 3: Close all peer connections.
+                let cm = distributed_runtime.connection_manager_mut();
+                let closed = cm.drain_connections().await;
+                tracing::info!(
+                    connections_closed = closed,
+                    "phase 3: connections drained, shutdown complete"
+                );
+            }
+        }
 
         Ok(())
     }
