@@ -1,4 +1,5 @@
 use std::pin::Pin;
+use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::sync::{mpsc, oneshot};
@@ -7,6 +8,7 @@ use rand::Rng;
 use super::core::{Action, Event, RaftCore};
 use super::log_store::LogStore;
 use super::messages::*;
+use super::transport::RaftTransport;
 
 /// Configuration for the RaftNode.
 #[derive(Debug, Clone)]
@@ -36,6 +38,9 @@ impl Default for RaftConfig {
 #[derive(Clone)]
 pub struct RaftHandle {
     pub proposal_tx: mpsc::Sender<ClientProposal>,
+    /// Channel for delivering inbound Raft messages from peers.
+    /// The transport pushes `(from_node_id, message)` tuples here.
+    pub inbound_tx: mpsc::Sender<(u64, RaftMessage)>,
 }
 
 impl RaftHandle {
@@ -56,12 +61,20 @@ impl RaftHandle {
 }
 
 /// Spawn the RaftNode actor. Returns a handle for submitting proposals.
+///
+/// The `transport` parameter is used to send outbound Raft messages to peer
+/// nodes. Inbound messages from peers should be sent to `RaftHandle::inbound_tx`.
 pub async fn spawn_raft_node(
     config: RaftConfig,
     apply_tx: mpsc::Sender<Vec<LogEntry>>,
+    transport: Option<Arc<dyn RaftTransport>>,
 ) -> RaftHandle {
     let (proposal_tx, proposal_rx) = mpsc::channel::<ClientProposal>(256);
-    let handle = RaftHandle { proposal_tx };
+    let (inbound_tx, inbound_rx) = mpsc::channel::<(u64, RaftMessage)>(256);
+    let handle = RaftHandle {
+        proposal_tx,
+        inbound_tx,
+    };
 
     let data_dir = config.data_dir.clone();
     std::fs::create_dir_all(&data_dir).expect("create data dir");
@@ -86,6 +99,7 @@ pub async fn spawn_raft_node(
     // Spawn the actor as a tokio task
     tokio::spawn(async move {
         let mut proposal_rx = proposal_rx;
+        let mut inbound_rx = inbound_rx;
         let mut election_timer = random_election_timeout(&config);
         let mut heartbeat_timer: Option<tokio::time::Interval> = None;
         let mut pending_responses: std::collections::HashMap<
@@ -101,6 +115,7 @@ pub async fn spawn_raft_node(
             &mut pending_responses,
             &mut heartbeat_timer,
             &config,
+            &transport,
         )
         .await;
 
@@ -109,14 +124,14 @@ pub async fn spawn_raft_node(
                 // Election timeout
                 _ = &mut election_timer => {
                     let actions = core.step(Event::ElectionTimeout);
-                    execute_actions(&actions, &log_store, &apply_tx, &mut pending_responses, &mut heartbeat_timer, &config).await;
+                    execute_actions(&actions, &log_store, &apply_tx, &mut pending_responses, &mut heartbeat_timer, &config, &transport).await;
                     election_timer = random_election_timeout(&config);
                 }
 
                 // Heartbeat (leader only)
                 _ = heartbeat_tick(&mut heartbeat_timer) => {
                     let actions = core.step(Event::HeartbeatTimeout);
-                    execute_actions(&actions, &log_store, &apply_tx, &mut pending_responses, &mut heartbeat_timer, &config).await;
+                    execute_actions(&actions, &log_store, &apply_tx, &mut pending_responses, &mut heartbeat_timer, &config, &transport).await;
                 }
 
                 // Client proposals
@@ -124,7 +139,13 @@ pub async fn spawn_raft_node(
                     let id = proposal.id;
                     pending_responses.insert(id, proposal.response_tx);
                     let actions = core.step(Event::Proposal { id, data: proposal.data });
-                    execute_actions(&actions, &log_store, &apply_tx, &mut pending_responses, &mut heartbeat_timer, &config).await;
+                    execute_actions(&actions, &log_store, &apply_tx, &mut pending_responses, &mut heartbeat_timer, &config, &transport).await;
+                }
+
+                // Inbound Raft messages from peers (via transport)
+                Some((from, message)) = inbound_rx.recv() => {
+                    let actions = core.step(Event::Message { from, message });
+                    execute_actions(&actions, &log_store, &apply_tx, &mut pending_responses, &mut heartbeat_timer, &config, &transport).await;
                 }
             }
         }
@@ -159,6 +180,7 @@ async fn execute_actions(
     pending_responses: &mut std::collections::HashMap<u64, oneshot::Sender<ClientProposalResult>>,
     heartbeat_timer: &mut Option<tokio::time::Interval>,
     config: &RaftConfig,
+    transport: &Option<Arc<dyn RaftTransport>>,
 ) {
     for action in actions {
         match action {
@@ -202,9 +224,12 @@ async fn execute_actions(
             Action::StopHeartbeatTimer => {
                 *heartbeat_timer = None;
             }
-            Action::SendMessage { to, message: _ } => {
-                // TODO: send via Rebar DistributedRouter in multi-node mode
-                tracing::debug!(to = to, "would send raft message (no network yet)");
+            Action::SendMessage { to, message } => {
+                if let Some(ref transport) = transport {
+                    transport.send(*to, message.clone()).await;
+                } else {
+                    tracing::debug!(to = to, "would send raft message (no transport configured)");
+                }
             }
         }
     }

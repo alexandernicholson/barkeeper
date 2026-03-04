@@ -45,7 +45,7 @@ impl BarkeepServer {
         spawn_state_machine(Arc::clone(&store), apply_rx).await;
 
         // Spawn the Raft node.
-        let raft_handle = spawn_raft_node(config.clone(), apply_tx).await;
+        let raft_handle = spawn_raft_node(config.clone(), apply_tx, None).await;
 
         // Create the KV gRPC service.
         let cluster_id = 1;
