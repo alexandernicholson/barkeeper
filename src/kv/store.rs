@@ -570,6 +570,54 @@ impl KvStore {
         Ok(())
     }
 
+    /// Return all mutations since `after_revision` (exclusive).
+    /// Each entry is `(key, event_type, kv_at_revision)`.
+    /// event_type: 0 = PUT, 1 = DELETE.
+    pub fn changes_since(
+        &self,
+        after_revision: i64,
+    ) -> Result<Vec<(Vec<u8>, i32, mvccpb::KeyValue)>, redb::Error> {
+        let txn = self.db.begin_read()?;
+        let rev_table = txn.open_table(REV_TABLE)?;
+        let kv_table = txn.open_table(KV_TABLE)?;
+
+        let start_rev = (after_revision + 1) as u64;
+        let mut results = Vec::new();
+
+        let range = rev_table.range(start_rev..)?;
+        for entry in range {
+            let (rev_key, rev_val) = entry?;
+            let revision = rev_key.value();
+            let entries: Vec<RevisionEntry> = serde_json::from_slice(rev_val.value())
+                .expect("deserialize revision entries");
+
+            for re in entries {
+                let event_type = match re.event_type {
+                    EventType::Put => 0,
+                    EventType::Delete => 1,
+                };
+
+                let compound = make_compound_key(&re.key, revision);
+                let kv = match kv_table.get(compound.as_slice())? {
+                    Some(val) => {
+                        let ikv: InternalKeyValue = serde_json::from_slice(val.value())
+                            .expect("deserialize kv");
+                        ikv.to_proto()
+                    }
+                    None => mvccpb::KeyValue {
+                        key: re.key.clone(),
+                        mod_revision: revision as i64,
+                        ..Default::default()
+                    },
+                };
+
+                results.push((re.key, event_type, kv));
+            }
+        }
+
+        Ok(results)
+    }
+
     // ── Private helpers ─────────────────────────────────────────────────────
 
     /// Evaluate all compare conditions. Returns `true` if all pass.
