@@ -6,6 +6,7 @@ pub mod cluster;
 pub mod auth;
 pub mod api;
 pub mod config;
+pub mod actors;
 
 pub mod proto {
     pub mod mvccpb {
