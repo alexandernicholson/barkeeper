@@ -4,6 +4,16 @@ An etcd-compatible distributed key-value store built on the [Rebar](https://gith
 
 barkeeper implements the etcd v3 API surface -- both gRPC and HTTP/JSON gateway -- on top of a Raft consensus engine written from scratch as Rebar actors, with [redb](https://github.com/cberner/redb) for durable storage. No C dependencies, no cgo, single static binary.
 
+## Status
+
+| Component | Status |
+|-----------|--------|
+| etcd v3 API | Partial (KV, Watch, Lease, Cluster, Maintenance, Auth) |
+| Raft Consensus | Single-node |
+| Watch Notifications | Working |
+| Lease Expiry | Working |
+| Actor Runtime | Rebar |
+
 ## Features
 
 - **etcd v3 gRPC API** -- KV (Range, Put, DeleteRange, Txn, Compact), Watch, Lease, Cluster, Maintenance, Auth services
@@ -11,7 +21,10 @@ barkeeper implements the etcd v3 API surface -- both gRPC and HTTP/JSON gateway 
 - **Raft consensus** -- leader election, log replication, and persistence, implemented as Rebar actors
 - **MVCC key-value store** -- multi-version concurrency control with revision history and compaction
 - **Transactions** -- compare-and-swap via Txn with version/value comparisons
-- **Leases** -- grant, revoke, keepalive, and time-to-live tracking
+- **Watch notifications** -- real-time PUT/DELETE event streaming with prefix watching support
+- **Lease expiry** -- automatic key cleanup when TTL expires, grant/revoke/keepalive/timetolive
+- **Raft term in responses** -- all HTTP gateway responses include Raft term in headers
+- **Rebar actor supervision** -- process supervision via BarkeepSupervisor (OneForAll strategy)
 - **Cluster membership** -- member list, add, remove, update, promote
 - **Auth (RBAC)** -- user/role/permission management
 - **Snapshots** -- state machine snapshot types for recovery
@@ -75,6 +88,50 @@ ETCDCTL_API=3 etcdctl --endpoints=127.0.0.1:2379 put hello world
 ETCDCTL_API=3 etcdctl --endpoints=127.0.0.1:2379 get hello
 ```
 
+## Architecture
+
+barkeeper is structured as a Rebar actor tree with supervised processes:
+
+```
+BarkeepSupervisor (OneForAll)
+├── RaftProcess      — consensus engine
+├── StoreProcess     — MVCC KV store (planned)
+├── WatchProcess     — change notification (planned)
+├── LeaseProcess     — TTL management (planned)
+├── ClusterProcess   — membership (planned)
+└── AuthProcess      — RBAC (planned)
+```
+
+```
+Client Request
+    |
+    v
+gRPC Service / HTTP Gateway
+    |
+    v
+RaftNode Actor  (leader election, log replication)
+    |
+    v
+StateMachine Actor  (applies committed entries)
+    |
+    v
+KvStore  (MVCC store backed by redb)
+```
+
+**Rebar supervision** -- the `BarkeepSupervisor` uses a OneForAll restart strategy, meaning if any child process crashes, all processes are restarted to maintain consistent state. Currently `RaftProcess` is the active supervised process; the remaining processes are planned as the actor decomposition progresses.
+
+**Raft consensus** is implemented from scratch as a Rebar actor. A `RaftCore` pure state machine processes events and produces actions (persist, append, apply, send messages). The `RaftNode` actor wraps it with timers, channels, and a transport layer.
+
+**State machine** receives committed log entries from Raft and applies KvCommands (Put, DeleteRange, Txn, Compact) to the KvStore.
+
+**KvStore** implements MVCC semantics with revision-indexed storage. Each mutation increments a global revision counter. Range queries can read at any historical revision. Compaction removes old revisions to reclaim space.
+
+**Watch hub** delivers real-time notifications for PUT and DELETE events. Supports exact-key and prefix-based watching, streaming events to connected watchers as keys change.
+
+**Lease manager** handles TTL-based key lifecycle. When a lease expires, all keys attached to it are automatically cleaned up. Supports grant, revoke, keepalive, and time-to-live queries.
+
+**Storage** uses [redb](https://github.com/cberner/redb), a pure-Rust embedded database with ACID transactions. No C dependencies (unlike boltdb/bbolt used by etcd).
+
 ## CLI Flags
 
 | Flag | Default | Description |
@@ -115,31 +172,40 @@ ETCDCTL_API=3 etcdctl --endpoints=127.0.0.1:2379 get hello
 
 Byte fields (key, value) are base64-encoded in JSON, matching etcd's HTTP gateway behavior.
 
-## Architecture
+## Documentation
 
-```
-Client Request
-    |
-    v
-gRPC Service / HTTP Gateway
-    |
-    v
-RaftNode Actor  (leader election, log replication)
-    |
-    v
-StateMachine Actor  (applies committed entries)
-    |
-    v
-KvStore  (MVCC store backed by redb)
+| Document | Description |
+|----------|-------------|
+| [System Architecture](docs/architecture.md) | Internal architecture, actor model, and data flow |
+| [Developer Guide](docs/developer-guide.md) | Building, testing, and contributing |
+| [Extension Guide](docs/extending.md) | Adding new services and actors |
+| [etcd Compatibility Reference](docs/etcd-compatibility.md) | API parity tracking with etcd v3 |
+
+## Tests
+
+```bash
+cargo test
 ```
 
-**Raft consensus** is implemented from scratch as a Rebar actor. A `RaftCore` pure state machine processes events and produces actions (persist, append, apply, send messages). The `RaftNode` actor wraps it with timers, channels, and a transport layer.
+76 tests across 10 test suites covering the Raft state machine, log store, KV store (including MVCC, transactions, and compaction), etcd HTTP gateway API compatibility, watch notifications, and lease expiry.
 
-**State machine** receives committed log entries from Raft and applies KvCommands (Put, DeleteRange, Txn, Compact) to the KvStore.
+## Differences from etcd
 
-**KvStore** implements MVCC semantics with revision-indexed storage. Each mutation increments a global revision counter. Range queries can read at any historical revision. Compaction removes old revisions to reclaim space.
+| Feature | etcd | barkeeper |
+|---------|------|-----------|
+| Language | Go | Rust |
+| Actor runtime | -- | Rebar (BEAM-inspired) |
+| Storage engine | bbolt (cgo) | redb (pure Rust) |
+| C dependencies | Yes (cgo) | None |
+| Watch notifications | Real-time | Working (PUT/DELETE events, prefix watching) |
+| Lease expiry | Timer-driven via Raft | Working (automatic key cleanup on TTL expiry) |
+| Auth | Token-based | RBAC structure implemented, token enforcement in progress |
+| Multi-node | Production-ready | Transport layer implemented, cluster bootstrap in progress |
+| TLS | Full support | Not yet implemented |
+| MVCC | Full | Implemented with revision history and compaction |
+| Transactions | Full Txn API | Compare-and-swap with version/value targets |
 
-**Storage** uses [redb](https://github.com/cberner/redb), a pure-Rust embedded database with ACID transactions. No C dependencies (unlike boltdb/bbolt used by etcd).
+barkeeper is a from-scratch implementation, not a fork of etcd. It aims for API compatibility, not code compatibility.
 
 ## Building from Source
 
@@ -169,32 +235,6 @@ cargo build --release
 ```
 
 The binary will be at `./target/release/barkeeper`.
-
-### Run tests
-
-```bash
-cargo test
-```
-
-This runs 55 tests covering the Raft state machine, log store, KV store (including MVCC, transactions, and compaction), and etcd HTTP gateway API compatibility.
-
-## Differences from etcd
-
-| Feature | etcd | barkeeper |
-|---------|------|-----------|
-| Language | Go | Rust |
-| Actor runtime | -- | Rebar (BEAM-inspired) |
-| Storage engine | bbolt (cgo) | redb (pure Rust) |
-| C dependencies | Yes (cgo) | None |
-| Watch notifications | Real-time | Hub implemented, notifications in progress |
-| Lease expiry | Timer-driven via Raft | TTL tracked, expiry timer in progress |
-| Auth | Token-based | RBAC structure implemented, token enforcement in progress |
-| Multi-node | Production-ready | Transport layer implemented, cluster bootstrap in progress |
-| TLS | Full support | Not yet implemented |
-| MVCC | Full | Implemented with revision history and compaction |
-| Transactions | Full Txn API | Compare-and-swap with version/value targets |
-
-barkeeper is a from-scratch implementation, not a fork of etcd. It aims for API compatibility, not code compatibility.
 
 ## License
 
