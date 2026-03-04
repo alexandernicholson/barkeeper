@@ -8,27 +8,32 @@ barkeeper implements the etcd v3 API surface -- both gRPC and HTTP/JSON gateway 
 
 | Component | Status |
 |-----------|--------|
-| etcd v3 API | Partial (KV, Watch, Lease, Cluster, Maintenance, Auth) |
-| Raft Consensus | Single-node |
-| Watch Notifications | Working |
-| Lease Expiry | Working |
+| etcd v3 API | All KV, Watch, Lease, Cluster, Maintenance, Auth endpoints working |
+| Raft Consensus | All writes go through Raft; multi-node via gRPC transport |
+| TLS | Auto-TLS and manual certificate support |
+| Auth Enforcement | HTTP middleware + gRPC interceptor (bcrypt passwords) |
+| Watch Notifications | Working, with revision-based replay |
+| Lease Expiry | Raft-proposed expiry (consistent across nodes) |
 | Actor Runtime | Rebar |
 
 ## Features
 
 - **etcd v3 gRPC API** -- KV (Range, Put, DeleteRange, Txn, Compact), Watch, Lease, Cluster, Maintenance, Auth services
-- **HTTP/JSON gateway** -- REST endpoints matching etcd's grpc-gateway (`/v3/kv/put`, `/v3/kv/range`, etc.)
-- **Raft consensus** -- leader election, log replication, and persistence, implemented as Rebar actors
+- **HTTP/JSON gateway** -- REST endpoints matching etcd's grpc-gateway (`/v3/kv/put`, `/v3/kv/range`, `/v3/kv/compaction`, etc.)
+- **Raft consensus on all writes** -- every KV mutation (put, delete, txn, compact) is proposed through Raft before being applied
+- **Multi-node clustering** -- gRPC-based `RaftTransport` with cluster bootstrap CLI for forming and joining clusters
+- **TLS support** -- auto-TLS (self-signed certificates generated at startup) and manual certificate configuration
+- **Auth enforcement** -- when auth is enabled, HTTP middleware and gRPC interceptors validate tokens; bcrypt password hashing
 - **MVCC key-value store** -- multi-version concurrency control with revision history and compaction
-- **Transactions** -- compare-and-swap via Txn with version/value comparisons
-- **Watch notifications** -- real-time PUT/DELETE event streaming with prefix watching support
-- **Lease expiry** -- automatic key cleanup when TTL expires, grant/revoke/keepalive/timetolive
+- **Transactions** -- compare-and-swap via Txn with version/value comparisons; watch notifications fire for transaction mutations
+- **Watch notifications** -- real-time PUT/DELETE event streaming with prefix watching and revision-based replay (WatchHub replays history)
+- **Lease expiry** -- Raft-proposed lease expiry for consistent cleanup across nodes; grant/revoke/keepalive/timetolive
 - **Raft term in responses** -- all HTTP gateway responses include Raft term in headers
 - **Rebar actor supervision** -- process supervision via BarkeepSupervisor (OneForAll strategy)
 - **Cluster membership** -- member list, add, remove, update, promote
-- **Auth (RBAC)** -- user/role/permission management
+- **Auth (RBAC)** -- user/role/permission management with enforcement
 - **Snapshots** -- state machine snapshot types for recovery
-- **Transport layer** -- pluggable Raft message transport for multi-node clusters
+- **Transport layer** -- gRPC-based Raft message transport for multi-node clusters
 - **Pure Rust** -- no C dependencies; storage via redb, not boltdb
 
 ## Quick Start
@@ -47,7 +52,8 @@ cargo build --release
 
 By default, barkeeper listens on:
 - **gRPC**: `127.0.0.1:2379`
-- **HTTP gateway**: `127.0.0.1:2380`
+- **HTTP gateway**: `127.0.0.1:2380` (gRPC port + 1)
+- **Peer traffic**: `localhost:2380`
 
 ### Test with curl (HTTP gateway)
 
@@ -94,12 +100,12 @@ barkeeper is structured as a Rebar actor tree with supervised processes:
 
 ```
 BarkeepSupervisor (OneForAll)
-├── RaftProcess      — consensus engine
-├── StoreProcess     — MVCC KV store (planned)
-├── WatchProcess     — change notification (planned)
-├── LeaseProcess     — TTL management (planned)
-├── ClusterProcess   — membership (planned)
-└── AuthProcess      — RBAC (planned)
+├── RaftProcess      — consensus engine (all writes go through Raft)
+├── StoreProcess     — MVCC KV store
+├── WatchProcess     — change notification with revision replay
+├── LeaseProcess     — TTL management (Raft-proposed expiry)
+├── ClusterProcess   — membership
+└── AuthProcess      — RBAC with enforcement
 ```
 
 ```
@@ -118,7 +124,7 @@ StateMachine Actor  (applies committed entries)
 KvStore  (MVCC store backed by redb)
 ```
 
-**Rebar supervision** -- the `BarkeepSupervisor` uses a OneForAll restart strategy, meaning if any child process crashes, all processes are restarted to maintain consistent state. Currently `RaftProcess` is the active supervised process; the remaining processes are planned as the actor decomposition progresses.
+**Rebar supervision** -- the `BarkeepSupervisor` uses a OneForAll restart strategy, meaning if any child process crashes, all processes are restarted to maintain consistent state.
 
 **Raft consensus** is implemented from scratch as a Rebar actor. A `RaftCore` pure state machine processes events and produces actions (persist, append, apply, send messages). The `RaftNode` actor wraps it with timers, channels, and a transport layer.
 
@@ -140,6 +146,19 @@ KvStore  (MVCC store backed by redb)
 | `--data-dir` | `data.barkeeper` | Path to data directory |
 | `--listen-client-urls` | `127.0.0.1:2379` | gRPC listen address (HTTP gateway binds to port+1) |
 | `--node-id` | `1` | Raft node ID |
+| `--listen-peer-urls` | `http://localhost:2380` | URL to listen on for peer traffic |
+| `--initial-cluster` | | Comma-separated cluster members (`1=http://10.0.0.1:2380,2=http://10.0.0.2:2380`) |
+| `--initial-cluster-state` | `new` | `new` for fresh cluster, `existing` to join |
+| `--auto-tls` | `false` | Auto-generate self-signed certs for client connections |
+| `--cert-file` | | Path to client server TLS cert file |
+| `--key-file` | | Path to client server TLS key file |
+| `--trusted-ca-file` | | Path to client server TLS trusted CA cert file |
+| `--client-cert-auth` | `false` | Enable client certificate authentication |
+| `--self-signed-cert-validity` | `1` | Validity period of self-signed certs (years) |
+| `--peer-auto-tls` | `false` | Auto-generate self-signed certs for peer connections |
+| `--peer-cert-file` | | Path to peer TLS cert file |
+| `--peer-key-file` | | Path to peer TLS key file |
+| `--peer-trusted-ca-file` | | Path to peer TLS trusted CA cert file |
 
 ## Supported APIs
 
@@ -162,7 +181,7 @@ KvStore  (MVCC store backed by redb)
 | `POST /v3/kv/range` | Get key(s) by key or key range |
 | `POST /v3/kv/deleterange` | Delete key(s) |
 | `POST /v3/kv/txn` | Transactional compare-and-swap |
-| `POST /v3/kv/compaction` | Compact revision history (stub) |
+| `POST /v3/kv/compaction` | Compact revision history |
 | `POST /v3/lease/grant` | Grant a lease |
 | `POST /v3/lease/revoke` | Revoke a lease |
 | `POST /v3/lease/timetolive` | Query lease TTL |
@@ -187,7 +206,7 @@ Byte fields (key, value) are base64-encoded in JSON, matching etcd's HTTP gatewa
 cargo test
 ```
 
-76 tests across 10 test suites covering the Raft state machine, log store, KV store (including MVCC, transactions, and compaction), etcd HTTP gateway API compatibility, watch notifications, and lease expiry.
+96 tests across 17 test suites covering Raft consensus, log store, KV store (MVCC, transactions, compaction), etcd HTTP gateway API compatibility, watch notifications (including revision replay), lease expiry, TLS configuration, auth enforcement, multi-node clustering, and gRPC transport.
 
 ## Differences from etcd
 
@@ -201,18 +220,18 @@ barkeeper is a from-scratch implementation, not a fork of etcd. It aims for API 
 | Concurrency | goroutines | Rebar actor runtime (BEAM-inspired) |
 | Storage | bbolt (cgo) | redb (pure Rust, no C deps) |
 
-### Known Gaps
+### Previously Known Gaps (all closed)
 
-| Gap | Details |
-|-----|---------|
-| **Writes bypass Raft** | KV mutations (put, delete, txn) go directly to the store instead of being proposed through Raft consensus. The Raft engine runs and elects a leader, but the write path doesn't use it yet. RaftProcess actor is implemented but not wired into the service layer. |
-| **Single-node only** | No multi-node clustering. The `RaftTransport` trait and message serialization exist, but no networked transport is implemented. |
-| **No TLS** | Neither gRPC nor HTTP gateway support TLS. |
-| **Auth not enforced** | The Auth gRPC API works (create users, roles, permissions) but requests are not checked for auth tokens. |
-| **Lease expiry is local** | etcd proposes lease expiry through Raft so all nodes agree. barkeeper uses a local timer that deletes keys directly from the store. Fine for single-node, incorrect for multi-node. |
-| **Txn watch notifications** | Mutations inside a transaction do not fire watch events. Direct put/delete calls do. |
-| **HTTP compaction stubbed** | gRPC `Compact` works. The HTTP gateway endpoint `/v3/kv/compaction` returns 501. |
-| **No revision-based watching** | etcd supports watching from a specific start revision. barkeeper's watch hub only streams events from the point of subscription. |
+All eight previously documented behavioral gaps have been resolved:
+
+1. **Writes go through Raft** -- all KV mutations (put, delete, txn, compact) are proposed through Raft consensus before being applied to the state machine.
+2. **Multi-node networking** -- gRPC-based `RaftTransport` with cluster bootstrap CLI (`--initial-cluster`, `--initial-cluster-state`).
+3. **TLS support** -- auto-TLS (self-signed certs) and manual certificate configuration for both client and peer connections.
+4. **Auth enforcement** -- when auth is enabled, HTTP middleware and gRPC interceptors validate tokens on every request; bcrypt password hashing.
+5. **Raft-proposed lease expiry** -- lease expiry is proposed through Raft so all nodes agree on cleanup.
+6. **Txn watch notifications** -- mutations inside transactions now fire watch events.
+7. **HTTP compaction endpoint** -- `/v3/kv/compaction` is fully functional.
+8. **Revision-based watching** -- WatchHub replays history from a specified start revision.
 
 ## Building from Source
 
