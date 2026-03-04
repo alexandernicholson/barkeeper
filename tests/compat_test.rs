@@ -22,7 +22,7 @@ use barkeeper::kv::state_machine::spawn_state_machine;
 use barkeeper::kv::store::KvStore;
 use barkeeper::lease::manager::LeaseManager;
 use barkeeper::raft::node::{spawn_raft_node, RaftConfig};
-use barkeeper::watch::hub::WatchHub;
+use barkeeper::watch::actor::spawn_watch_hub_actor;
 use rebar_core::runtime::Runtime;
 
 /// Spin up a minimal barkeeper instance and return the HTTP gateway address.
@@ -51,7 +51,8 @@ async fn start_test_instance() -> (SocketAddr, tempfile::TempDir) {
         .add_initial_member(1, "test-node".to_string(), vec![], vec![])
         .await;
 
-    let watch_hub = Arc::new(WatchHub::with_store(store.clone()));
+    let watch_runtime = Runtime::new(1);
+    let watch_hub = spawn_watch_hub_actor(&watch_runtime, Some(store.clone())).await;
     let auth_runtime = Runtime::new(1);
     let auth_manager = spawn_auth_actor(&auth_runtime).await;
 
@@ -59,7 +60,7 @@ async fn start_test_instance() -> (SocketAddr, tempfile::TempDir) {
     {
         let lm = Arc::clone(&lease_manager);
         let st = store.clone();
-        let wh = Arc::clone(&watch_hub);
+        let wh = watch_hub.clone();
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
@@ -76,7 +77,7 @@ async fn start_test_instance() -> (SocketAddr, tempfile::TempDir) {
                                     value: vec![],
                                     lease: 0,
                                 };
-                                wh.notify(&prev.key, 1, tombstone, Some(prev.clone())).await;
+                                wh.notify(prev.key.clone(), 1, tombstone, Some(prev.clone())).await;
                             }
                         }
                     }
@@ -88,7 +89,7 @@ async fn start_test_instance() -> (SocketAddr, tempfile::TempDir) {
     let app = gateway::create_router(
         raft_handle.clone(),
         store.clone(),
-        Arc::clone(&watch_hub),
+        watch_hub.clone(),
         Arc::clone(&lease_manager),
         cluster_manager,
         1,

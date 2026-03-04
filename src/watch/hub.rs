@@ -181,7 +181,7 @@ impl WatchHub {
 /// - If `range_end` is empty, the watcher matches only the exact key.
 /// - If `range_end` is `[0]` (`\x00`), the watcher matches all keys >= key.
 /// - Otherwise the watcher matches keys in the half-open range [key, range_end).
-fn key_matches(watcher_key: &[u8], range_end: &[u8], event_key: &[u8]) -> bool {
+pub fn key_matches(watcher_key: &[u8], range_end: &[u8], event_key: &[u8]) -> bool {
     if range_end.is_empty() {
         // Exact match.
         event_key == watcher_key

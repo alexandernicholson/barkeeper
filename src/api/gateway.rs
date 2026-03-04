@@ -29,7 +29,7 @@ use crate::kv::store::{TxnCompare, TxnCompareResult, TxnCompareTarget, TxnOp, Tx
 use crate::lease::manager::LeaseManager;
 use crate::raft::messages::ClientProposalResult;
 use crate::raft::node::RaftHandle;
-use crate::watch::hub::WatchHub;
+use crate::watch::actor::WatchHubActorHandle;
 
 // ── Proto3 JSON serialization helpers ──────────────────────────────────────
 
@@ -66,7 +66,7 @@ fn is_empty_str(val: &str) -> bool {
 #[derive(Clone)]
 pub struct GatewayState {
     pub store: KvStoreActorHandle,
-    pub watch_hub: Arc<WatchHub>,
+    pub watch_hub: WatchHubActorHandle,
     pub lease_manager: Arc<LeaseManager>,
     pub cluster_manager: ClusterActorHandle,
     pub auth_manager: AuthActorHandle,
@@ -494,7 +494,7 @@ async fn auth_middleware(
 pub fn create_router(
     raft_handle: RaftHandle,
     store: KvStoreActorHandle,
-    watch_hub: Arc<WatchHub>,
+    watch_hub: WatchHubActorHandle,
     lease_manager: Arc<LeaseManager>,
     cluster_manager: ClusterActorHandle,
     cluster_id: u64,
@@ -631,7 +631,7 @@ async fn handle_put(
                         value: value.clone(),
                         lease: lease_id,
                     };
-                    state.watch_hub.notify(&key, 0, notify_kv, result.prev_kv.clone()).await;
+                    state.watch_hub.notify(key.clone(), 0, notify_kv, result.prev_kv.clone()).await;
 
                     // Attach the key to its lease so the expiry timer can clean it up.
                     if lease_id != 0 {
@@ -701,7 +701,7 @@ async fn handle_delete_range(
                             value: vec![],
                             lease: 0,
                         };
-                        state.watch_hub.notify(&prev.key, 1, tombstone, Some(prev.clone())).await;
+                        state.watch_hub.notify(prev.key.clone(), 1, tombstone, Some(prev.clone())).await;
                     }
 
                     let prev_kvs = if req.prev_kv.unwrap_or(false) {
@@ -850,7 +850,7 @@ async fn handle_txn(
                                     value: value.clone(),
                                     lease: *lease_id,
                                 };
-                                state.watch_hub.notify(key, 0, notify_kv, r.prev_kv.clone()).await;
+                                state.watch_hub.notify(key.clone(), 0, notify_kv, r.prev_kv.clone()).await;
                             }
                             (TxnOp::DeleteRange { .. }, TxnOpResponse::DeleteRange(r)) => {
                                 for prev in &r.prev_kvs {
@@ -862,7 +862,7 @@ async fn handle_txn(
                                         value: vec![],
                                         lease: 0,
                                     };
-                                    state.watch_hub.notify(&prev.key, 1, tombstone, Some(prev.clone())).await;
+                                    state.watch_hub.notify(prev.key.clone(), 1, tombstone, Some(prev.clone())).await;
                                 }
                             }
                             _ => {} // Range ops don't need notifications

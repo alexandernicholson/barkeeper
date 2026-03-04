@@ -18,12 +18,12 @@ use crate::proto::etcdserverpb::{
 };
 use crate::raft::node::RaftHandle;
 use crate::raft::messages::ClientProposalResult;
-use crate::watch::hub::WatchHub;
+use crate::watch::actor::WatchHubActorHandle;
 
 /// gRPC KV service implementing the etcd KV API.
 pub struct KvService {
     store: KvStoreActorHandle,
-    watch_hub: Arc<WatchHub>,
+    watch_hub: WatchHubActorHandle,
     lease_manager: Arc<LeaseManager>,
     cluster_id: u64,
     member_id: u64,
@@ -34,7 +34,7 @@ pub struct KvService {
 impl KvService {
     pub fn new(
         store: KvStoreActorHandle,
-        watch_hub: Arc<WatchHub>,
+        watch_hub: WatchHubActorHandle,
         lease_manager: Arc<LeaseManager>,
         cluster_id: u64,
         member_id: u64,
@@ -126,7 +126,7 @@ impl Kv for KvService {
                     value: req.value.clone(),
                     lease: req.lease,
                 };
-                self.watch_hub.notify(&req.key, 0, notify_kv, result.prev_kv.clone()).await;
+                self.watch_hub.notify(req.key.clone(), 0, notify_kv, result.prev_kv.clone()).await;
 
                 // Attach the key to its lease so the expiry timer can clean it up.
                 if req.lease != 0 {
@@ -188,7 +188,7 @@ impl Kv for KvService {
                         value: vec![],
                         lease: 0,
                     };
-                    self.watch_hub.notify(&prev.key, 1, tombstone, Some(prev.clone())).await;
+                    self.watch_hub.notify(prev.key.clone(), 1, tombstone, Some(prev.clone())).await;
                 }
 
                 let prev_kvs = if req.prev_kv {
@@ -278,7 +278,7 @@ impl Kv for KvService {
                                 value: value.clone(),
                                 lease: *lease_id,
                             };
-                            self.watch_hub.notify(key, 0, notify_kv, r.prev_kv.clone()).await;
+                            self.watch_hub.notify(key.clone(), 0, notify_kv, r.prev_kv.clone()).await;
                         }
                         (TxnOp::DeleteRange { .. }, TxnOpResponse::DeleteRange(r)) => {
                             for prev in &r.prev_kvs {
@@ -290,7 +290,7 @@ impl Kv for KvService {
                                     value: vec![],
                                     lease: 0,
                                 };
-                                self.watch_hub.notify(&prev.key, 1, tombstone, Some(prev.clone())).await;
+                                self.watch_hub.notify(prev.key.clone(), 1, tombstone, Some(prev.clone())).await;
                             }
                         }
                         _ => {} // Range ops don't need notifications

@@ -19,7 +19,7 @@ use barkeeper::kv::state_machine::spawn_state_machine;
 use barkeeper::kv::store::KvStore;
 use barkeeper::lease::manager::LeaseManager;
 use barkeeper::raft::node::{spawn_raft_node, RaftConfig};
-use barkeeper::watch::hub::WatchHub;
+use barkeeper::watch::actor::spawn_watch_hub_actor;
 use rebar_core::runtime::Runtime;
 
 fn b64(s: &str) -> String {
@@ -43,7 +43,8 @@ async fn start_instance_with_lease_expiry() -> (SocketAddr, KvStoreActorHandle, 
     let raft_handle = spawn_raft_node(config, apply_tx).await;
 
     let lease_manager = Arc::new(LeaseManager::new());
-    let watch_hub = Arc::new(WatchHub::with_store(store.clone()));
+    let watch_runtime = Runtime::new(1);
+    let watch_hub = spawn_watch_hub_actor(&watch_runtime, Some(store.clone())).await;
     let cluster_runtime = Runtime::new(1);
     let cluster_manager = spawn_cluster_actor(&cluster_runtime, 1).await;
     cluster_manager.add_initial_member(1, "test".to_string(), vec![], vec![]).await;
@@ -51,7 +52,7 @@ async fn start_instance_with_lease_expiry() -> (SocketAddr, KvStoreActorHandle, 
     // Spawn a lease expiry timer that checks every 500ms.
     let lm_clone = Arc::clone(&lease_manager);
     let store_clone = store.clone();
-    let hub_clone = Arc::clone(&watch_hub);
+    let hub_clone = watch_hub.clone();
     tokio::spawn(async move {
         loop {
             sleep(Duration::from_millis(500)).await;
@@ -68,7 +69,7 @@ async fn start_instance_with_lease_expiry() -> (SocketAddr, KvStoreActorHandle, 
                         value: vec![],
                         lease: 0,
                     };
-                    hub_clone.notify(key, 1, tombstone, None).await;
+                    hub_clone.notify(key.clone(), 1, tombstone, None).await;
                 }
             }
         }
@@ -80,7 +81,7 @@ async fn start_instance_with_lease_expiry() -> (SocketAddr, KvStoreActorHandle, 
     let app = gateway::create_router(
         raft_handle.clone(),
         store.clone(),
-        Arc::clone(&watch_hub),
+        watch_hub.clone(),
         Arc::clone(&lease_manager),
         cluster_manager,
         1, 1,

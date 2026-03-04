@@ -21,7 +21,7 @@ use barkeeper::kv::state_machine::spawn_state_machine;
 use barkeeper::kv::store::KvStore;
 use barkeeper::lease::manager::LeaseManager;
 use barkeeper::raft::node::{spawn_raft_node, RaftConfig};
-use barkeeper::watch::hub::WatchHub;
+use barkeeper::watch::actor::spawn_watch_hub_actor;
 use rebar_core::runtime::Runtime;
 
 fn b64(s: &str) -> String {
@@ -55,14 +55,15 @@ async fn start_test_instance() -> (SocketAddr, tempfile::TempDir) {
         .add_initial_member(1, "test-node".to_string(), vec![], vec![])
         .await;
 
-    let watch_hub = Arc::new(WatchHub::with_store(store.clone()));
+    let watch_runtime = Runtime::new(1);
+    let watch_hub = spawn_watch_hub_actor(&watch_runtime, Some(store.clone())).await;
     let auth_runtime = Runtime::new(1);
     let auth_manager = spawn_auth_actor(&auth_runtime).await;
 
     let app = gateway::create_router(
         raft_handle.clone(),
         store.clone(),
-        Arc::clone(&watch_hub),
+        watch_hub.clone(),
         Arc::clone(&lease_manager),
         cluster_manager,
         1,

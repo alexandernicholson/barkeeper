@@ -41,7 +41,7 @@ use crate::proto::etcdserverpb::maintenance_server::MaintenanceServer;
 use crate::proto::etcdserverpb::watch_server::WatchServer;
 use crate::raft::node::{spawn_raft_node_rebar, RaftConfig};
 use crate::tls::TlsConfig;
-use crate::watch::hub::WatchHub;
+use crate::watch::actor::spawn_watch_hub_actor;
 
 /// TCP connector for the ConnectionManager.
 ///
@@ -179,11 +179,12 @@ impl BarkeepServer {
             });
         }
 
-        // Create the Watch hub and gRPC service.
+        // Create the Watch hub actor and gRPC service.
         let cluster_id = 1;
         let member_id = config.node_id;
-        let watch_hub = Arc::new(WatchHub::with_store(store.clone()));
-        let watch_service = WatchService::new(Arc::clone(&watch_hub), cluster_id, member_id, Arc::clone(&raft_term));
+        let watch_runtime = rebar_core::runtime::Runtime::new(config.node_id);
+        let watch_hub = spawn_watch_hub_actor(&watch_runtime, Some(store.clone())).await;
+        let watch_service = WatchService::new(watch_hub.clone(), cluster_id, member_id, Arc::clone(&raft_term));
 
         // Create the Lease manager and gRPC service.
         let lease_manager = Arc::new(LeaseManager::new());
@@ -191,7 +192,7 @@ impl BarkeepServer {
         // Create the KV gRPC service.
         let kv_service = KvService::new(
             store.clone(),
-            Arc::clone(&watch_hub),
+            watch_hub.clone(),
             Arc::clone(&lease_manager),
             cluster_id,
             member_id,
@@ -253,7 +254,7 @@ impl BarkeepServer {
         {
             let lm = Arc::clone(&lease_manager);
             let st = store.clone();
-            let wh = Arc::clone(&watch_hub);
+            let wh = watch_hub.clone();
             supervisor
                 .add_child(ChildEntry::new(
                     ChildSpec::new("lease_expiry_timer")
@@ -261,7 +262,7 @@ impl BarkeepServer {
                     move || {
                         let lm = Arc::clone(&lm);
                         let st = st.clone();
-                        let wh = Arc::clone(&wh);
+                        let wh = wh.clone();
                         async move {
                             tracing::info!("lease expiry timer started");
                             loop {
@@ -279,7 +280,7 @@ impl BarkeepServer {
                                                     value: vec![],
                                                     lease: 0,
                                                 };
-                                                wh.notify(&prev.key, 1, tombstone, Some(prev.clone())).await;
+                                                wh.notify(prev.key.clone(), 1, tombstone, Some(prev.clone())).await;
                                             }
                                         }
                                     }
@@ -300,7 +301,7 @@ impl BarkeepServer {
         let http_app = gateway::create_router(
             raft_handle,
             store.clone(),
-            Arc::clone(&watch_hub),
+            watch_hub.clone(),
             Arc::clone(&lease_manager),
             cluster_manager,
             cluster_id,

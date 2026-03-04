@@ -54,6 +54,30 @@ pub enum WatchCmd {
     },
 }
 
+/// Commands sent to the WatchHubActor.
+pub enum WatchHubCmd {
+    /// Create a new watch on a key or range. Returns the watch_id and an event
+    /// receiver through the reply channel.
+    CreateWatch {
+        key: Vec<u8>,
+        range_end: Vec<u8>,
+        start_revision: i64,
+        reply: oneshot::Sender<(i64, tokio::sync::mpsc::Receiver<crate::watch::hub::WatchEvent>)>,
+    },
+    /// Cancel an existing watch. Returns true if the watcher existed and was removed.
+    CancelWatch {
+        watch_id: i64,
+        reply: oneshot::Sender<bool>,
+    },
+    /// Notify all matching watchers of a mutation event. Fire-and-forget (no reply).
+    Notify {
+        key: Vec<u8>,
+        event_type: i32, // 0 = PUT, 1 = DELETE
+        kv: mvccpb::KeyValue,
+        prev_kv: Option<mvccpb::KeyValue>,
+    },
+}
+
 /// Commands sent to the LeaseProcess actor.
 pub enum LeaseCmd {
     /// Check for expired leases (called by timer tick).

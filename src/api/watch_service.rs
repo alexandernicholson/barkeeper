@@ -9,33 +9,24 @@ use tonic::{Request, Response, Status, Streaming};
 use crate::proto::etcdserverpb::watch_request::RequestUnion;
 use crate::proto::etcdserverpb::watch_server::Watch;
 use crate::proto::etcdserverpb::{ResponseHeader, WatchRequest, WatchResponse};
-use crate::watch::hub::WatchHub;
+use crate::watch::actor::WatchHubActorHandle;
 
 /// gRPC Watch service implementing the etcd Watch API.
 pub struct WatchService {
-    hub: Arc<WatchHub>,
+    hub: WatchHubActorHandle,
     cluster_id: u64,
     member_id: u64,
     raft_term: Arc<AtomicU64>,
 }
 
 impl WatchService {
-    pub fn new(hub: Arc<WatchHub>, cluster_id: u64, member_id: u64, raft_term: Arc<AtomicU64>) -> Self {
+    pub fn new(hub: WatchHubActorHandle, cluster_id: u64, member_id: u64, raft_term: Arc<AtomicU64>) -> Self {
         WatchService {
             hub,
             cluster_id,
             member_id,
             raft_term,
         }
-    }
-
-    fn make_header(&self, revision: i64) -> Option<ResponseHeader> {
-        Some(ResponseHeader {
-            cluster_id: self.cluster_id,
-            member_id: self.member_id,
-            revision,
-            raft_term: self.raft_term.load(Ordering::Relaxed),
-        })
     }
 }
 
@@ -50,7 +41,7 @@ impl Watch for WatchService {
         let mut in_stream = request.into_inner();
         let (resp_tx, resp_rx) = mpsc::channel(256);
 
-        let hub = Arc::clone(&self.hub);
+        let hub = self.hub.clone();
         let cluster_id = self.cluster_id;
         let member_id = self.member_id;
         let raft_term = Arc::clone(&self.raft_term);
