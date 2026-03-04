@@ -915,3 +915,52 @@ async fn test_response_header_has_nonzero_raft_term() {
     let term_val: u64 = raft_term.as_str().unwrap_or("0").parse().unwrap_or(0);
     assert!(term_val > 0, "raft_term should be > 0, got {}", term_val);
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Compaction Tests
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// HTTP compaction endpoint should work, not return 501.
+#[tokio::test]
+async fn test_http_compaction_works() {
+    let (addr, _dir) = start_test_instance().await;
+    let client = Client::new();
+
+    // Put some keys to create revisions.
+    client
+        .post(format!("http://{}/v3/kv/put", addr))
+        .body(format!(
+            r#"{{"key":"{}","value":"{}"}}"#,
+            b64("compact1"),
+            b64("v1")
+        ))
+        .send()
+        .await
+        .unwrap();
+    client
+        .post(format!("http://{}/v3/kv/put", addr))
+        .body(format!(
+            r#"{{"key":"{}","value":"{}"}}"#,
+            b64("compact2"),
+            b64("v2")
+        ))
+        .send()
+        .await
+        .unwrap();
+
+    // Compact at revision 1.
+    let resp = client
+        .post(format!("http://{}/v3/kv/compaction", addr))
+        .body(r#"{"revision":"1"}"#)
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 200, "compaction should return 200, not 501");
+
+    let body: Value = resp.json().await.unwrap();
+    assert!(
+        body.get("header").is_some(),
+        "compaction response should have header"
+    );
+}
