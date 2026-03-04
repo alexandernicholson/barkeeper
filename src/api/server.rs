@@ -8,6 +8,7 @@ use crate::api::cluster_service::ClusterService;
 use crate::api::gateway;
 use crate::api::kv_service::KvService;
 use crate::api::lease_service::LeaseService;
+use crate::api::maintenance_service::MaintenanceService;
 use crate::api::watch_service::WatchService;
 use crate::cluster::manager::ClusterManager;
 use crate::kv::state_machine::spawn_state_machine;
@@ -16,6 +17,7 @@ use crate::lease::manager::LeaseManager;
 use crate::proto::etcdserverpb::cluster_server::ClusterServer;
 use crate::proto::etcdserverpb::kv_server::KvServer;
 use crate::proto::etcdserverpb::lease_server::LeaseServer;
+use crate::proto::etcdserverpb::maintenance_server::MaintenanceServer;
 use crate::proto::etcdserverpb::watch_server::WatchServer;
 use crate::raft::node::{spawn_raft_node, RaftConfig};
 use crate::watch::hub::WatchHub;
@@ -78,6 +80,10 @@ impl BarkeepServer {
         let cluster_service =
             ClusterService::new(Arc::clone(&cluster_manager), cluster_id, member_id);
 
+        // Create the Maintenance gRPC service.
+        let maintenance_service =
+            MaintenanceService::new(Arc::clone(&store), cluster_id, member_id);
+
         // Start the HTTP/JSON gateway on port + 1.
         let http_addr = SocketAddr::new(addr.ip(), addr.port() + 1);
         let http_app = gateway::create_router(
@@ -107,6 +113,7 @@ impl BarkeepServer {
             .add_service(WatchServer::new(watch_service))
             .add_service(LeaseServer::new(lease_service))
             .add_service(ClusterServer::new(cluster_service))
+            .add_service(MaintenanceServer::new(maintenance_service))
             .serve(addr)
             .await?;
 

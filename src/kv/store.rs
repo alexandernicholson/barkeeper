@@ -110,11 +110,13 @@ fn extract_revision(compound: &[u8]) -> u64 {
 /// that encode the user key and revision for lexicographic ordering.
 pub struct KvStore {
     db: Database,
+    db_path: std::path::PathBuf,
 }
 
 impl KvStore {
     /// Open or create a KvStore at the given path.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, redb::Error> {
+        let db_path = path.as_ref().to_path_buf();
         let db = Database::create(path)?;
         // Ensure all tables exist.
         let txn = db.begin_write()?;
@@ -124,7 +126,13 @@ impl KvStore {
             txn.open_table(META_TABLE)?;
         }
         txn.commit()?;
-        Ok(KvStore { db })
+        Ok(KvStore { db, db_path })
+    }
+
+    /// Get the database file size in bytes.
+    pub fn db_file_size(&self) -> Result<i64, std::io::Error> {
+        let metadata = std::fs::metadata(&self.db_path)?;
+        Ok(metadata.len() as i64)
     }
 
     /// Get the current revision number.
