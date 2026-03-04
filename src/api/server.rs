@@ -110,6 +110,36 @@ impl BarkeepServer {
         let maintenance_service =
             MaintenanceService::new(Arc::clone(&store), cluster_id, member_id, Arc::clone(&raft_term));
 
+        // Spawn lease expiry timer — checks every 500ms for expired leases.
+        {
+            let lm = Arc::clone(&lease_manager);
+            let st = Arc::clone(&store);
+            let wh = Arc::clone(&watch_hub);
+            tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+                    let expired = lm.check_expired().await;
+                    for lease in expired {
+                        for key in &lease.keys {
+                            if let Ok(result) = st.delete_range(key, b"") {
+                                for prev in &result.prev_kvs {
+                                    let tombstone = crate::proto::mvccpb::KeyValue {
+                                        key: prev.key.clone(),
+                                        create_revision: 0,
+                                        mod_revision: result.revision,
+                                        version: 0,
+                                        value: vec![],
+                                        lease: 0,
+                                    };
+                                    wh.notify(&prev.key, 1, tombstone, Some(prev.clone())).await;
+                                }
+                            }
+                        }
+                    }
+                }
+            });
+        }
+
         // Start the HTTP/JSON gateway on port + 1.
         let http_addr = SocketAddr::new(addr.ip(), addr.port() + 1);
         let http_app = gateway::create_router(
