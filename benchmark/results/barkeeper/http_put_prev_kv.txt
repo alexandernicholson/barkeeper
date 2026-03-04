@@ -1,0 +1,15 @@
+{
+    "header": {
+        "cluster_id": "1",
+        "member_id": "1",
+        "revision": "16",
+        "raft_term": "0"
+    },
+    "prev_kv": {
+        "key": "cHJldnRlc3Q=",
+        "create_revision": "15",
+        "mod_revision": "15",
+        "version": "1",
+        "value": "dmFsMQ=="
+    }
+}

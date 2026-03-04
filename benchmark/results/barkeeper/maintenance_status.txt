@@ -1,0 +1,16 @@
+[
+    {
+        "Endpoint": "http://127.0.0.1:23791",
+        "Status": {
+            "header": {
+                "cluster_id": 1,
+                "member_id": 1,
+                "revision": 14
+            },
+            "version": "0.1.0",
+            "dbSize": 1589248,
+            "leader": 1,
+            "dbSizeInUse": 1589248
+        }
+    }
+]

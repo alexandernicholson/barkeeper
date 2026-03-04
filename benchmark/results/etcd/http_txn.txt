@@ -1,0 +1,18 @@
+{
+    "header": {
+        "cluster_id": "15118495548433857066",
+        "member_id": "13668033151171901709",
+        "revision": "22",
+        "raft_term": "2"
+    },
+    "succeeded": true,
+    "responses": [
+        {
+            "response_put": {
+                "header": {
+                    "revision": "22"
+                }
+            }
+        }
+    ]
+}

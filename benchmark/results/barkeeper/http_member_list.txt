@@ -1,0 +1,19 @@
+{
+    "header": {
+        "cluster_id": "1",
+        "member_id": "1",
+        "raft_term": "0"
+    },
+    "members": [
+        {
+            "ID": "1",
+            "name": "test-barkeeper",
+            "peerURLs": [
+                "http://127.0.0.1:23791"
+            ],
+            "clientURLs": [
+                "http://127.0.0.1:23791"
+            ]
+        }
+    ]
+}

@@ -1,0 +1,9 @@
+{
+    "header": {
+        "cluster_id": "1",
+        "member_id": "1",
+        "revision": "11",
+        "raft_term": "0"
+    },
+    "deleted": "1"
+}

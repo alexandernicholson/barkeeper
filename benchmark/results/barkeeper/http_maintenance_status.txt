@@ -1,0 +1,15 @@
+{
+    "header": {
+        "cluster_id": "1",
+        "member_id": "1",
+        "revision": "14",
+        "raft_term": "0"
+    },
+    "version": "0.1.0",
+    "dbSize": "1589248",
+    "leader": "1",
+    "raftIndex": "0",
+    "raftTerm": "0",
+    "raftAppliedIndex": "0",
+    "dbSizeInUse": "1589248"
+}

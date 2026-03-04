@@ -1,0 +1,6 @@
+compares:
+success requests (get, put, del):
+failure requests (get, put, del):
+SUCCESS
+
+OK

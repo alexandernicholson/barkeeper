@@ -1,0 +1,32 @@
+{
+    "header": {
+        "cluster_id": "1",
+        "member_id": "1",
+        "revision": "19",
+        "raft_term": "0"
+    },
+    "kvs": [
+        {
+            "key": "cHJlZml4L2E=",
+            "create_revision": "17",
+            "mod_revision": "17",
+            "version": "1",
+            "value": "MQ=="
+        },
+        {
+            "key": "cHJlZml4L2I=",
+            "create_revision": "18",
+            "mod_revision": "18",
+            "version": "1",
+            "value": "Mg=="
+        },
+        {
+            "key": "cHJlZml4L2M=",
+            "create_revision": "19",
+            "mod_revision": "19",
+            "version": "1",
+            "value": "Mw=="
+        }
+    ],
+    "count": "3"
+}

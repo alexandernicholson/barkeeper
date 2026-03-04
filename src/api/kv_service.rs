@@ -2,7 +2,6 @@ use std::sync::Arc;
 
 use tonic::{Request, Response, Status};
 
-use crate::kv::state_machine::KvCommand;
 use crate::kv::store::{
     KvStore, TxnCompare, TxnCompareResult, TxnCompareTarget, TxnOp, TxnOpResponse,
 };
@@ -13,21 +12,17 @@ use crate::proto::etcdserverpb::{
     DeleteRangeResponse, PutRequest, PutResponse, RangeRequest, RangeResponse, RequestOp,
     ResponseHeader, ResponseOp, TxnRequest, TxnResponse,
 };
-use crate::raft::messages::ClientProposalResult;
-use crate::raft::node::RaftHandle;
 
 /// gRPC KV service implementing the etcd KV API.
 pub struct KvService {
-    raft: RaftHandle,
     store: Arc<KvStore>,
     cluster_id: u64,
     member_id: u64,
 }
 
 impl KvService {
-    pub fn new(raft: RaftHandle, store: Arc<KvStore>, cluster_id: u64, member_id: u64) -> Self {
+    pub fn new(store: Arc<KvStore>, cluster_id: u64, member_id: u64) -> Self {
         KvService {
-            raft,
             store,
             cluster_id,
             member_id,
@@ -73,47 +68,21 @@ impl Kv for KvService {
     async fn put(&self, request: Request<PutRequest>) -> Result<Response<PutResponse>, Status> {
         let req = request.into_inner();
 
-        let cmd = KvCommand::Put {
-            key: req.key.clone(),
-            value: req.value.clone(),
-            lease_id: req.lease,
+        let result = self
+            .store
+            .put(&req.key, &req.value, req.lease)
+            .map_err(|e| Status::internal(format!("put failed: {}", e)))?;
+
+        let prev_kv = if req.prev_kv {
+            result.prev_kv
+        } else {
+            None
         };
 
-        let data =
-            serde_json::to_vec(&cmd).map_err(|e| Status::internal(format!("serialize: {}", e)))?;
-
-        let result = self
-            .raft
-            .propose(data)
-            .await
-            .map_err(|e| Status::internal(format!("propose failed: {}", e)))?;
-
-        match result {
-            ClientProposalResult::Success { revision, .. } => {
-                // If prev_kv was requested, read the previous value from the store.
-                // Note: the put has already been applied by the time we get here,
-                // so the prev_kv is the value at revision - 1.
-                let prev_kv = if req.prev_kv && revision > 1 {
-                    let prev_result = self
-                        .store
-                        .range(&req.key, b"", 0, revision - 1)
-                        .map_err(|e| Status::internal(format!("prev_kv read: {}", e)))?;
-                    prev_result.kvs.into_iter().next()
-                } else {
-                    None
-                };
-
-                Ok(Response::new(PutResponse {
-                    header: self.make_header(revision),
-                    prev_kv,
-                }))
-            }
-            ClientProposalResult::NotLeader { leader_id } => Err(Status::unavailable(format!(
-                "not leader, leader is {:?}",
-                leader_id
-            ))),
-            ClientProposalResult::Error(e) => Err(Status::internal(e)),
-        }
+        Ok(Response::new(PutResponse {
+            header: self.make_header(result.revision),
+            prev_kv,
+        }))
     }
 
     async fn delete_range(
@@ -122,52 +91,22 @@ impl Kv for KvService {
     ) -> Result<Response<DeleteRangeResponse>, Status> {
         let req = request.into_inner();
 
-        let cmd = KvCommand::DeleteRange {
-            key: req.key.clone(),
-            range_end: req.range_end.clone(),
+        let result = self
+            .store
+            .delete_range(&req.key, &req.range_end)
+            .map_err(|e| Status::internal(format!("delete failed: {}", e)))?;
+
+        let prev_kvs = if req.prev_kv {
+            result.prev_kvs
+        } else {
+            vec![]
         };
 
-        let data =
-            serde_json::to_vec(&cmd).map_err(|e| Status::internal(format!("serialize: {}", e)))?;
-
-        let result = self
-            .raft
-            .propose(data)
-            .await
-            .map_err(|e| Status::internal(format!("propose failed: {}", e)))?;
-
-        match result {
-            ClientProposalResult::Success { revision, .. } => {
-                // Read the delete result from the store to get deleted count.
-                // The delete has already been applied. We can look at the revision
-                // to determine the delete result. For now, we return the revision
-                // from Raft and read back the deleted count.
-                let deleted_result = self
-                    .store
-                    .current_revision()
-                    .map_err(|e| Status::internal(format!("revision read: {}", e)))?;
-
-                // For prev_kv support, we'd need to read before the delete.
-                // Since the delete was applied through Raft, prev_kvs aren't easily
-                // available here. Return empty for now unless prev_kv is requested.
-                let prev_kvs = vec![];
-
-                // We don't have direct access to the deleted count from the Raft
-                // proposal result. The state machine applied the delete but didn't
-                // report back the count through the proposal channel. We use the
-                // revision to construct the response.
-                Ok(Response::new(DeleteRangeResponse {
-                    header: self.make_header(revision),
-                    deleted: if deleted_result == revision { 1 } else { 0 },
-                    prev_kvs,
-                }))
-            }
-            ClientProposalResult::NotLeader { leader_id } => Err(Status::unavailable(format!(
-                "not leader, leader is {:?}",
-                leader_id
-            ))),
-            ClientProposalResult::Error(e) => Err(Status::internal(e)),
-        }
+        Ok(Response::new(DeleteRangeResponse {
+            header: self.make_header(result.revision),
+            deleted: result.deleted,
+            prev_kvs,
+        }))
     }
 
     async fn txn(&self, request: Request<TxnRequest>) -> Result<Response<TxnResponse>, Status> {
@@ -322,7 +261,7 @@ fn convert_txn_op_response(
         TxnOpResponse::Put(r) => ResponseOp {
             response: Some(response_op::Response::ResponsePut(PutResponse {
                 header: make_header(r.revision),
-                prev_kv: r.prev_kv,
+                prev_kv: None, // prev_kv only included when explicitly requested
             })),
         },
         TxnOpResponse::DeleteRange(r) => ResponseOp {

@@ -34,7 +34,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     tracing::info!(name = %cli.name, %addr, "barkeeper starting");
 
-    BarkeepServer::start(config, addr).await?;
+    BarkeepServer::start(config, addr, cli.name).await?;
 
     Ok(())
 }

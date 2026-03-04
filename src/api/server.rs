@@ -36,6 +36,7 @@ impl BarkeepServer {
     pub async fn start(
         config: RaftConfig,
         addr: SocketAddr,
+        name: String,
     ) -> Result<(), Box<dyn std::error::Error>> {
         // Create data directory.
         std::fs::create_dir_all(&config.data_dir)?;
@@ -56,7 +57,6 @@ impl BarkeepServer {
         let cluster_id = 1;
         let member_id = config.node_id;
         let kv_service = KvService::new(
-            raft_handle.clone(),
             Arc::clone(&store),
             cluster_id,
             member_id,
@@ -75,7 +75,7 @@ impl BarkeepServer {
         cluster_manager
             .add_initial_member(
                 member_id,
-                String::new(),
+                name,
                 vec![format!("http://{}", addr)],
                 vec![format!("http://{}", addr)],
             )
@@ -94,7 +94,7 @@ impl BarkeepServer {
         // Start the HTTP/JSON gateway on port + 1.
         let http_addr = SocketAddr::new(addr.ip(), addr.port() + 1);
         let http_app = gateway::create_router(
-            raft_handle.clone(),
+            raft_handle,
             Arc::clone(&store),
             Arc::clone(&lease_manager),
             Arc::clone(&cluster_manager),
