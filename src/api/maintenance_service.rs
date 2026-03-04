@@ -1,3 +1,4 @@
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use tokio_stream::wrappers::ReceiverStream;
@@ -17,14 +18,16 @@ pub struct MaintenanceService {
     store: Arc<KvStore>,
     cluster_id: u64,
     member_id: u64,
+    raft_term: Arc<AtomicU64>,
 }
 
 impl MaintenanceService {
-    pub fn new(store: Arc<KvStore>, cluster_id: u64, member_id: u64) -> Self {
+    pub fn new(store: Arc<KvStore>, cluster_id: u64, member_id: u64, raft_term: Arc<AtomicU64>) -> Self {
         MaintenanceService {
             store,
             cluster_id,
             member_id,
+            raft_term,
         }
     }
 
@@ -34,7 +37,7 @@ impl MaintenanceService {
             cluster_id: self.cluster_id,
             member_id: self.member_id,
             revision,
-            raft_term: 0,
+            raft_term: self.raft_term.load(Ordering::Relaxed),
         })
     }
 }
@@ -64,7 +67,7 @@ impl Maintenance for MaintenanceService {
             db_size,
             leader: self.member_id,
             raft_index: 0,
-            raft_term: 0,
+            raft_term: self.raft_term.load(Ordering::Relaxed),
             raft_applied_index: 0,
             errors: vec![],
             db_size_in_use: db_size,

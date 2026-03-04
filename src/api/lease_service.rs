@@ -1,3 +1,4 @@
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use futures::StreamExt;
@@ -18,14 +19,16 @@ pub struct LeaseService {
     manager: Arc<LeaseManager>,
     cluster_id: u64,
     member_id: u64,
+    raft_term: Arc<AtomicU64>,
 }
 
 impl LeaseService {
-    pub fn new(manager: Arc<LeaseManager>, cluster_id: u64, member_id: u64) -> Self {
+    pub fn new(manager: Arc<LeaseManager>, cluster_id: u64, member_id: u64, raft_term: Arc<AtomicU64>) -> Self {
         LeaseService {
             manager,
             cluster_id,
             member_id,
+            raft_term,
         }
     }
 
@@ -34,7 +37,7 @@ impl LeaseService {
             cluster_id: self.cluster_id,
             member_id: self.member_id,
             revision,
-            raft_term: 0,
+            raft_term: self.raft_term.load(Ordering::Relaxed),
         })
     }
 }
@@ -85,6 +88,7 @@ impl Lease for LeaseService {
         let manager = Arc::clone(&self.manager);
         let cluster_id = self.cluster_id;
         let member_id = self.member_id;
+        let raft_term = Arc::clone(&self.raft_term);
 
         tokio::spawn(async move {
             while let Some(result) = in_stream.next().await {
@@ -103,7 +107,7 @@ impl Lease for LeaseService {
                         cluster_id,
                         member_id,
                         revision: 0,
-                        raft_term: 0,
+                        raft_term: raft_term.load(Ordering::Relaxed),
                     }),
                     id: req.id,
                     ttl,

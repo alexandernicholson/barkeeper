@@ -50,13 +50,14 @@ async fn start_test_instance() -> (SocketAddr, tempfile::TempDir) {
     let watch_hub = Arc::new(WatchHub::new());
 
     let app = gateway::create_router(
-        raft_handle,
+        raft_handle.clone(),
         Arc::clone(&store),
         Arc::clone(&watch_hub),
         Arc::clone(&lease_manager),
         Arc::clone(&cluster_manager),
         1,
         1,
+        Arc::clone(&raft_handle.current_term),
     );
 
     let http_port = portpicker::pick_unused_port().expect("no free port");
@@ -890,4 +891,27 @@ async fn test_delete_zero_omits_deleted() {
             || body["deleted"].as_i64() == Some(0),
         "zero deleted should be omitted or zero"
     );
+}
+
+/// Response headers should include a non-zero raft_term after the node
+/// becomes leader (single-node cluster elects itself).
+#[tokio::test]
+async fn test_response_header_has_nonzero_raft_term() {
+    let (addr, _dir) = start_test_instance().await;
+    let client = Client::new();
+
+    let resp: Value = client
+        .post(format!("http://{}/v3/kv/put", addr))
+        .body(format!(r#"{{"key":"{}","value":"{}"}}"#, b64("termtest"), b64("val")))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    let raft_term = &resp["header"]["raft_term"];
+    // Proto3 JSON: raft_term is a string.
+    let term_val: u64 = raft_term.as_str().unwrap_or("0").parse().unwrap_or(0);
+    assert!(term_val > 0, "raft_term should be > 0, got {}", term_val);
 }

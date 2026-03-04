@@ -1,3 +1,4 @@
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use tonic::{Request, Response, Status};
@@ -15,14 +16,16 @@ pub struct ClusterService {
     manager: Arc<ClusterManager>,
     cluster_id: u64,
     member_id: u64,
+    raft_term: Arc<AtomicU64>,
 }
 
 impl ClusterService {
-    pub fn new(manager: Arc<ClusterManager>, cluster_id: u64, member_id: u64) -> Self {
+    pub fn new(manager: Arc<ClusterManager>, cluster_id: u64, member_id: u64, raft_term: Arc<AtomicU64>) -> Self {
         ClusterService {
             manager,
             cluster_id,
             member_id,
+            raft_term,
         }
     }
 
@@ -31,7 +34,7 @@ impl ClusterService {
             cluster_id: self.cluster_id,
             member_id: self.member_id,
             revision: 0,
-            raft_term: 0,
+            raft_term: self.raft_term.load(Ordering::Relaxed),
         })
     }
 

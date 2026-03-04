@@ -6,6 +6,7 @@
 //! strings following the proto3 canonical JSON mapping. Fields with default
 //! values (0, false, empty) are omitted from responses.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use axum::extract::State;
@@ -62,6 +63,7 @@ pub struct GatewayState {
     pub cluster_manager: Arc<ClusterManager>,
     pub cluster_id: u64,
     pub member_id: u64,
+    pub raft_term: Arc<AtomicU64>,
 }
 
 // ── JSON request / response types ───────────────────────────────────────────
@@ -391,7 +393,7 @@ impl GatewayState {
             cluster_id: self.cluster_id,
             member_id: self.member_id,
             revision,
-            raft_term: 0,
+            raft_term: self.raft_term.load(Ordering::Relaxed),
         }
     }
 }
@@ -414,6 +416,7 @@ pub fn create_router(
     cluster_manager: Arc<ClusterManager>,
     cluster_id: u64,
     member_id: u64,
+    raft_term: Arc<AtomicU64>,
 ) -> Router {
     let state = GatewayState {
         store,
@@ -422,6 +425,7 @@ pub fn create_router(
         cluster_manager,
         cluster_id,
         member_id,
+        raft_term,
     };
 
     Router::new()
@@ -828,7 +832,7 @@ async fn handle_maintenance_status(
         db_size,
         leader: state.member_id,
         raft_index: 0,
-        raft_term: 0,
+        raft_term: state.raft_term.load(Ordering::Relaxed),
         raft_applied_index: 0,
         db_size_in_use: db_size,
     })

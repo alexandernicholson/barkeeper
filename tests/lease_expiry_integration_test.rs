@@ -67,14 +67,15 @@ async fn start_instance_with_lease_expiry() -> (SocketAddr, Arc<KvStore>, Arc<Le
         }
     });
 
-    // IMPORTANT: create_router signature is (raft, store, watch_hub, lease_manager, cluster_manager, cluster_id, member_id)
+    // IMPORTANT: create_router signature is (raft, store, watch_hub, lease_manager, cluster_manager, cluster_id, member_id, raft_term)
     let app = gateway::create_router(
-        raft_handle,
+        raft_handle.clone(),
         Arc::clone(&store),
         Arc::clone(&watch_hub),
         Arc::clone(&lease_manager),
         Arc::clone(&cluster_manager),
         1, 1,
+        Arc::clone(&raft_handle.current_term),
     );
 
     let port = portpicker::pick_unused_port().unwrap();

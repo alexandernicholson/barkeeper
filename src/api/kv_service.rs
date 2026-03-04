@@ -1,3 +1,4 @@
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use tonic::{Request, Response, Status};
@@ -22,6 +23,7 @@ pub struct KvService {
     lease_manager: Arc<LeaseManager>,
     cluster_id: u64,
     member_id: u64,
+    raft_term: Arc<AtomicU64>,
 }
 
 impl KvService {
@@ -31,6 +33,7 @@ impl KvService {
         lease_manager: Arc<LeaseManager>,
         cluster_id: u64,
         member_id: u64,
+        raft_term: Arc<AtomicU64>,
     ) -> Self {
         KvService {
             store,
@@ -38,6 +41,7 @@ impl KvService {
             lease_manager,
             cluster_id,
             member_id,
+            raft_term,
         }
     }
 
@@ -46,7 +50,7 @@ impl KvService {
             cluster_id: self.cluster_id,
             member_id: self.member_id,
             revision,
-            raft_term: 0,
+            raft_term: self.raft_term.load(Ordering::Relaxed),
         })
     }
 }
@@ -192,7 +196,7 @@ impl Kv for KvService {
         let responses: Vec<ResponseOp> = result
             .responses
             .into_iter()
-            .map(|resp| convert_txn_op_response(resp, self.cluster_id, self.member_id))
+            .map(|resp| convert_txn_op_response(resp, self.cluster_id, self.member_id, self.raft_term.load(Ordering::Relaxed)))
             .collect();
 
         Ok(Response::new(TxnResponse {
@@ -289,13 +293,14 @@ fn convert_txn_op_response(
     resp: TxnOpResponse,
     cluster_id: u64,
     member_id: u64,
+    raft_term: u64,
 ) -> ResponseOp {
     let make_header = |revision: i64| {
         Some(ResponseHeader {
             cluster_id,
             member_id,
             revision,
-            raft_term: 0,
+            raft_term,
         })
     };
 

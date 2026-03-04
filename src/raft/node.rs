@@ -1,4 +1,5 @@
 use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -41,6 +42,8 @@ pub struct RaftHandle {
     /// Channel for delivering inbound Raft messages from peers.
     /// The transport pushes `(from_node_id, message)` tuples here.
     pub inbound_tx: mpsc::Sender<(u64, RaftMessage)>,
+    /// Current Raft term, updated by the actor after every state transition.
+    pub current_term: Arc<AtomicU64>,
 }
 
 impl RaftHandle {
@@ -71,9 +74,12 @@ pub async fn spawn_raft_node(
 ) -> RaftHandle {
     let (proposal_tx, proposal_rx) = mpsc::channel::<ClientProposal>(256);
     let (inbound_tx, inbound_rx) = mpsc::channel::<(u64, RaftMessage)>(256);
+    let current_term = Arc::new(AtomicU64::new(0));
+    let term_ref = Arc::clone(&current_term);
     let handle = RaftHandle {
         proposal_tx,
         inbound_tx,
+        current_term,
     };
 
     let data_dir = config.data_dir.clone();
@@ -118,6 +124,7 @@ pub async fn spawn_raft_node(
             &transport,
         )
         .await;
+        term_ref.store(core.state.persistent.current_term, Ordering::Relaxed);
 
         loop {
             tokio::select! {
@@ -125,6 +132,7 @@ pub async fn spawn_raft_node(
                 _ = &mut election_timer => {
                     let actions = core.step(Event::ElectionTimeout);
                     execute_actions(&actions, &log_store, &apply_tx, &mut pending_responses, &mut heartbeat_timer, &config, &transport).await;
+                    term_ref.store(core.state.persistent.current_term, Ordering::Relaxed);
                     election_timer = random_election_timeout(&config);
                 }
 
@@ -132,6 +140,7 @@ pub async fn spawn_raft_node(
                 _ = heartbeat_tick(&mut heartbeat_timer) => {
                     let actions = core.step(Event::HeartbeatTimeout);
                     execute_actions(&actions, &log_store, &apply_tx, &mut pending_responses, &mut heartbeat_timer, &config, &transport).await;
+                    term_ref.store(core.state.persistent.current_term, Ordering::Relaxed);
                 }
 
                 // Client proposals
@@ -140,12 +149,14 @@ pub async fn spawn_raft_node(
                     pending_responses.insert(id, proposal.response_tx);
                     let actions = core.step(Event::Proposal { id, data: proposal.data });
                     execute_actions(&actions, &log_store, &apply_tx, &mut pending_responses, &mut heartbeat_timer, &config, &transport).await;
+                    term_ref.store(core.state.persistent.current_term, Ordering::Relaxed);
                 }
 
                 // Inbound Raft messages from peers (via transport)
                 Some((from, message)) = inbound_rx.recv() => {
                     let actions = core.step(Event::Message { from, message });
                     execute_actions(&actions, &log_store, &apply_tx, &mut pending_responses, &mut heartbeat_timer, &config, &transport).await;
+                    term_ref.store(core.state.persistent.current_term, Ordering::Relaxed);
                 }
             }
         }

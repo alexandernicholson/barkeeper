@@ -1,3 +1,4 @@
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use futures::StreamExt;
@@ -15,14 +16,16 @@ pub struct WatchService {
     hub: Arc<WatchHub>,
     cluster_id: u64,
     member_id: u64,
+    raft_term: Arc<AtomicU64>,
 }
 
 impl WatchService {
-    pub fn new(hub: Arc<WatchHub>, cluster_id: u64, member_id: u64) -> Self {
+    pub fn new(hub: Arc<WatchHub>, cluster_id: u64, member_id: u64, raft_term: Arc<AtomicU64>) -> Self {
         WatchService {
             hub,
             cluster_id,
             member_id,
+            raft_term,
         }
     }
 
@@ -31,7 +34,7 @@ impl WatchService {
             cluster_id: self.cluster_id,
             member_id: self.member_id,
             revision,
-            raft_term: 0,
+            raft_term: self.raft_term.load(Ordering::Relaxed),
         })
     }
 }
@@ -50,6 +53,7 @@ impl Watch for WatchService {
         let hub = Arc::clone(&self.hub);
         let cluster_id = self.cluster_id;
         let member_id = self.member_id;
+        let raft_term = Arc::clone(&self.raft_term);
 
         tokio::spawn(async move {
             // Track active watch IDs so we can spawn event-forwarding tasks.
@@ -82,7 +86,7 @@ impl Watch for WatchService {
                                 cluster_id,
                                 member_id,
                                 revision: 0,
-                                raft_term: 0,
+                                raft_term: raft_term.load(Ordering::Relaxed),
                             }),
                             watch_id,
                             created: true,
@@ -100,6 +104,7 @@ impl Watch for WatchService {
                         // Spawn a task to forward events from this watch to the
                         // response stream.
                         let resp_tx_clone = resp_tx.clone();
+                        let raft_term_clone = Arc::clone(&raft_term);
                         let task = tokio::spawn(async move {
                             while let Some(watch_event) = event_rx.recv().await {
                                 let resp = WatchResponse {
@@ -107,7 +112,7 @@ impl Watch for WatchService {
                                         cluster_id,
                                         member_id,
                                         revision: 0,
-                                        raft_term: 0,
+                                        raft_term: raft_term_clone.load(Ordering::Relaxed),
                                     }),
                                     watch_id: watch_event.watch_id,
                                     created: false,
@@ -144,7 +149,7 @@ impl Watch for WatchService {
                                 cluster_id,
                                 member_id,
                                 revision: 0,
-                                raft_term: 0,
+                                raft_term: raft_term.load(Ordering::Relaxed),
                             }),
                             watch_id: cancel.watch_id,
                             created: false,
@@ -167,7 +172,7 @@ impl Watch for WatchService {
                                 cluster_id,
                                 member_id,
                                 revision: 0,
-                                raft_term: 0,
+                                raft_term: raft_term.load(Ordering::Relaxed),
                             }),
                             watch_id: -1,
                             created: false,

@@ -52,12 +52,13 @@ impl BarkeepServer {
 
         // Spawn the Raft node.
         let raft_handle = spawn_raft_node(config.clone(), apply_tx, None).await;
+        let raft_term = Arc::clone(&raft_handle.current_term);
 
         // Create the Watch hub and gRPC service.
         let cluster_id = 1;
         let member_id = config.node_id;
         let watch_hub = Arc::new(WatchHub::new());
-        let watch_service = WatchService::new(Arc::clone(&watch_hub), cluster_id, member_id);
+        let watch_service = WatchService::new(Arc::clone(&watch_hub), cluster_id, member_id, Arc::clone(&raft_term));
 
         // Create the Lease manager and gRPC service.
         let lease_manager = Arc::new(LeaseManager::new());
@@ -69,8 +70,9 @@ impl BarkeepServer {
             Arc::clone(&lease_manager),
             cluster_id,
             member_id,
+            Arc::clone(&raft_term),
         );
-        let lease_service = LeaseService::new(Arc::clone(&lease_manager), cluster_id, member_id);
+        let lease_service = LeaseService::new(Arc::clone(&lease_manager), cluster_id, member_id, Arc::clone(&raft_term));
 
         // Create the Cluster manager and gRPC service.
         let cluster_manager = Arc::new(ClusterManager::new(cluster_id));
@@ -83,15 +85,15 @@ impl BarkeepServer {
             )
             .await;
         let cluster_service =
-            ClusterService::new(Arc::clone(&cluster_manager), cluster_id, member_id);
+            ClusterService::new(Arc::clone(&cluster_manager), cluster_id, member_id, Arc::clone(&raft_term));
 
         // Create the Auth manager and gRPC service.
         let auth_manager = Arc::new(AuthManager::new());
-        let auth_service = AuthService::new(Arc::clone(&auth_manager), cluster_id, member_id);
+        let auth_service = AuthService::new(Arc::clone(&auth_manager), cluster_id, member_id, Arc::clone(&raft_term));
 
         // Create the Maintenance gRPC service.
         let maintenance_service =
-            MaintenanceService::new(Arc::clone(&store), cluster_id, member_id);
+            MaintenanceService::new(Arc::clone(&store), cluster_id, member_id, Arc::clone(&raft_term));
 
         // Start the HTTP/JSON gateway on port + 1.
         let http_addr = SocketAddr::new(addr.ip(), addr.port() + 1);
@@ -103,6 +105,7 @@ impl BarkeepServer {
             Arc::clone(&cluster_manager),
             cluster_id,
             member_id,
+            Arc::clone(&raft_term),
         );
 
         tracing::info!(%http_addr, "starting HTTP gateway");
