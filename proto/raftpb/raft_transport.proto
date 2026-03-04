@@ -1,0 +1,13 @@
+syntax = "proto3";
+package raftpb;
+
+service RaftTransport {
+    rpc SendMessage(RaftMessageRequest) returns (RaftMessageResponse);
+}
+
+message RaftMessageRequest {
+    uint64 from_node = 1;
+    bytes message = 2; // serialized RaftMessage (JSON)
+}
+
+message RaftMessageResponse {}
