@@ -240,6 +240,19 @@ struct StatusResponse {
     db_size_in_use: i64,
 }
 
+// ── Compaction types ───────────────────────────────────────────────────────
+
+#[derive(Debug, Deserialize, Default)]
+struct CompactionRequest {
+    #[serde(default)]
+    revision: Option<String>, // proto3 JSON: int64 as string
+}
+
+#[derive(Debug, Serialize)]
+struct CompactionResponse {
+    header: JsonResponseHeader,
+}
+
 // ── Txn types ──────────────────────────────────────────────────────────────
 
 #[derive(Debug, Deserialize, Default)]
@@ -433,7 +446,7 @@ pub fn create_router(
         .route("/v3/kv/put", post(handle_put))
         .route("/v3/kv/deleterange", post(handle_delete_range))
         .route("/v3/kv/txn", post(handle_txn))
-        .route("/v3/kv/compaction", post(handle_compaction_stub))
+        .route("/v3/kv/compaction", post(handle_compaction))
         .route("/v3/lease/grant", post(handle_lease_grant))
         .route("/v3/lease/revoke", post(handle_lease_revoke))
         .route("/v3/lease/timetolive", post(handle_lease_timetolive))
@@ -700,11 +713,31 @@ async fn handle_txn(
     }
 }
 
-async fn handle_compaction_stub() -> impl IntoResponse {
-    json_error(
-        StatusCode::NOT_IMPLEMENTED,
-        "compaction not yet implemented",
-    )
+async fn handle_compaction(
+    State(state): State<GatewayState>,
+    body: axum::body::Bytes,
+) -> impl IntoResponse {
+    let req: CompactionRequest = parse_json(&body);
+    let revision: i64 = req.revision
+        .as_deref()
+        .unwrap_or("0")
+        .parse()
+        .unwrap_or(0);
+
+    match state.store.compact(revision) {
+        Ok(()) => {
+            let rev = state.store.current_revision().unwrap_or(0);
+            axum::Json(CompactionResponse {
+                header: state.make_header(rev),
+            })
+            .into_response()
+        }
+        Err(e) => json_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("compact: {}", e),
+        )
+        .into_response(),
+    }
 }
 
 async fn handle_lease_grant(
