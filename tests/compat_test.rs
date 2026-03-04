@@ -999,6 +999,37 @@ async fn test_http_compaction_works() {
 // Lease Expiry Tests
 // ═══════════════════════════════════════════════════════════════════════════
 
+/// After a write, the maintenance status should show advancing raft_applied_index.
+#[tokio::test]
+async fn test_writes_advance_raft_applied_index() {
+    let (addr, _dir) = start_test_instance().await;
+    let client = Client::new();
+
+    // Check initial status.
+    let status1: Value = client
+        .post(format!("http://{}/v3/maintenance/status", addr))
+        .body("{}")
+        .send().await.unwrap()
+        .json().await.unwrap();
+
+    // Do a write.
+    client
+        .post(format!("http://{}/v3/kv/put", addr))
+        .body(format!(r#"{{"key":"{}","value":"{}"}}"#, b64("raftwrite"), b64("val")))
+        .send().await.unwrap();
+
+    // Check status after write.
+    let status2: Value = client
+        .post(format!("http://{}/v3/maintenance/status", addr))
+        .body("{}")
+        .send().await.unwrap()
+        .json().await.unwrap();
+
+    let idx1: u64 = status1["raftAppliedIndex"].as_str().unwrap_or("0").parse().unwrap_or(0);
+    let idx2: u64 = status2["raftAppliedIndex"].as_str().unwrap_or("0").parse().unwrap_or(0);
+    assert!(idx2 > idx1, "raft_applied_index should advance after write: {} -> {}", idx1, idx2);
+}
+
 /// Keys attached to expired leases should be automatically deleted.
 /// This tests the production expiry timer path.
 #[tokio::test]
