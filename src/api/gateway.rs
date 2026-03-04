@@ -23,8 +23,9 @@ use serde::{Deserialize, Serialize, Serializer};
 use crate::auth::actor::AuthActorHandle;
 use crate::proto::etcdserverpb::{alarm_request::AlarmAction, AlarmMember, AlarmType};
 use crate::cluster::actor::ClusterActorHandle;
+use crate::kv::actor::KvStoreActorHandle;
 use crate::kv::state_machine::KvCommand;
-use crate::kv::store::{KvStore, TxnCompare, TxnCompareResult, TxnCompareTarget, TxnOp, TxnOpResponse};
+use crate::kv::store::{TxnCompare, TxnCompareResult, TxnCompareTarget, TxnOp, TxnOpResponse};
 use crate::lease::manager::LeaseManager;
 use crate::raft::messages::ClientProposalResult;
 use crate::raft::node::RaftHandle;
@@ -64,7 +65,7 @@ fn is_empty_str(val: &str) -> bool {
 
 #[derive(Clone)]
 pub struct GatewayState {
-    pub store: Arc<KvStore>,
+    pub store: KvStoreActorHandle,
     pub watch_hub: Arc<WatchHub>,
     pub lease_manager: Arc<LeaseManager>,
     pub cluster_manager: ClusterActorHandle,
@@ -492,7 +493,7 @@ async fn auth_middleware(
 
 pub fn create_router(
     raft_handle: RaftHandle,
-    store: Arc<KvStore>,
+    store: KvStoreActorHandle,
     watch_hub: Arc<WatchHub>,
     lease_manager: Arc<LeaseManager>,
     cluster_manager: ClusterActorHandle,
@@ -571,9 +572,9 @@ async fn handle_range(
     let limit = req.limit.unwrap_or(0);
     let revision = req.revision.unwrap_or(0);
 
-    match state.store.range(&key, &range_end, limit, revision) {
+    match state.store.range(key, range_end, limit, revision).await {
         Ok(result) => {
-            let rev = state.store.current_revision().unwrap_or(0);
+            let rev = state.store.current_revision().await.unwrap_or(0);
             let kvs: Vec<JsonKeyValue> = result.kvs.iter().map(proto_kv_to_json).collect();
             axum::Json(RangeResponse {
                 header: state.make_header(rev),
@@ -615,7 +616,7 @@ async fn handle_put(
 
     match proposal_result {
         ClientProposalResult::Success { .. } => {
-            match state.store.put(&key, &value, lease_id) {
+            match state.store.put(key.clone(), value.clone(), lease_id).await {
                 Ok(result) => {
                     // Notify watchers of the put event.
                     let (create_rev, ver) = match &result.prev_kv {
@@ -688,7 +689,7 @@ async fn handle_delete_range(
 
     match proposal_result {
         ClientProposalResult::Success { .. } => {
-            match state.store.delete_range(&key, &range_end) {
+            match state.store.delete_range(key.clone(), range_end.clone()).await {
                 Ok(result) => {
                     // Notify watchers for each deleted key.
                     for prev in &result.prev_kvs {
@@ -830,7 +831,7 @@ async fn handle_txn(
             let success_clone = success.clone();
             let failure_clone = failure.clone();
 
-            match state.store.txn(compares, success, failure) {
+            match state.store.txn(compares, success, failure).await {
                 Ok(result) => {
                     // Notify watchers for txn mutations.
                     let executed_ops = if result.succeeded { &success_clone } else { &failure_clone };
@@ -950,9 +951,9 @@ async fn handle_compaction(
 
     match proposal_result {
         ClientProposalResult::Success { .. } => {
-            match state.store.compact(revision) {
+            match state.store.compact(revision).await {
                 Ok(()) => {
-                    let rev = state.store.current_revision().unwrap_or(0);
+                    let rev = state.store.current_revision().await.unwrap_or(0);
                     axum::Json(CompactionResponse {
                         header: state.make_header(rev),
                     })
@@ -983,7 +984,7 @@ async fn handle_lease_grant(
     let id = req.id.unwrap_or(0);
 
     let lease_id = state.lease_manager.grant(id, ttl).await;
-    let rev = state.store.current_revision().unwrap_or(0);
+    let rev = state.store.current_revision().await.unwrap_or(0);
 
     axum::Json(LeaseGrantResponse {
         header: state.make_header(rev),
@@ -1054,7 +1055,7 @@ async fn handle_lease_leases(
     let _req: LeaseLeasesRequest = parse_json(&body);
     let ids = state.lease_manager.list().await;
     let leases = ids.into_iter().map(|id| JsonLeaseStatus { id }).collect();
-    let rev = state.store.current_revision().unwrap_or(0);
+    let rev = state.store.current_revision().await.unwrap_or(0);
 
     axum::Json(LeaseLeasesResponse {
         header: state.make_header(rev),
@@ -1090,8 +1091,8 @@ async fn handle_maintenance_status(
     body: axum::body::Bytes,
 ) -> impl IntoResponse {
     let _: serde_json::Value = parse_json(&body);
-    let rev = state.store.current_revision().unwrap_or(0);
-    let db_size = state.store.db_file_size().unwrap_or(0);
+    let rev = state.store.current_revision().await.unwrap_or(0);
+    let db_size = state.store.db_file_size().await.unwrap_or(0);
 
     axum::Json(StatusResponse {
         header: state.make_header(rev),
@@ -1108,7 +1109,7 @@ async fn handle_maintenance_status(
 async fn handle_maintenance_snapshot(
     State(state): State<GatewayState>,
 ) -> impl IntoResponse {
-    match state.store.snapshot_bytes() {
+    match state.store.snapshot_bytes().await {
         Ok(data) => (
             StatusCode::OK,
             [(axum::http::header::CONTENT_TYPE, "application/octet-stream")],
@@ -1139,9 +1140,9 @@ async fn handle_maintenance_defragment(
 ) -> impl IntoResponse {
     let _: DefragmentReq = parse_json(&body);
 
-    match state.store.compact_db() {
+    match state.store.compact_db().await {
         Ok(_) => {
-            let rev = state.store.current_revision().unwrap_or(0);
+            let rev = state.store.current_revision().await.unwrap_or(0);
             axum::Json(DefragmentResp {
                 header: state.make_header(rev),
             })
@@ -1201,7 +1202,7 @@ async fn handle_maintenance_alarm(
         member_id
     };
 
-    let rev = state.store.current_revision().unwrap_or(0);
+    let rev = state.store.current_revision().await.unwrap_or(0);
 
     let alarm_action = AlarmAction::try_from(action).unwrap_or(AlarmAction::Get);
     let mut alarms_lock = state.alarms.lock().unwrap();

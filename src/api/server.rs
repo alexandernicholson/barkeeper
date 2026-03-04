@@ -29,6 +29,7 @@ use crate::auth::interceptor::GrpcAuthLayer;
 use crate::cluster::actor::spawn_cluster_actor;
 use crate::cluster::swim_service::SwimService;
 use crate::config::ClusterConfig;
+use crate::kv::actor::spawn_kv_store_actor;
 use crate::kv::state_machine::spawn_state_machine;
 use crate::kv::store::KvStore;
 use crate::lease::manager::LeaseManager;
@@ -81,8 +82,8 @@ impl BarkeepServer {
         // Create data directory.
         std::fs::create_dir_all(&config.data_dir)?;
 
-        // Open the shared KV store.
-        let store = Arc::new(KvStore::open(format!("{}/kv.redb", config.data_dir))?);
+        // Open the KV store.
+        let kv_store = KvStore::open(format!("{}/kv.redb", config.data_dir))?;
 
         // Initialize the DistributedRuntime with TCP transport.
         let connector = Box::new(TcpConnector);
@@ -106,11 +107,15 @@ impl BarkeepServer {
 
         tracing::info!("started Rebar supervisor");
 
+        // Spawn the KvStore actor on a standalone Rebar runtime.
+        let kv_runtime = rebar_core::runtime::Runtime::new(config.node_id);
+        let store = spawn_kv_store_actor(&kv_runtime, kv_store).await;
+
         // Create the apply channel between Raft and the state machine.
         let (apply_tx, apply_rx) = mpsc::channel(256);
 
         // Spawn the state machine apply loop.
-        spawn_state_machine(Arc::clone(&store), apply_rx).await;
+        spawn_state_machine(store.clone(), apply_rx).await;
 
         // Create the Rebar registry and peer PID map for the Raft actor.
         let registry = Arc::new(Mutex::new(Registry::new()));
@@ -177,7 +182,7 @@ impl BarkeepServer {
         // Create the Watch hub and gRPC service.
         let cluster_id = 1;
         let member_id = config.node_id;
-        let watch_hub = Arc::new(WatchHub::with_store(Arc::clone(&store)));
+        let watch_hub = Arc::new(WatchHub::with_store(store.clone()));
         let watch_service = WatchService::new(Arc::clone(&watch_hub), cluster_id, member_id, Arc::clone(&raft_term));
 
         // Create the Lease manager and gRPC service.
@@ -185,7 +190,7 @@ impl BarkeepServer {
 
         // Create the KV gRPC service.
         let kv_service = KvService::new(
-            Arc::clone(&store),
+            store.clone(),
             Arc::clone(&watch_hub),
             Arc::clone(&lease_manager),
             cluster_id,
@@ -239,7 +244,7 @@ impl BarkeepServer {
 
         // Create the Maintenance gRPC service.
         let maintenance_service =
-            MaintenanceService::new(Arc::clone(&store), cluster_id, member_id, Arc::clone(&raft_term), raft_handle.clone());
+            MaintenanceService::new(store.clone(), cluster_id, member_id, Arc::clone(&raft_term), raft_handle.clone());
         let alarms = maintenance_service.alarms();
 
         // Register lease expiry timer as a supervised Rebar child process.
@@ -247,7 +252,7 @@ impl BarkeepServer {
         // handles to the same shared state.
         {
             let lm = Arc::clone(&lease_manager);
-            let st = Arc::clone(&store);
+            let st = store.clone();
             let wh = Arc::clone(&watch_hub);
             supervisor
                 .add_child(ChildEntry::new(
@@ -255,7 +260,7 @@ impl BarkeepServer {
                         .restart(RestartType::Permanent),
                     move || {
                         let lm = Arc::clone(&lm);
-                        let st = Arc::clone(&st);
+                        let st = st.clone();
                         let wh = Arc::clone(&wh);
                         async move {
                             tracing::info!("lease expiry timer started");
@@ -264,7 +269,7 @@ impl BarkeepServer {
                                 let expired = lm.check_expired().await;
                                 for lease in expired {
                                     for key in &lease.keys {
-                                        if let Ok(result) = st.delete_range(key, b"") {
+                                        if let Ok(result) = st.delete_range(key.clone(), vec![]).await {
                                             for prev in &result.prev_kvs {
                                                 let tombstone = crate::proto::mvccpb::KeyValue {
                                                     key: prev.key.clone(),
@@ -294,7 +299,7 @@ impl BarkeepServer {
         let http_addr = SocketAddr::new(addr.ip(), addr.port() + 1);
         let http_app = gateway::create_router(
             raft_handle,
-            Arc::clone(&store),
+            store.clone(),
             Arc::clone(&watch_hub),
             Arc::clone(&lease_manager),
             cluster_manager,

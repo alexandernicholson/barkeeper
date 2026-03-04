@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::{mpsc, Mutex};
 
-use crate::kv::store::KvStore;
+use crate::kv::actor::KvStoreActorHandle;
 use crate::proto::mvccpb;
 
 /// A single watcher watching a key or range.
@@ -27,7 +27,7 @@ pub struct WatchEvent {
 pub struct WatchHub {
     watchers: Arc<Mutex<HashMap<i64, Watcher>>>,
     next_id: Arc<Mutex<i64>>,
-    store: Option<Arc<KvStore>>,
+    store: Option<KvStoreActorHandle>,
 }
 
 impl WatchHub {
@@ -39,8 +39,8 @@ impl WatchHub {
         }
     }
 
-    /// Create a WatchHub with an attached KvStore for historical replay.
-    pub fn with_store(store: Arc<KvStore>) -> Self {
+    /// Create a WatchHub with an attached KvStore actor handle for historical replay.
+    pub fn with_store(store: KvStoreActorHandle) -> Self {
         WatchHub {
             watchers: Arc::new(Mutex::new(HashMap::new())),
             next_id: Arc::new(Mutex::new(1)),
@@ -86,7 +86,7 @@ impl WatchHub {
             if let Some(ref store) = self.store {
                 // changes_since is exclusive, so pass start_revision - 1
                 // to include events AT start_revision.
-                match store.changes_since(start_revision - 1) {
+                match store.changes_since(start_revision - 1).await {
                     Ok(changes) => {
                         for (change_key, event_type, kv) in changes {
                             if !key_matches(&replay_key, &replay_range_end, &change_key) {

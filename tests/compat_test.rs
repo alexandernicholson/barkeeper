@@ -17,11 +17,13 @@ use tokio::sync::mpsc;
 use barkeeper::api::gateway;
 use barkeeper::auth::actor::spawn_auth_actor;
 use barkeeper::cluster::actor::spawn_cluster_actor;
+use barkeeper::kv::actor::spawn_kv_store_actor;
 use barkeeper::kv::state_machine::spawn_state_machine;
 use barkeeper::kv::store::KvStore;
 use barkeeper::lease::manager::LeaseManager;
 use barkeeper::raft::node::{spawn_raft_node, RaftConfig};
 use barkeeper::watch::hub::WatchHub;
+use rebar_core::runtime::Runtime;
 
 /// Spin up a minimal barkeeper instance and return the HTTP gateway address.
 async fn start_test_instance() -> (SocketAddr, tempfile::TempDir) {
@@ -33,30 +35,30 @@ async fn start_test_instance() -> (SocketAddr, tempfile::TempDir) {
         ..Default::default()
     };
 
-    let store = Arc::new(
-        KvStore::open(dir.path().join("kv.redb")).expect("open KvStore"),
-    );
+    let kv_store = KvStore::open(dir.path().join("kv.redb")).expect("open KvStore");
+    let kv_runtime = Runtime::new(1);
+    let store = spawn_kv_store_actor(&kv_runtime, kv_store).await;
 
     let (apply_tx, apply_rx) = mpsc::channel(256);
-    spawn_state_machine(Arc::clone(&store), apply_rx).await;
+    spawn_state_machine(store.clone(), apply_rx).await;
 
     let raft_handle = spawn_raft_node(config, apply_tx).await;
 
     let lease_manager = Arc::new(LeaseManager::new());
-    let cluster_runtime = rebar_core::runtime::Runtime::new(1);
+    let cluster_runtime = Runtime::new(1);
     let cluster_manager = spawn_cluster_actor(&cluster_runtime, 1).await;
     cluster_manager
         .add_initial_member(1, "test-node".to_string(), vec![], vec![])
         .await;
 
-    let watch_hub = Arc::new(WatchHub::with_store(Arc::clone(&store)));
-    let auth_runtime = rebar_core::runtime::Runtime::new(1);
+    let watch_hub = Arc::new(WatchHub::with_store(store.clone()));
+    let auth_runtime = Runtime::new(1);
     let auth_manager = spawn_auth_actor(&auth_runtime).await;
 
     // Spawn lease expiry timer — checks every 500ms for expired leases.
     {
         let lm = Arc::clone(&lease_manager);
-        let st = Arc::clone(&store);
+        let st = store.clone();
         let wh = Arc::clone(&watch_hub);
         tokio::spawn(async move {
             loop {
@@ -64,7 +66,7 @@ async fn start_test_instance() -> (SocketAddr, tempfile::TempDir) {
                 let expired = lm.check_expired().await;
                 for lease in expired {
                     for key in &lease.keys {
-                        if let Ok(result) = st.delete_range(key, b"") {
+                        if let Ok(result) = st.delete_range(key.clone(), vec![]).await {
                             for prev in &result.prev_kvs {
                                 let tombstone = barkeeper::proto::mvccpb::KeyValue {
                                     key: prev.key.clone(),
@@ -85,7 +87,7 @@ async fn start_test_instance() -> (SocketAddr, tempfile::TempDir) {
 
     let app = gateway::create_router(
         raft_handle.clone(),
-        Arc::clone(&store),
+        store.clone(),
         Arc::clone(&watch_hub),
         Arc::clone(&lease_manager),
         cluster_manager,

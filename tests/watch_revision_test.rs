@@ -2,8 +2,10 @@
 
 use std::sync::Arc;
 
+use barkeeper::kv::actor::spawn_kv_store_actor;
 use barkeeper::kv::store::KvStore;
 use barkeeper::watch::hub::WatchHub;
+use rebar_core::runtime::Runtime;
 use tokio::time::{timeout, Duration};
 
 /// changes_since should return mutations after the given revision.
@@ -56,13 +58,15 @@ async fn test_changes_since_includes_deletes() {
 #[tokio::test]
 async fn test_watchhub_replays_history() {
     let dir = tempfile::tempdir().unwrap();
-    let store = Arc::new(KvStore::open(dir.path().join("kv.redb")).unwrap());
-    let hub = WatchHub::with_store(Arc::clone(&store));
+    let kv_store = KvStore::open(dir.path().join("kv.redb")).unwrap();
+    let kv_runtime = Runtime::new(1);
+    let handle = spawn_kv_store_actor(&kv_runtime, kv_store).await;
+    let hub = WatchHub::with_store(handle.clone());
 
-    // Create some history.
-    store.put(b"hist", b"v1", 0).unwrap(); // rev 1
-    store.put(b"hist", b"v2", 0).unwrap(); // rev 2
-    store.put(b"other", b"v3", 0).unwrap(); // rev 3
+    // Create some history via the actor handle.
+    handle.put(b"hist".to_vec(), b"v1".to_vec(), 0).await.unwrap(); // rev 1
+    handle.put(b"hist".to_vec(), b"v2".to_vec(), 0).await.unwrap(); // rev 2
+    handle.put(b"other".to_vec(), b"v3".to_vec(), 0).await.unwrap(); // rev 3
 
     // Watch "hist" from revision 1 — should replay rev 1 and 2.
     let (_wid, mut rx) = hub.create_watch(b"hist".to_vec(), vec![], 1).await;

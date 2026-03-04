@@ -1,9 +1,8 @@
-use std::sync::Arc;
-
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 
-use super::store::{KvStore, TxnCompare, TxnOp};
+use super::actor::KvStoreActorHandle;
+use super::store::{TxnCompare, TxnOp};
 use crate::raft::messages::{LogEntry, LogEntryData};
 
 /// Commands that can be applied to the KV store via Raft.
@@ -30,11 +29,11 @@ pub enum KvCommand {
 
 /// Applies committed Raft entries to the KV store.
 pub struct StateMachine {
-    store: Arc<KvStore>,
+    store: KvStoreActorHandle,
 }
 
 impl StateMachine {
-    pub fn new(store: Arc<KvStore>) -> Self {
+    pub fn new(store: KvStoreActorHandle) -> Self {
         StateMachine { store }
     }
 
@@ -60,7 +59,7 @@ impl StateMachine {
                 key,
                 value,
                 lease_id,
-            } => match self.store.put(key, value, lease_id) {
+            } => match self.store.put(key, value, lease_id).await {
                 Ok(result) => {
                     tracing::debug!(revision = result.revision, "applied put");
                 }
@@ -69,7 +68,7 @@ impl StateMachine {
                 }
             },
             KvCommand::DeleteRange { key, range_end } => {
-                match self.store.delete_range(&key, &range_end) {
+                match self.store.delete_range(key, range_end).await {
                     Ok(result) => {
                         tracing::debug!(
                             revision = result.revision,
@@ -86,7 +85,7 @@ impl StateMachine {
                 compares,
                 success,
                 failure,
-            } => match self.store.txn(compares, success, failure) {
+            } => match self.store.txn(compares, success, failure).await {
                 Ok(result) => {
                     tracing::debug!(
                         succeeded = result.succeeded,
@@ -99,7 +98,7 @@ impl StateMachine {
                     tracing::error!(error = %e, "failed to apply txn");
                 }
             },
-            KvCommand::Compact { revision } => match self.store.compact(revision) {
+            KvCommand::Compact { revision } => match self.store.compact(revision).await {
                 Ok(()) => {
                     tracing::debug!(revision = revision, "applied compact");
                 }
@@ -109,19 +108,11 @@ impl StateMachine {
             }
         }
     }
-
-    pub fn store(&self) -> &KvStore {
-        &self.store
-    }
-
-    pub fn store_arc(&self) -> Arc<KvStore> {
-        Arc::clone(&self.store)
-    }
 }
 
 /// Spawn the state machine apply loop.
 pub async fn spawn_state_machine(
-    store: Arc<KvStore>,
+    store: KvStoreActorHandle,
     mut apply_rx: mpsc::Receiver<Vec<LogEntry>>,
 ) {
     let sm = StateMachine::new(store);

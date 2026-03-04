@@ -1,9 +1,18 @@
-use std::sync::Arc;
-
+use barkeeper::kv::actor::spawn_kv_store_actor;
 use barkeeper::kv::state_machine::{KvCommand, StateMachine};
 use barkeeper::kv::store::KvStore;
 use barkeeper::raft::messages::{LogEntry, LogEntryData};
+use rebar_core::runtime::Runtime;
 use tempfile::tempdir;
+
+/// Helper: open a KvStore and spawn the actor, returning the handle.
+async fn make_store_handle(
+    dir: &tempfile::TempDir,
+) -> barkeeper::kv::actor::KvStoreActorHandle {
+    let store = KvStore::open(dir.path().join("test.redb")).unwrap();
+    let runtime = Runtime::new(1);
+    spawn_kv_store_actor(&runtime, store).await
+}
 
 /// State machine now delegates application to the service layer.
 /// It should accept entries without panicking and leave the store unchanged
@@ -11,8 +20,8 @@ use tempfile::tempdir;
 #[tokio::test]
 async fn test_state_machine_apply_put() {
     let dir = tempdir().unwrap();
-    let store = Arc::new(KvStore::open(dir.path().join("test.redb")).unwrap());
-    let sm = StateMachine::new(Arc::clone(&store));
+    let handle = make_store_handle(&dir).await;
+    let sm = StateMachine::new(handle.clone());
 
     let cmd = KvCommand::Put {
         key: b"hello".to_vec(),
@@ -26,20 +35,20 @@ async fn test_state_machine_apply_put() {
         data: LogEntryData::Command(serde_json::to_vec(&cmd).unwrap()),
     };
 
-    // Should not panic — state machine accepts entries for logging.
+    // Should not panic -- state machine accepts entries for logging.
     sm.apply(vec![entry]).await;
 
     // Store remains empty: the service layer applies after Raft commit,
     // not the state machine.
-    let result = sm.store().range(b"hello", b"", 0, 0).unwrap();
+    let result = handle.range(b"hello".to_vec(), vec![], 0, 0).await.unwrap();
     assert_eq!(result.kvs.len(), 0);
 }
 
 #[tokio::test]
 async fn test_state_machine_apply_delete() {
     let dir = tempdir().unwrap();
-    let store = Arc::new(KvStore::open(dir.path().join("test.redb")).unwrap());
-    let sm = StateMachine::new(Arc::clone(&store));
+    let handle = make_store_handle(&dir).await;
+    let sm = StateMachine::new(handle.clone());
 
     let put = LogEntry {
         term: 1,
@@ -68,28 +77,23 @@ async fn test_state_machine_apply_delete() {
 
     sm.apply(vec![put, delete]).await;
 
-    let result = sm.store().range(b"key", b"", 0, 0).unwrap();
+    let result = handle.range(b"key".to_vec(), vec![], 0, 0).await.unwrap();
     assert_eq!(result.kvs.len(), 0);
 }
 
 /// State machine no longer applies to store (service layer does).
-/// Verify the state machine holds a reference to the shared store.
+/// Verify the handle can write and read back data.
 #[tokio::test]
 async fn test_state_machine_shared_store() {
     let dir = tempdir().unwrap();
-    let store = Arc::new(KvStore::open(dir.path().join("test.redb")).unwrap());
-    let sm = StateMachine::new(Arc::clone(&store));
+    let handle = make_store_handle(&dir).await;
+    let _sm = StateMachine::new(handle.clone());
 
-    // Write directly to the store (simulating the service layer).
-    store.put(b"shared", b"data", 0).unwrap();
+    // Write directly to the store via handle (simulating the service layer).
+    handle.put(b"shared".to_vec(), b"data".to_vec(), 0).await.unwrap();
 
-    // State machine's store reference should see the same data.
-    let result = sm.store().range(b"shared", b"", 0, 0).unwrap();
-    assert_eq!(result.kvs.len(), 1);
-    assert_eq!(result.kvs[0].value, b"data");
-
-    // Also verify through the Arc reference.
-    let result = store.range(b"shared", b"", 0, 0).unwrap();
+    // The handle should see the same data.
+    let result = handle.range(b"shared".to_vec(), vec![], 0, 0).await.unwrap();
     assert_eq!(result.kvs.len(), 1);
     assert_eq!(result.kvs[0].value, b"data");
 }
@@ -97,8 +101,8 @@ async fn test_state_machine_shared_store() {
 #[tokio::test]
 async fn test_state_machine_noop_and_config_change_ignored() {
     let dir = tempdir().unwrap();
-    let store = Arc::new(KvStore::open(dir.path().join("test.redb")).unwrap());
-    let sm = StateMachine::new(Arc::clone(&store));
+    let handle = make_store_handle(&dir).await;
+    let sm = StateMachine::new(handle.clone());
 
     let noop_entry = LogEntry {
         term: 1,
@@ -110,7 +114,7 @@ async fn test_state_machine_noop_and_config_change_ignored() {
     sm.apply(vec![noop_entry]).await;
 
     // Store should still be empty.
-    assert_eq!(store.current_revision().unwrap(), 0);
+    assert_eq!(handle.current_revision().await.unwrap(), 0);
 }
 
 /// State machine now delegates application to the service layer.
@@ -119,8 +123,8 @@ async fn test_state_machine_noop_and_config_change_ignored() {
 #[tokio::test]
 async fn test_state_machine_multiple_puts() {
     let dir = tempdir().unwrap();
-    let store = Arc::new(KvStore::open(dir.path().join("test.redb")).unwrap());
-    let sm = StateMachine::new(Arc::clone(&store));
+    let handle = make_store_handle(&dir).await;
+    let sm = StateMachine::new(handle.clone());
 
     let entries: Vec<LogEntry> = (1..=5)
         .map(|i| LogEntry {
@@ -137,9 +141,9 @@ async fn test_state_machine_multiple_puts() {
         })
         .collect();
 
-    // Should not panic — state machine logs entries for observability.
+    // Should not panic -- state machine logs entries for observability.
     sm.apply(entries).await;
 
     // Store remains empty: the service layer applies after Raft commit.
-    assert_eq!(store.current_revision().unwrap(), 0);
+    assert_eq!(handle.current_revision().await.unwrap(), 0);
 }

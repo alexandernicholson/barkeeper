@@ -5,7 +5,7 @@ use tokio::sync::oneshot;
 use crate::cluster::manager::Member;
 use crate::cluster::membership_sync::MembershipSync;
 use crate::kv::state_machine::KvCommand;
-use crate::kv::store::{DeleteResult, PutResult, TxnResult};
+use crate::kv::store::{DeleteResult, PutResult, RangeResult, TxnCompare, TxnOp, TxnResult};
 use crate::proto::mvccpb;
 
 /// Commands sent to the RaftProcess actor.
@@ -203,5 +203,63 @@ pub enum ClusterCmd {
     SetMembershipSync {
         sync: Arc<std::sync::Mutex<MembershipSync>>,
         reply: oneshot::Sender<()>,
+    },
+}
+
+/// Commands sent to the KvStoreActor.
+pub enum KvStoreCmd {
+    /// Put a key-value pair.
+    Put {
+        key: Vec<u8>,
+        value: Vec<u8>,
+        lease_id: i64,
+        reply: oneshot::Sender<Result<PutResult, String>>,
+    },
+    /// Query a range of keys.
+    Range {
+        key: Vec<u8>,
+        range_end: Vec<u8>,
+        limit: i64,
+        revision: i64,
+        reply: oneshot::Sender<Result<RangeResult, String>>,
+    },
+    /// Delete keys in a range.
+    DeleteRange {
+        key: Vec<u8>,
+        range_end: Vec<u8>,
+        reply: oneshot::Sender<Result<DeleteResult, String>>,
+    },
+    /// Execute a transaction (compare-and-swap).
+    Txn {
+        compares: Vec<TxnCompare>,
+        success: Vec<TxnOp>,
+        failure: Vec<TxnOp>,
+        reply: oneshot::Sender<Result<TxnResult, String>>,
+    },
+    /// Compact the store up to a revision.
+    Compact {
+        revision: i64,
+        reply: oneshot::Sender<Result<(), String>>,
+    },
+    /// Get the current revision number.
+    CurrentRevision {
+        reply: oneshot::Sender<Result<i64, String>>,
+    },
+    /// Return all mutations since a revision (exclusive).
+    ChangesSince {
+        after_revision: i64,
+        reply: oneshot::Sender<Result<Vec<(Vec<u8>, i32, mvccpb::KeyValue)>, String>>,
+    },
+    /// Get the database file size in bytes.
+    DbFileSize {
+        reply: oneshot::Sender<Result<i64, String>>,
+    },
+    /// Read the entire database file for snapshotting.
+    SnapshotBytes {
+        reply: oneshot::Sender<Result<Vec<u8>, String>>,
+    },
+    /// Trigger internal compaction of the redb database.
+    CompactDb {
+        reply: oneshot::Sender<Result<bool, String>>,
     },
 }

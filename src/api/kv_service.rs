@@ -3,9 +3,10 @@ use std::sync::Arc;
 
 use tonic::{Request, Response, Status};
 
+use crate::kv::actor::KvStoreActorHandle;
 use crate::kv::state_machine::KvCommand;
 use crate::kv::store::{
-    KvStore, TxnCompare, TxnCompareResult, TxnCompareTarget, TxnOp, TxnOpResponse,
+    TxnCompare, TxnCompareResult, TxnCompareTarget, TxnOp, TxnOpResponse,
 };
 use crate::lease::manager::LeaseManager;
 use crate::proto::etcdserverpb::compare::{CompareResult, CompareTarget, TargetUnion};
@@ -21,7 +22,7 @@ use crate::watch::hub::WatchHub;
 
 /// gRPC KV service implementing the etcd KV API.
 pub struct KvService {
-    store: Arc<KvStore>,
+    store: KvStoreActorHandle,
     watch_hub: Arc<WatchHub>,
     lease_manager: Arc<LeaseManager>,
     cluster_id: u64,
@@ -32,7 +33,7 @@ pub struct KvService {
 
 impl KvService {
     pub fn new(
-        store: Arc<KvStore>,
+        store: KvStoreActorHandle,
         watch_hub: Arc<WatchHub>,
         lease_manager: Arc<LeaseManager>,
         cluster_id: u64,
@@ -71,12 +72,14 @@ impl Kv for KvService {
 
         let result = self
             .store
-            .range(&req.key, &req.range_end, req.limit, req.revision)
+            .range(req.key.clone(), req.range_end.clone(), req.limit, req.revision)
+            .await
             .map_err(|e| Status::internal(format!("range failed: {}", e)))?;
 
         let revision = self
             .store
             .current_revision()
+            .await
             .map_err(|e| Status::internal(format!("revision failed: {}", e)))?;
 
         Ok(Response::new(RangeResponse {
@@ -106,7 +109,8 @@ impl Kv for KvService {
                 // Committed. Apply to store.
                 let result = self
                     .store
-                    .put(&req.key, &req.value, req.lease)
+                    .put(req.key.clone(), req.value.clone(), req.lease)
+                    .await
                     .map_err(|e| Status::internal(format!("put failed: {}", e)))?;
 
                 // Notify watchers of the put event.
@@ -170,7 +174,8 @@ impl Kv for KvService {
                 // Committed. Apply to store.
                 let result = self
                     .store
-                    .delete_range(&req.key, &req.range_end)
+                    .delete_range(req.key.clone(), req.range_end.clone())
+                    .await
                     .map_err(|e| Status::internal(format!("delete failed: {}", e)))?;
 
                 // Notify watchers for each deleted key.
@@ -253,6 +258,7 @@ impl Kv for KvService {
                 let result = self
                     .store
                     .txn(compares, success, failure)
+                    .await
                     .map_err(|e| Status::internal(format!("txn failed: {}", e)))?;
 
                 // Notify watchers for txn mutations.
@@ -333,11 +339,13 @@ impl Kv for KvService {
                 // Committed. Apply to store.
                 self.store
                     .compact(req.revision)
+                    .await
                     .map_err(|e| Status::internal(format!("compact failed: {}", e)))?;
 
                 let revision = self
                     .store
                     .current_revision()
+                    .await
                     .map_err(|e| Status::internal(format!("revision failed: {}", e)))?;
 
                 Ok(Response::new(CompactionResponse {

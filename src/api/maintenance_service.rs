@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex};
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
 
-use crate::kv::store::KvStore;
+use crate::kv::actor::KvStoreActorHandle;
 use crate::proto::etcdserverpb::maintenance_server::Maintenance;
 use crate::proto::etcdserverpb::{
     alarm_request::AlarmAction, AlarmMember, AlarmRequest, AlarmResponse, AlarmType,
@@ -16,7 +16,7 @@ use crate::raft::node::RaftHandle;
 
 /// gRPC Maintenance service implementing the etcd Maintenance API.
 pub struct MaintenanceService {
-    store: Arc<KvStore>,
+    store: KvStoreActorHandle,
     cluster_id: u64,
     member_id: u64,
     raft_term: Arc<AtomicU64>,
@@ -26,7 +26,7 @@ pub struct MaintenanceService {
 
 impl MaintenanceService {
     pub fn new(
-        store: Arc<KvStore>,
+        store: KvStoreActorHandle,
         cluster_id: u64,
         member_id: u64,
         raft_term: Arc<AtomicU64>,
@@ -47,8 +47,8 @@ impl MaintenanceService {
         Arc::clone(&self.alarms)
     }
 
-    fn make_header(&self) -> Option<ResponseHeader> {
-        let revision = self.store.current_revision().unwrap_or(0);
+    async fn make_header(&self) -> Option<ResponseHeader> {
+        let revision = self.store.current_revision().await.unwrap_or(0);
         Some(ResponseHeader {
             cluster_id: self.cluster_id,
             member_id: self.member_id,
@@ -73,6 +73,10 @@ impl Maintenance for MaintenanceService {
             req.member_id
         };
 
+        // Fetch header before acquiring the std::sync::Mutex to avoid
+        // holding a MutexGuard across an await point.
+        let header = self.make_header().await;
+
         let mut alarms = self.alarms.lock().unwrap();
 
         match action {
@@ -88,7 +92,7 @@ impl Maintenance for MaintenanceService {
                         .collect()
                 };
                 Ok(Response::new(AlarmResponse {
-                    header: self.make_header(),
+                    header,
                     alarms: result,
                 }))
             }
@@ -110,7 +114,7 @@ impl Maintenance for MaintenanceService {
                     alarms.push(new_alarm.clone());
                 }
                 Ok(Response::new(AlarmResponse {
-                    header: self.make_header(),
+                    header,
                     alarms: vec![new_alarm],
                 }))
             }
@@ -126,7 +130,7 @@ impl Maintenance for MaintenanceService {
                     );
                 }
                 Ok(Response::new(AlarmResponse {
-                    header: self.make_header(),
+                    header,
                     alarms: vec![],
                 }))
             }
@@ -137,10 +141,10 @@ impl Maintenance for MaintenanceService {
         &self,
         _request: Request<StatusRequest>,
     ) -> Result<Response<StatusResponse>, Status> {
-        let db_size = self.store.db_file_size().unwrap_or(0);
+        let db_size = self.store.db_file_size().await.unwrap_or(0);
 
         Ok(Response::new(StatusResponse {
-            header: self.make_header(),
+            header: self.make_header().await,
             version: env!("CARGO_PKG_VERSION").to_string(),
             db_size,
             leader: self.member_id,
@@ -165,11 +169,11 @@ impl Maintenance for MaintenanceService {
         // Trigger a write transaction commit which causes redb to reclaim
         // unused pages internally. redb manages its own page-level compaction
         // so an explicit "defragment" reduces to flushing pending work.
-        match self.store.compact_db() {
+        match self.store.compact_db().await {
             Ok(_) => {
                 tracing::info!("defragment completed successfully");
                 Ok(Response::new(DefragmentResponse {
-                    header: self.make_header(),
+                    header: self.make_header().await,
                 }))
             }
             Err(e) => {
@@ -185,7 +189,7 @@ impl Maintenance for MaintenanceService {
     ) -> Result<Response<HashResponse>, Status> {
         // Stub: return zero hash
         Ok(Response::new(HashResponse {
-            header: self.make_header(),
+            header: self.make_header().await,
             hash: 0,
         }))
     }
@@ -196,7 +200,7 @@ impl Maintenance for MaintenanceService {
     ) -> Result<Response<HashKvResponse>, Status> {
         // Stub: return zero hash
         Ok(Response::new(HashKvResponse {
-            header: self.make_header(),
+            header: self.make_header().await,
             hash: 0,
             compact_revision: 0,
             hash_revision: 0,
@@ -212,10 +216,11 @@ impl Maintenance for MaintenanceService {
         let data = self
             .store
             .snapshot_bytes()
+            .await
             .map_err(|e| Status::internal(format!("snapshot: {}", e)))?;
 
         let (tx, rx) = tokio::sync::mpsc::channel(4);
-        let header = self.make_header();
+        let header = self.make_header().await;
         let version = env!("CARGO_PKG_VERSION").to_string();
 
         tokio::spawn(async move {
