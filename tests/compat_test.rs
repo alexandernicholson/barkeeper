@@ -964,3 +964,55 @@ async fn test_http_compaction_works() {
         "compaction response should have header"
     );
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Lease Expiry Tests
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Keys attached to expired leases should be automatically deleted.
+/// This tests the production expiry timer path.
+#[tokio::test]
+async fn test_lease_expiry_via_production_timer() {
+    let (addr, _dir) = start_test_instance().await;
+    let client = Client::new();
+
+    // Grant a short-lived lease.
+    let resp: Value = client
+        .post(format!("http://{}/v3/lease/grant", addr))
+        .body(r#"{"TTL": 1}"#)
+        .send().await.unwrap()
+        .json().await.unwrap();
+    let lease_id = resp["ID"].as_str().unwrap();
+
+    // Put a key with the lease.
+    client
+        .post(format!("http://{}/v3/kv/put", addr))
+        .body(format!(
+            r#"{{"key":"{}","value":"{}","lease":{}}}"#,
+            b64("expiring"), b64("temp"), lease_id
+        ))
+        .send().await.unwrap();
+
+    // Key should exist.
+    let get: Value = client
+        .post(format!("http://{}/v3/kv/range", addr))
+        .body(format!(r#"{{"key":"{}"}}"#, b64("expiring")))
+        .send().await.unwrap()
+        .json().await.unwrap();
+    assert!(get["kvs"].as_array().unwrap().len() > 0);
+
+    // Wait for expiry (TTL=1 + timer interval + margin).
+    tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
+
+    // Key should be gone.
+    let get2: Value = client
+        .post(format!("http://{}/v3/kv/range", addr))
+        .body(format!(r#"{{"key":"{}"}}"#, b64("expiring")))
+        .send().await.unwrap()
+        .json().await.unwrap();
+    let kvs = get2.get("kvs").and_then(|v| v.as_array());
+    assert!(
+        kvs.is_none() || kvs.unwrap().is_empty(),
+        "key should be deleted after lease expiry"
+    );
+}
