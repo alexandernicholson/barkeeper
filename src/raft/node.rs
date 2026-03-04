@@ -250,7 +250,29 @@ async fn execute_actions(
             }
             Action::SendMessage { to, message } => {
                 if let Some(ref transport) = transport {
-                    transport.send(*to, message.clone()).await;
+                    // For AppendEntries, fill in entries and prev_log_term
+                    // from the LogStore (the core leaves them as placeholders).
+                    let message = match message {
+                        RaftMessage::AppendEntriesReq(req) => {
+                            let mut req = req.clone();
+                            // Fill prev_log_term from log store
+                            if req.prev_log_index > 0 {
+                                req.prev_log_term = log_store
+                                    .term_at(req.prev_log_index)
+                                    .unwrap()
+                                    .unwrap_or(0);
+                            }
+                            // Fill entries from log store (prev_log_index+1 .. last)
+                            let last = log_store.last_index().unwrap_or(0);
+                            let start = req.prev_log_index + 1;
+                            if start <= last {
+                                req.entries = log_store.get_range(start, last).unwrap_or_default();
+                            }
+                            RaftMessage::AppendEntriesReq(req)
+                        }
+                        other => other.clone(),
+                    };
+                    transport.send(*to, message).await;
                 } else {
                     tracing::debug!(to = to, "would send raft message (no transport configured)");
                 }

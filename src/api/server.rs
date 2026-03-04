@@ -1,13 +1,15 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use tokio::sync::mpsc;
 use tonic::transport::Server;
 
+use rebar_core::process::ExitReason;
 use rebar_core::runtime::Runtime;
-use rebar_core::supervisor::engine::start_supervisor;
-use rebar_core::supervisor::spec::{SupervisorSpec, RestartStrategy};
+use rebar_core::supervisor::engine::{start_supervisor, ChildEntry};
+use rebar_core::supervisor::spec::{ChildSpec, RestartStrategy, RestartType, SupervisorSpec};
 
 use crate::api::auth_service::AuthService;
 use crate::api::cluster_service::ClusterService;
@@ -66,7 +68,7 @@ impl BarkeepServer {
             .max_restarts(5)
             .max_seconds(30);
 
-        let _supervisor = start_supervisor(runtime.clone(), supervisor_spec, vec![]).await;
+        let supervisor = start_supervisor(runtime.clone(), supervisor_spec, vec![]).await;
 
         tracing::info!("started Rebar supervisor");
 
@@ -184,35 +186,54 @@ impl BarkeepServer {
         // Create the Maintenance gRPC service.
         let maintenance_service =
             MaintenanceService::new(Arc::clone(&store), cluster_id, member_id, Arc::clone(&raft_term), raft_handle.clone());
+        let alarms = maintenance_service.alarms();
 
-        // Spawn lease expiry timer — checks every 500ms for expired leases.
+        // Register lease expiry timer as a supervised Rebar child process.
+        // The factory closure clones Arc references so restarts get fresh
+        // handles to the same shared state.
         {
             let lm = Arc::clone(&lease_manager);
             let st = Arc::clone(&store);
             let wh = Arc::clone(&watch_hub);
-            tokio::spawn(async move {
-                loop {
-                    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-                    let expired = lm.check_expired().await;
-                    for lease in expired {
-                        for key in &lease.keys {
-                            if let Ok(result) = st.delete_range(key, b"") {
-                                for prev in &result.prev_kvs {
-                                    let tombstone = crate::proto::mvccpb::KeyValue {
-                                        key: prev.key.clone(),
-                                        create_revision: 0,
-                                        mod_revision: result.revision,
-                                        version: 0,
-                                        value: vec![],
-                                        lease: 0,
-                                    };
-                                    wh.notify(&prev.key, 1, tombstone, Some(prev.clone())).await;
+            supervisor
+                .add_child(ChildEntry::new(
+                    ChildSpec::new("lease_expiry_timer")
+                        .restart(RestartType::Permanent),
+                    move || {
+                        let lm = Arc::clone(&lm);
+                        let st = Arc::clone(&st);
+                        let wh = Arc::clone(&wh);
+                        async move {
+                            tracing::info!("lease expiry timer started");
+                            loop {
+                                tokio::time::sleep(Duration::from_millis(500)).await;
+                                let expired = lm.check_expired().await;
+                                for lease in expired {
+                                    for key in &lease.keys {
+                                        if let Ok(result) = st.delete_range(key, b"") {
+                                            for prev in &result.prev_kvs {
+                                                let tombstone = crate::proto::mvccpb::KeyValue {
+                                                    key: prev.key.clone(),
+                                                    create_revision: 0,
+                                                    mod_revision: result.revision,
+                                                    version: 0,
+                                                    value: vec![],
+                                                    lease: 0,
+                                                };
+                                                wh.notify(&prev.key, 1, tombstone, Some(prev.clone())).await;
+                                            }
+                                        }
+                                    }
                                 }
                             }
+                            #[allow(unreachable_code)]
+                            ExitReason::Normal
                         }
-                    }
-                }
-            });
+                    },
+                ))
+                .await
+                .expect("failed to register lease_expiry_timer");
+            tracing::info!("registered lease_expiry_timer with supervisor");
         }
 
         // Start the HTTP/JSON gateway on port + 1.
@@ -227,6 +248,7 @@ impl BarkeepServer {
             member_id,
             Arc::clone(&raft_term),
             Arc::clone(&auth_manager),
+            alarms,
         );
 
         tracing::info!(%http_addr, %scheme, "starting HTTP gateway");

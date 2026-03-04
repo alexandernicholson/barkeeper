@@ -65,6 +65,7 @@ async fn start_test_instance() -> (SocketAddr, tempfile::TempDir) {
         1,
         Arc::clone(&raft_handle.current_term),
         Arc::clone(&auth_manager),
+        Arc::new(std::sync::Mutex::new(vec![])),
     );
 
     let http_port = portpicker::pick_unused_port().expect("no free port");

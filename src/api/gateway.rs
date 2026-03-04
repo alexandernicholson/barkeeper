@@ -7,11 +7,12 @@
 //! values (0, false, empty) are omitted from responses.
 
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use axum::extract::{Request, State};
 use axum::http::StatusCode;
 use axum::middleware::{self, Next};
+use axum::response::sse::{Event as SseEvent, Sse};
 use axum::response::IntoResponse;
 use axum::routing::post;
 use axum::Router;
@@ -20,6 +21,7 @@ use base64::Engine;
 use serde::{Deserialize, Serialize, Serializer};
 
 use crate::auth::manager::AuthManager;
+use crate::proto::etcdserverpb::{alarm_request::AlarmAction, AlarmMember, AlarmType};
 use crate::cluster::manager::ClusterManager;
 use crate::kv::state_machine::KvCommand;
 use crate::kv::store::{KvStore, TxnCompare, TxnCompareResult, TxnCompareTarget, TxnOp, TxnOpResponse};
@@ -71,6 +73,7 @@ pub struct GatewayState {
     pub member_id: u64,
     pub raft_term: Arc<AtomicU64>,
     pub raft_handle: RaftHandle,
+    pub alarms: Arc<Mutex<Vec<AlarmMember>>>,
 }
 
 // ── JSON request / response types ───────────────────────────────────────────
@@ -258,6 +261,18 @@ struct CompactionRequest {
 #[derive(Debug, Serialize)]
 struct CompactionResponse {
     header: JsonResponseHeader,
+}
+
+// ── Watch types ─────────────────────────────────────────────────────────────
+
+#[derive(Debug, Deserialize, Default)]
+struct WatchCreateRequest {
+    #[serde(default)]
+    key: Option<String>,
+    #[serde(default)]
+    range_end: Option<String>,
+    #[serde(default)]
+    start_revision: Option<i64>,
 }
 
 // ── Txn types ──────────────────────────────────────────────────────────────
@@ -485,6 +500,7 @@ pub fn create_router(
     member_id: u64,
     raft_term: Arc<AtomicU64>,
     auth_manager: Arc<AuthManager>,
+    alarms: Arc<Mutex<Vec<AlarmMember>>>,
 ) -> Router {
     let state = GatewayState {
         store,
@@ -496,6 +512,7 @@ pub fn create_router(
         member_id,
         raft_term,
         raft_handle,
+        alarms,
     };
 
     Router::new()
@@ -510,6 +527,11 @@ pub fn create_router(
         .route("/v3/lease/leases", post(handle_lease_leases))
         .route("/v3/cluster/member/list", post(handle_cluster_member_list))
         .route("/v3/maintenance/status", post(handle_maintenance_status))
+        .route("/v3/maintenance/defragment", post(handle_maintenance_defragment))
+        .route("/v3/maintenance/alarm", post(handle_maintenance_alarm))
+        .route("/v3/maintenance/snapshot", post(handle_maintenance_snapshot))
+        // Watch SSE endpoint
+        .route("/v3/watch", post(handle_watch_sse))
         // Auth endpoints
         .route("/v3/auth/enable", post(handle_auth_enable))
         .route("/v3/auth/disable", post(handle_auth_disable))
@@ -1083,6 +1105,158 @@ async fn handle_maintenance_status(
     })
 }
 
+async fn handle_maintenance_snapshot(
+    State(state): State<GatewayState>,
+) -> impl IntoResponse {
+    match state.store.snapshot_bytes() {
+        Ok(data) => (
+            StatusCode::OK,
+            [(axum::http::header::CONTENT_TYPE, "application/octet-stream")],
+            data,
+        )
+            .into_response(),
+        Err(e) => json_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("snapshot: {}", e),
+        )
+        .into_response(),
+    }
+}
+
+// ── Defragment types ───────────────────────────────────────────────────────
+
+#[derive(Debug, Deserialize, Default)]
+struct DefragmentReq {}
+
+#[derive(Debug, Serialize)]
+struct DefragmentResp {
+    header: JsonResponseHeader,
+}
+
+async fn handle_maintenance_defragment(
+    State(state): State<GatewayState>,
+    body: axum::body::Bytes,
+) -> impl IntoResponse {
+    let _: DefragmentReq = parse_json(&body);
+
+    match state.store.compact_db() {
+        Ok(_) => {
+            let rev = state.store.current_revision().unwrap_or(0);
+            axum::Json(DefragmentResp {
+                header: state.make_header(rev),
+            })
+            .into_response()
+        }
+        Err(e) => json_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("defragment failed: {}", e),
+        )
+        .into_response(),
+    }
+}
+
+// ── Alarm types ────────────────────────────────────────────────────────────
+
+#[derive(Debug, Deserialize, Default)]
+struct AlarmReq {
+    #[serde(default)]
+    action: Option<i32>,
+    #[serde(default, rename = "memberID")]
+    member_id: Option<String>, // proto3 JSON: uint64 as string
+    #[serde(default)]
+    alarm: Option<i32>,
+}
+
+#[derive(Debug, Serialize)]
+struct AlarmResp {
+    header: JsonResponseHeader,
+    #[serde(skip_serializing_if = "is_empty_vec")]
+    alarms: Vec<JsonAlarmMember>,
+}
+
+#[derive(Debug, Serialize)]
+struct JsonAlarmMember {
+    #[serde(rename = "memberID", skip_serializing_if = "is_zero_u64", serialize_with = "ser_str_u64")]
+    member_id: u64,
+    #[serde(skip_serializing_if = "is_zero_i64", serialize_with = "ser_str_i64")]
+    alarm: i64,
+}
+
+async fn handle_maintenance_alarm(
+    State(state): State<GatewayState>,
+    body: axum::body::Bytes,
+) -> impl IntoResponse {
+    let req: AlarmReq = parse_json(&body);
+    let action = req.action.unwrap_or(0);
+    let alarm_value = req.alarm.unwrap_or(0);
+    let member_id: u64 = req
+        .member_id
+        .as_deref()
+        .unwrap_or("0")
+        .parse()
+        .unwrap_or(0);
+    let effective_member_id = if member_id == 0 {
+        state.member_id
+    } else {
+        member_id
+    };
+
+    let rev = state.store.current_revision().unwrap_or(0);
+
+    let alarm_action = AlarmAction::try_from(action).unwrap_or(AlarmAction::Get);
+    let mut alarms_lock = state.alarms.lock().unwrap();
+
+    let result_alarms: Vec<JsonAlarmMember> = match alarm_action {
+        AlarmAction::Get => {
+            let alarm_type = AlarmType::try_from(alarm_value).unwrap_or(AlarmType::None);
+            if alarm_type == AlarmType::None {
+                alarms_lock
+                    .iter()
+                    .map(|a| JsonAlarmMember {
+                        member_id: a.member_id,
+                        alarm: a.alarm as i64,
+                    })
+                    .collect()
+            } else {
+                alarms_lock
+                    .iter()
+                    .filter(|a| a.alarm == alarm_value)
+                    .map(|a| JsonAlarmMember {
+                        member_id: a.member_id,
+                        alarm: a.alarm as i64,
+                    })
+                    .collect()
+            }
+        }
+        AlarmAction::Activate => {
+            let new_alarm = AlarmMember {
+                member_id: effective_member_id,
+                alarm: alarm_value,
+            };
+            let already_exists = alarms_lock
+                .iter()
+                .any(|a| a.member_id == effective_member_id && a.alarm == alarm_value);
+            if !already_exists {
+                alarms_lock.push(new_alarm);
+            }
+            vec![JsonAlarmMember {
+                member_id: effective_member_id,
+                alarm: alarm_value as i64,
+            }]
+        }
+        AlarmAction::Deactivate => {
+            alarms_lock
+                .retain(|a| !(a.member_id == effective_member_id && a.alarm == alarm_value));
+            vec![]
+        }
+    };
+
+    axum::Json(AlarmResp {
+        header: state.make_header(rev),
+        alarms: result_alarms,
+    })
+}
+
 // ── Auth JSON request / response types ──────────────────────────────────────
 
 #[derive(Debug, Deserialize, Default)]
@@ -1588,4 +1762,126 @@ async fn handle_auth_role_revoke_permission(
         header: state.make_header(0),
     })
     .into_response()
+}
+
+// ── Watch SSE handler ───────────────────────────────────────────────────────
+
+fn proto_kv_to_json_value(kv: &crate::proto::mvccpb::KeyValue) -> serde_json::Value {
+    let mut m = serde_json::Map::new();
+    m.insert("key".into(), serde_json::Value::String(encode_b64(&kv.key)));
+    if kv.create_revision != 0 {
+        m.insert(
+            "create_revision".into(),
+            serde_json::Value::String(kv.create_revision.to_string()),
+        );
+    }
+    if kv.mod_revision != 0 {
+        m.insert(
+            "mod_revision".into(),
+            serde_json::Value::String(kv.mod_revision.to_string()),
+        );
+    }
+    if kv.version != 0 {
+        m.insert(
+            "version".into(),
+            serde_json::Value::String(kv.version.to_string()),
+        );
+    }
+    m.insert(
+        "value".into(),
+        serde_json::Value::String(encode_b64(&kv.value)),
+    );
+    if kv.lease != 0 {
+        m.insert(
+            "lease".into(),
+            serde_json::Value::String(kv.lease.to_string()),
+        );
+    }
+    serde_json::Value::Object(m)
+}
+
+fn make_header_json(state: &GatewayState, revision: i64) -> serde_json::Value {
+    let mut m = serde_json::Map::new();
+    m.insert(
+        "cluster_id".into(),
+        serde_json::Value::String(state.cluster_id.to_string()),
+    );
+    m.insert(
+        "member_id".into(),
+        serde_json::Value::String(state.member_id.to_string()),
+    );
+    if revision != 0 {
+        m.insert(
+            "revision".into(),
+            serde_json::Value::String(revision.to_string()),
+        );
+    }
+    m.insert(
+        "raft_term".into(),
+        serde_json::Value::String(state.raft_term.load(Ordering::Relaxed).to_string()),
+    );
+    serde_json::Value::Object(m)
+}
+
+async fn handle_watch_sse(
+    State(state): State<GatewayState>,
+    body: axum::body::Bytes,
+) -> Sse<impl futures::Stream<Item = Result<SseEvent, std::convert::Infallible>>> {
+    let req: WatchCreateRequest = parse_json(&body);
+    let key = decode_b64(&req.key);
+    let range_end = decode_b64(&req.range_end);
+    let start_revision = req.start_revision.unwrap_or(0);
+
+    let (watch_id, mut event_rx) = state
+        .watch_hub
+        .create_watch(key, range_end, start_revision)
+        .await;
+
+    let stream = async_stream::stream! {
+        // Send initial "created" event.
+        let created = serde_json::json!({
+            "result": {
+                "header": make_header_json(&state, 0),
+                "watch_id": watch_id.to_string(),
+                "created": true,
+                "events": []
+            }
+        });
+        yield Ok::<_, std::convert::Infallible>(
+            SseEvent::default().data(created.to_string()),
+        );
+
+        // Forward watch events as they arrive.
+        while let Some(watch_event) = event_rx.recv().await {
+            let events: Vec<serde_json::Value> = watch_event
+                .events
+                .iter()
+                .map(|e| {
+                    let mut ev = serde_json::json!({
+                        "type": if e.r#type == 1 { "DELETE" } else { "PUT" },
+                    });
+                    if let Some(ref kv) = e.kv {
+                        ev["kv"] = proto_kv_to_json_value(kv);
+                    }
+                    if let Some(ref prev) = e.prev_kv {
+                        ev["prev_kv"] = proto_kv_to_json_value(prev);
+                    }
+                    ev
+                })
+                .collect();
+
+            let resp = serde_json::json!({
+                "result": {
+                    "header": make_header_json(&state, 0),
+                    "watch_id": watch_event.watch_id.to_string(),
+                    "events": events
+                }
+            });
+            yield Ok::<_, std::convert::Infallible>(
+                SseEvent::default().data(resp.to_string()),
+            );
+        }
+    };
+
+    Sse::new(stream)
 }

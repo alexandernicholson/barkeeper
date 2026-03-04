@@ -79,6 +79,7 @@ async fn start_instance_with_lease_expiry() -> (SocketAddr, Arc<KvStore>, Arc<Le
         1, 1,
         Arc::clone(&raft_handle.current_term),
         Arc::clone(&auth_manager),
+        Arc::new(std::sync::Mutex::new(vec![])),
     );
 
     let port = portpicker::pick_unused_port().unwrap();

@@ -201,6 +201,23 @@ impl KvStore {
         Ok(metadata.len() as i64)
     }
 
+    /// Read the entire database file into memory for snapshotting.
+    pub fn snapshot_bytes(&self) -> Result<Vec<u8>, std::io::Error> {
+        std::fs::read(&self.db_path)
+    }
+
+    /// Trigger internal compaction of the redb database.
+    ///
+    /// redb manages its own page-level compaction automatically, but
+    /// committing an empty write transaction flushes any pending internal
+    /// housekeeping and reclaims unused pages. This is the closest analogue
+    /// to etcd's "defragment" operation when backed by redb.
+    pub fn compact_db(&self) -> Result<bool, redb::Error> {
+        let txn = self.db.begin_write()?;
+        txn.commit()?;
+        Ok(true)
+    }
+
     /// Get the current revision number.
     pub fn current_revision(&self) -> Result<i64, redb::Error> {
         let txn = self.db.begin_read()?;

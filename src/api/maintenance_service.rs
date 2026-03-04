@@ -1,5 +1,5 @@
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
@@ -7,10 +7,10 @@ use tonic::{Request, Response, Status};
 use crate::kv::store::KvStore;
 use crate::proto::etcdserverpb::maintenance_server::Maintenance;
 use crate::proto::etcdserverpb::{
-    AlarmRequest, AlarmResponse, DefragmentRequest, DefragmentResponse, DowngradeRequest,
-    DowngradeResponse, HashKvRequest, HashKvResponse, HashRequest, HashResponse,
-    MoveLeaderRequest, MoveLeaderResponse, ResponseHeader, SnapshotRequest, SnapshotResponse,
-    StatusRequest, StatusResponse,
+    alarm_request::AlarmAction, AlarmMember, AlarmRequest, AlarmResponse, AlarmType,
+    DefragmentRequest, DefragmentResponse, DowngradeRequest, DowngradeResponse, HashKvRequest,
+    HashKvResponse, HashRequest, HashResponse, MoveLeaderRequest, MoveLeaderResponse,
+    ResponseHeader, SnapshotRequest, SnapshotResponse, StatusRequest, StatusResponse,
 };
 use crate::raft::node::RaftHandle;
 
@@ -21,6 +21,7 @@ pub struct MaintenanceService {
     member_id: u64,
     raft_term: Arc<AtomicU64>,
     raft_handle: RaftHandle,
+    alarms: Arc<Mutex<Vec<AlarmMember>>>,
 }
 
 impl MaintenanceService {
@@ -37,7 +38,13 @@ impl MaintenanceService {
             member_id,
             raft_term,
             raft_handle,
+            alarms: Arc::new(Mutex::new(Vec::new())),
         }
+    }
+
+    /// Returns a shared reference to the alarm store for use by the HTTP gateway.
+    pub fn alarms(&self) -> Arc<Mutex<Vec<AlarmMember>>> {
+        Arc::clone(&self.alarms)
     }
 
     fn make_header(&self) -> Option<ResponseHeader> {
@@ -55,13 +62,75 @@ impl MaintenanceService {
 impl Maintenance for MaintenanceService {
     async fn alarm(
         &self,
-        _request: Request<AlarmRequest>,
+        request: Request<AlarmRequest>,
     ) -> Result<Response<AlarmResponse>, Status> {
-        // Stub: no alarms active
-        Ok(Response::new(AlarmResponse {
-            header: self.make_header(),
-            alarms: vec![],
-        }))
+        let req = request.into_inner();
+        let action = AlarmAction::try_from(req.action).unwrap_or(AlarmAction::Get);
+        let alarm_type = AlarmType::try_from(req.alarm).unwrap_or(AlarmType::None);
+        let member_id = if req.member_id == 0 {
+            self.member_id
+        } else {
+            req.member_id
+        };
+
+        let mut alarms = self.alarms.lock().unwrap();
+
+        match action {
+            AlarmAction::Get => {
+                // Return all active alarms, optionally filtered by type.
+                let result: Vec<AlarmMember> = if alarm_type == AlarmType::None {
+                    alarms.clone()
+                } else {
+                    alarms
+                        .iter()
+                        .filter(|a| a.alarm == req.alarm)
+                        .cloned()
+                        .collect()
+                };
+                Ok(Response::new(AlarmResponse {
+                    header: self.make_header(),
+                    alarms: result,
+                }))
+            }
+            AlarmAction::Activate => {
+                // Add the alarm if not already present.
+                let new_alarm = AlarmMember {
+                    member_id,
+                    alarm: req.alarm,
+                };
+                let already_exists = alarms
+                    .iter()
+                    .any(|a| a.member_id == member_id && a.alarm == req.alarm);
+                if !already_exists {
+                    tracing::warn!(
+                        member_id,
+                        alarm = req.alarm,
+                        "alarm activated"
+                    );
+                    alarms.push(new_alarm.clone());
+                }
+                Ok(Response::new(AlarmResponse {
+                    header: self.make_header(),
+                    alarms: vec![new_alarm],
+                }))
+            }
+            AlarmAction::Deactivate => {
+                // Remove matching alarms.
+                let before_len = alarms.len();
+                alarms.retain(|a| !(a.member_id == member_id && a.alarm == req.alarm));
+                if alarms.len() < before_len {
+                    tracing::info!(
+                        member_id,
+                        alarm = req.alarm,
+                        "alarm deactivated"
+                    );
+                }
+                Ok(Response::new(AlarmResponse {
+                    header: self.make_header(),
+                    alarms: vec![],
+                }))
+            }
+        }
     }
 
     async fn status(
@@ -91,10 +160,23 @@ impl Maintenance for MaintenanceService {
         &self,
         _request: Request<DefragmentRequest>,
     ) -> Result<Response<DefragmentResponse>, Status> {
-        // Stub: redb handles compaction internally
-        Ok(Response::new(DefragmentResponse {
-            header: self.make_header(),
-        }))
+        tracing::info!("defragment requested");
+
+        // Trigger a write transaction commit which causes redb to reclaim
+        // unused pages internally. redb manages its own page-level compaction
+        // so an explicit "defragment" reduces to flushing pending work.
+        match self.store.compact_db() {
+            Ok(_) => {
+                tracing::info!("defragment completed successfully");
+                Ok(Response::new(DefragmentResponse {
+                    header: self.make_header(),
+                }))
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "defragment failed");
+                Err(Status::internal(format!("defragment failed: {}", e)))
+            }
+        }
     }
 
     async fn hash(
@@ -127,19 +209,42 @@ impl Maintenance for MaintenanceService {
         &self,
         _request: Request<SnapshotRequest>,
     ) -> Result<Response<Self::SnapshotStream>, Status> {
-        // Stub: send an empty snapshot with a single chunk
-        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        let data = self
+            .store
+            .snapshot_bytes()
+            .map_err(|e| Status::internal(format!("snapshot: {}", e)))?;
+
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
         let header = self.make_header();
+        let version = env!("CARGO_PKG_VERSION").to_string();
+
         tokio::spawn(async move {
-            let _ = tx
-                .send(Ok(SnapshotResponse {
-                    header,
-                    remaining_bytes: 0,
-                    blob: vec![],
-                    version: env!("CARGO_PKG_VERSION").to_string(),
-                }))
-                .await;
+            let total = data.len();
+            let chunk_size = 64 * 1024; // 64KB chunks
+            let mut offset = 0;
+            let mut first = true;
+
+            while offset < total {
+                let end = (offset + chunk_size).min(total);
+                let chunk = data[offset..end].to_vec();
+                let remaining = (total - end) as u64;
+
+                let resp = SnapshotResponse {
+                    header: if first { header.clone() } else { None },
+                    remaining_bytes: remaining,
+                    blob: chunk,
+                    version: if first { version.clone() } else { String::new() },
+                };
+
+                first = false;
+                offset = end;
+
+                if tx.send(Ok(resp)).await.is_err() {
+                    break;
+                }
+            }
         });
+
         Ok(Response::new(ReceiverStream::new(rx)))
     }
 
