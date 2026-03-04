@@ -12,18 +12,21 @@ use crate::proto::etcdserverpb::{
     DeleteRangeResponse, PutRequest, PutResponse, RangeRequest, RangeResponse, RequestOp,
     ResponseHeader, ResponseOp, TxnRequest, TxnResponse,
 };
+use crate::watch::hub::WatchHub;
 
 /// gRPC KV service implementing the etcd KV API.
 pub struct KvService {
     store: Arc<KvStore>,
+    watch_hub: Arc<WatchHub>,
     cluster_id: u64,
     member_id: u64,
 }
 
 impl KvService {
-    pub fn new(store: Arc<KvStore>, cluster_id: u64, member_id: u64) -> Self {
+    pub fn new(store: Arc<KvStore>, watch_hub: Arc<WatchHub>, cluster_id: u64, member_id: u64) -> Self {
         KvService {
             store,
+            watch_hub,
             cluster_id,
             member_id,
         }
@@ -73,6 +76,17 @@ impl Kv for KvService {
             .put(&req.key, &req.value, req.lease)
             .map_err(|e| Status::internal(format!("put failed: {}", e)))?;
 
+        // Notify watchers of the put event.
+        let notify_kv = crate::proto::mvccpb::KeyValue {
+            key: req.key.clone(),
+            create_revision: result.revision,
+            mod_revision: result.revision,
+            version: 1,
+            value: req.value.clone(),
+            lease: req.lease,
+        };
+        self.watch_hub.notify(&req.key, 0, notify_kv, result.prev_kv.clone()).await;
+
         let prev_kv = if req.prev_kv {
             result.prev_kv
         } else {
@@ -95,6 +109,19 @@ impl Kv for KvService {
             .store
             .delete_range(&req.key, &req.range_end)
             .map_err(|e| Status::internal(format!("delete failed: {}", e)))?;
+
+        // Notify watchers for each deleted key.
+        for prev in &result.prev_kvs {
+            let tombstone = crate::proto::mvccpb::KeyValue {
+                key: prev.key.clone(),
+                create_revision: 0,
+                mod_revision: result.revision,
+                version: 0,
+                value: vec![],
+                lease: 0,
+            };
+            self.watch_hub.notify(&prev.key, 1, tombstone, Some(prev.clone())).await;
+        }
 
         let prev_kvs = if req.prev_kv {
             result.prev_kvs
@@ -137,6 +164,11 @@ impl Kv for KvService {
             .store
             .txn(compares, success, failure)
             .map_err(|e| Status::internal(format!("txn failed: {}", e)))?;
+
+        // TODO: Wire txn watch notifications. Individual put/delete operations
+        // within a txn should notify watchers, but this requires iterating over
+        // the TxnOpResponse results and extracting the mutated keys. This will
+        // be wired in the StoreProcess layer later.
 
         // Convert results to proto responses.
         let responses: Vec<ResponseOp> = result

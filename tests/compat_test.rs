@@ -20,6 +20,7 @@ use barkeeper::kv::state_machine::spawn_state_machine;
 use barkeeper::kv::store::KvStore;
 use barkeeper::lease::manager::LeaseManager;
 use barkeeper::raft::node::{spawn_raft_node, RaftConfig};
+use barkeeper::watch::hub::WatchHub;
 
 /// Spin up a minimal barkeeper instance and return the HTTP gateway address.
 async fn start_test_instance() -> (SocketAddr, tempfile::TempDir) {
@@ -46,9 +47,12 @@ async fn start_test_instance() -> (SocketAddr, tempfile::TempDir) {
         .add_initial_member(1, "test-node".to_string(), vec![], vec![])
         .await;
 
+    let watch_hub = Arc::new(WatchHub::new());
+
     let app = gateway::create_router(
         raft_handle,
         Arc::clone(&store),
+        Arc::clone(&watch_hub),
         Arc::clone(&lease_manager),
         Arc::clone(&cluster_manager),
         1,

@@ -53,18 +53,19 @@ impl BarkeepServer {
         // Spawn the Raft node.
         let raft_handle = spawn_raft_node(config.clone(), apply_tx, None).await;
 
-        // Create the KV gRPC service.
+        // Create the Watch hub and gRPC service.
         let cluster_id = 1;
         let member_id = config.node_id;
+        let watch_hub = Arc::new(WatchHub::new());
+        let watch_service = WatchService::new(Arc::clone(&watch_hub), cluster_id, member_id);
+
+        // Create the KV gRPC service.
         let kv_service = KvService::new(
             Arc::clone(&store),
+            Arc::clone(&watch_hub),
             cluster_id,
             member_id,
         );
-
-        // Create the Watch hub and gRPC service.
-        let watch_hub = Arc::new(WatchHub::new());
-        let watch_service = WatchService::new(Arc::clone(&watch_hub), cluster_id, member_id);
 
         // Create the Lease manager and gRPC service.
         let lease_manager = Arc::new(LeaseManager::new());
@@ -96,6 +97,7 @@ impl BarkeepServer {
         let http_app = gateway::create_router(
             raft_handle,
             Arc::clone(&store),
+            Arc::clone(&watch_hub),
             Arc::clone(&lease_manager),
             Arc::clone(&cluster_manager),
             cluster_id,

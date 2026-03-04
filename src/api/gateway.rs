@@ -20,6 +20,7 @@ use serde::{Deserialize, Serialize, Serializer};
 use crate::cluster::manager::ClusterManager;
 use crate::kv::store::{KvStore, TxnCompare, TxnCompareResult, TxnCompareTarget, TxnOp, TxnOpResponse};
 use crate::lease::manager::LeaseManager;
+use crate::watch::hub::WatchHub;
 
 // ── Proto3 JSON serialization helpers ──────────────────────────────────────
 
@@ -56,6 +57,7 @@ fn is_empty_str(val: &str) -> bool {
 #[derive(Clone)]
 pub struct GatewayState {
     pub store: Arc<KvStore>,
+    pub watch_hub: Arc<WatchHub>,
     pub lease_manager: Arc<LeaseManager>,
     pub cluster_manager: Arc<ClusterManager>,
     pub cluster_id: u64,
@@ -407,6 +409,7 @@ fn parse_json<T: serde::de::DeserializeOwned + Default>(body: &[u8]) -> T {
 pub fn create_router(
     _raft: crate::raft::node::RaftHandle,
     store: Arc<KvStore>,
+    watch_hub: Arc<WatchHub>,
     lease_manager: Arc<LeaseManager>,
     cluster_manager: Arc<ClusterManager>,
     cluster_id: u64,
@@ -414,6 +417,7 @@ pub fn create_router(
 ) -> Router {
     let state = GatewayState {
         store,
+        watch_hub,
         lease_manager,
         cluster_manager,
         cluster_id,
@@ -477,6 +481,17 @@ async fn handle_put(
 
     match state.store.put(&key, &value, lease_id) {
         Ok(result) => {
+            // Notify watchers of the put event.
+            let notify_kv = crate::proto::mvccpb::KeyValue {
+                key: key.clone(),
+                create_revision: result.revision,
+                mod_revision: result.revision,
+                version: 1,
+                value: value.clone(),
+                lease: lease_id,
+            };
+            state.watch_hub.notify(&key, 0, notify_kv, result.prev_kv.clone()).await;
+
             let prev_kv = if req.prev_kv.unwrap_or(false) {
                 result.prev_kv.as_ref().map(proto_kv_to_json)
             } else {
@@ -505,6 +520,19 @@ async fn handle_delete_range(
 
     match state.store.delete_range(&key, &range_end) {
         Ok(result) => {
+            // Notify watchers for each deleted key.
+            for prev in &result.prev_kvs {
+                let tombstone = crate::proto::mvccpb::KeyValue {
+                    key: prev.key.clone(),
+                    create_revision: 0,
+                    mod_revision: result.revision,
+                    version: 0,
+                    value: vec![],
+                    lease: 0,
+                };
+                state.watch_hub.notify(&prev.key, 1, tombstone, Some(prev.clone())).await;
+            }
+
             let prev_kvs = if req.prev_kv.unwrap_or(false) {
                 result.prev_kvs.iter().map(proto_kv_to_json).collect()
             } else {
