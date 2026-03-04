@@ -28,7 +28,7 @@ goroutines.
 | Lease     | Yes  | Yes          |
 | Cluster   | Yes  | Yes          |
 | Maintenance | Yes | Yes        |
-| Auth      | Yes  | Planned      |
+| Auth      | Yes  | Yes          |
 
 ---
 
@@ -89,35 +89,10 @@ for request-response patterns.
 
 ## Write Path
 
-Writes flow through the gRPC/HTTP layer, into the KV store, and fan out to
-watchers. The Raft consensus path exists but is not yet wired into the API
-service layer (writes currently bypass Raft for direct store access).
-
-### Current Write Path
-
-```
-Client (etcdctl / HTTP)
-        |
-        v
-+------------------+
-| gRPC (tonic)     |    or    HTTP Gateway (axum, port+1)
-| KvService.put()  |         /v3/kv/put
-+------------------+
-        |
-        v
-+------------------+
-| KvStore.put()    |  <-- direct call, no Raft
-| (redb txn)       |
-+------------------+
-        |
-        +-------> WatchHub.notify()
-        |         fan-out to matching watchers
-        |
-        +-------> LeaseManager.attach_key()
-                  (if lease != 0)
-```
-
-### Future Write Path (via Raft)
+All writes flow through Raft consensus before being applied to the KV store.
+The service layer serializes a `KvCommand`, proposes it through `RaftHandle`,
+waits for commit confirmation, then applies the mutation to the store and
+notifies watchers.
 
 ```
 Client (etcdctl / HTTP)
@@ -130,38 +105,35 @@ Client (etcdctl / HTTP)
         |
         v
 +------------------+
-| RaftProcess      |  <-- RaftCmd::Propose { command, reply }
-| (RaftCore.step)  |
+| RaftHandle       |  <-- propose(serialized KvCommand)
+| .propose(data)   |
 +------------------+
         |
-        | AppendToLog, replicate to followers
+        | single-node: commits immediately
+        | multi-node: replicates to followers, waits for quorum
         v
 +------------------+
-| LogStore (redb)  |  <-- durable append
-| raft.redb        |
+| ClientProposal   |
+| Result::Success  |
 +------------------+
         |
-        | committed (quorum ack)
-        v
-+------------------+
-| StoreProcess     |  <-- StoreCmd::Apply { command, reply }
-| StateMachine     |
-+------------------+
-        |
+        | service applies after commit confirmation
         v
 +------------------+
 | KvStore.put()    |
 | (redb txn)       |
 +------------------+
         |
-        +-------> WatchProcess  <-- WatchCmd::Notify
+        +-------> WatchHub.notify()
         |         fan-out to matching watchers
         |
         +-------> LeaseManager.attach_key()
+                  (if lease != 0)
 ```
 
-The RaftProcess actor loop (`raft_process.rs`) already implements the full
-Propose -> Commit -> Apply -> Respond pipeline using `StoreCmd::Apply`.
+The state machine (`spawn_state_machine`) receives committed entries for
+observability logging but does not apply them — the service layer handles
+application after Raft commit to avoid double-apply.
 
 ---
 
@@ -418,10 +390,10 @@ pub trait RaftTransport: Send + Sync {
 
 **Implementations:**
 
-| Transport        | Use Case                              |
-|------------------|---------------------------------------|
-| `LocalTransport` | In-process multi-node testing         |
-| (planned)        | Rebar DistributedRouter (QUIC/SWIM)   |
+| Transport            | Use Case                              |
+|----------------------|---------------------------------------|
+| `LocalTransport`     | In-process multi-node testing         |
+| `GrpcRaftTransport`  | Multi-node clusters over gRPC         |
 
 ### Raft Messages
 
@@ -455,9 +427,10 @@ follower acknowledgment.
 | HTTP Gateway         | grpc-gateway            | axum (custom handler)               |
 | Serialization        | protobuf                | prost (protobuf) + serde_json       |
 | Async Runtime        | goroutine scheduler     | tokio                               |
-| Inter-node Transport | gRPC streaming           | RaftTransport trait (QUIC planned)  |
+| Inter-node Transport | gRPC streaming           | GrpcRaftTransport (gRPC)            |
 | MVCC                 | Custom B-tree            | Compound keys in redb               |
-| Cluster Discovery    | peer URL exchange        | Rebar SWIM (planned)                |
+| TLS                  | Manual + auto            | Manual + auto-TLS (rcgen)           |
+| Cluster Discovery    | peer URL exchange        | `--initial-cluster` CLI flag        |
 
 ---
 
@@ -483,8 +456,8 @@ CLI entry point using clap. Parses `--name`, `--data-dir`,
   machine, creates all service instances, starts gRPC (tonic) and HTTP (axum)
   servers.
 - **`kv_service.rs`** -- gRPC KV service: `Range`, `Put`, `DeleteRange`, `Txn`,
-  `Compact`. Calls KvStore directly, notifies WatchHub on mutations, attaches
-  keys to leases.
+  `Compact`. Proposes writes through Raft, applies to KvStore after commit,
+  notifies WatchHub on mutations, attaches keys to leases.
 - **`watch_service.rs`** -- gRPC Watch service with bidirectional streaming.
   Creates/cancels watches via WatchHub, streams events back to clients.
 - **`lease_service.rs`** -- gRPC Lease service: `LeaseGrant`, `LeaseRevoke`,
@@ -516,7 +489,9 @@ CLI entry point using clap. Parses `--name`, `--data-dir`,
 - **`log_store.rs`** -- Durable log storage backed by redb. append, get,
   get_range, truncate_after, hard state persistence.
 - **`transport.rs`** -- `RaftTransport` trait and `LocalTransport`
-  (in-process testing). Future: RebarTransport over QUIC/SWIM.
+  (in-process testing).
+- **`grpc_transport.rs`** -- `GrpcRaftTransport` (client) and
+  `RaftTransportServer` (server) for multi-node clusters over gRPC.
 - **`snapshot.rs`** -- `SnapshotMeta` and `Snapshot` types for point-in-time
   state machine captures.
 
@@ -549,9 +524,16 @@ CLI entry point using clap. Parses `--name`, `--data-dir`,
 
 ### `src/auth/`
 
-- **`manager.rs`** -- In-memory RBAC `AuthManager`. Tracks users (with password
-  hashes and roles) and roles (with key-range permissions). Full CRUD for users
-  and roles, permission grant/revoke.
+- **`manager.rs`** -- In-memory RBAC `AuthManager`. Tracks users (with bcrypt
+  password hashes and roles) and roles (with key-range permissions). Full CRUD
+  for users and roles, permission grant/revoke. Token generation and validation.
+- **`interceptor.rs`** -- gRPC auth interceptor (`GrpcAuthLayer`). Validates
+  tokens on all requests when auth is enabled; auth endpoints pass through.
+
+### `src/tls.rs`
+
+TLS certificate management. `TlsConfig` struct, `generate_self_signed()` for
+auto-TLS, `build_tls_acceptor()` for HTTP, `build_tonic_tls()` for gRPC.
 
 ### `src/config.rs`
 

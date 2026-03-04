@@ -48,10 +48,11 @@ cd barkeeper
 cargo build --release
 ```
 
-The build step compiles three proto files (`proto/etcdserverpb/rpc.proto`,
-`proto/etcdserverpb/kv.proto`, `proto/authpb/auth.proto`) via `tonic-build`
-in `build.rs`. The generated Rust code is placed in the `target/` directory
-and included at compile time through `tonic::include_proto!()` in `src/lib.rs`.
+The build step compiles four proto files (`proto/etcdserverpb/rpc.proto`,
+`proto/etcdserverpb/kv.proto`, `proto/authpb/auth.proto`,
+`proto/raftpb/raft_transport.proto`) via `tonic-build` in `build.rs`. The
+generated Rust code is placed in the `target/` directory and included at
+compile time through `tonic::include_proto!()` in `src/lib.rs`.
 
 ---
 
@@ -74,6 +75,19 @@ By default the server listens on:
 | `--name`               | `default`        | Human-readable name for this node        |
 | `--data-dir`           | `data.barkeeper`  | Directory for redb data files            |
 | `--node-id`            | `1`              | Raft node identifier                     |
+| `--listen-peer-urls`   | `http://localhost:2380` | URL for peer traffic              |
+| `--initial-cluster`    |                  | Comma-separated cluster members (`1=http://10.0.0.1:2380,...`) |
+| `--initial-cluster-state` | `new`         | `new` for fresh cluster, `existing` to join |
+| `--auto-tls`           | `false`          | Auto-generate self-signed certs for client connections |
+| `--cert-file`          |                  | Path to client server TLS cert file      |
+| `--key-file`           |                  | Path to client server TLS key file       |
+| `--trusted-ca-file`    |                  | Path to client server TLS trusted CA cert file |
+| `--client-cert-auth`   | `false`          | Enable client certificate authentication |
+| `--self-signed-cert-validity` | `1`       | Validity period of self-signed certs (years) |
+| `--peer-auto-tls`      | `false`          | Auto-generate self-signed certs for peer connections |
+| `--peer-cert-file`     |                  | Path to peer TLS cert file               |
+| `--peer-key-file`      |                  | Path to peer TLS key file                |
+| `--peer-trusted-ca-file` |                | Path to peer TLS trusted CA cert file    |
 
 Example with custom settings:
 
@@ -219,11 +233,11 @@ cargo test
 
 ### Test Files
 
-The test suite contains **76 tests** across 10 files in `tests/`:
+The test suite contains **89 tests** across 14 files in `tests/`:
 
 | File                              | Tests | Description                                                     |
 |-----------------------------------|-------|-----------------------------------------------------------------|
-| `compat_test.rs`                  | 27    | End-to-end etcd compatibility tests against the HTTP gateway    |
+| `compat_test.rs`                  | 30    | End-to-end etcd compatibility tests against the HTTP gateway    |
 | `integration_test.rs`             | 5     | gRPC integration tests using tonic clients                      |
 | `kv_store_test.rs`                | 8     | MVCC key-value store unit tests (put, get, range, delete, compact) |
 | `lease_expiry_test.rs`            | 3     | Lease manager expiry logic unit tests                           |
@@ -233,6 +247,10 @@ The test suite contains **76 tests** across 10 files in `tests/`:
 | `raft_types_test.rs`              | 6     | Raft type serialization and message encoding tests              |
 | `txn_test.rs`                     | 7     | Transaction (compare-and-swap) tests against the KV store       |
 | `watch_notify_test.rs`            | 3     | Watch hub notification and key-matching tests                   |
+| `txn_watch_test.rs`               | 2     | Watch notifications fired by transaction mutations              |
+| `watch_revision_test.rs`          | 4     | Revision-based history replay and `changes_since` tests         |
+| `auth_test.rs`                    | 1     | Auth enforcement (unauthenticated rejection, token validation)  |
+| `cluster_test.rs`                 | 3     | Multi-node Raft cluster integration tests (election, leader)    |
 
 ---
 
@@ -251,17 +269,20 @@ barkeeper/
 |   |   |-- rpc.proto       #   KV, Watch, Lease, Cluster, Maintenance, Auth services
 |   |   |-- kv.proto        #   KeyValue and Event message types (mvccpb)
 |   |-- authpb/
-|       |-- auth.proto      #   User, Permission, Role message types
+|   |   |-- auth.proto      #   User, Permission, Role message types
+|   |-- raftpb/
+|       |-- raft_transport.proto  # gRPC Raft transport service definition
 |
 |-- src/
-|   |-- main.rs             # CLI entry point (clap argument parsing)
+|   |-- main.rs             # CLI entry point (clap argument parsing, TLS + cluster flags)
 |   |-- lib.rs              # Crate root; declares modules, includes generated proto code
-|   |-- config.rs           # (Reserved for future configuration)
+|   |-- config.rs           # ClusterConfig for multi-node cluster bootstrap
+|   |-- tls.rs              # TLS configuration, auto-TLS cert generation (rcgen)
 |   |
 |   |-- api/                # Network-facing API layer
-|   |   |-- server.rs       #   BarkeepServer: wires up all services and starts gRPC + HTTP
-|   |   |-- gateway.rs      #   HTTP/JSON gateway (axum router, etcd grpc-gateway compat)
-|   |   |-- kv_service.rs   #   gRPC KV service (Range, Put, DeleteRange, Txn, Compact)
+|   |   |-- server.rs       #   BarkeepServer: wires up all services, starts gRPC + HTTP + TLS
+|   |   |-- gateway.rs      #   HTTP/JSON gateway (axum router, auth middleware, etcd compat)
+|   |   |-- kv_service.rs   #   gRPC KV service (Range, Put, DeleteRange, Txn, Compact via Raft)
 |   |   |-- watch_service.rs#   gRPC Watch service (bidirectional streaming)
 |   |   |-- lease_service.rs#   gRPC Lease service (Grant, Revoke, KeepAlive, TimeToLive)
 |   |   |-- cluster_service.rs  # gRPC Cluster service (MemberList, MemberAdd, etc.)
@@ -269,20 +290,21 @@ barkeeper/
 |   |   |-- maintenance_service.rs # gRPC Maintenance service (Status, Defragment stubs)
 |   |
 |   |-- kv/                 # Key-value storage layer
-|   |   |-- store.rs        #   MVCC KV store backed by redb (put, range, delete, txn, compact)
-|   |   |-- state_machine.rs#   Raft state machine apply loop (deserializes committed entries)
+|   |   |-- store.rs        #   MVCC KV store backed by redb (put, range, delete, txn, compact, changes_since)
+|   |   |-- state_machine.rs#   Raft state machine (logs committed entries for observability)
 |   |
 |   |-- raft/               # Raft consensus implementation
 |   |   |-- core.rs         #   Pure state machine: Event -> Vec<Action> (no I/O)
-|   |   |-- node.rs         #   RaftNode actor: timers, channels, action execution
+|   |   |-- node.rs         #   RaftNode actor: timers, channels, action execution, applied_index
 |   |   |-- state.rs        #   Raft state types (RaftRole, PersistentState, VolatileState, LeaderState)
 |   |   |-- messages.rs     #   Raft RPC message types (AppendEntries, RequestVote, InstallSnapshot)
 |   |   |-- log_store.rs    #   Durable Raft log backed by redb
 |   |   |-- transport.rs    #   RaftTransport trait + LocalTransport for in-process testing
+|   |   |-- grpc_transport.rs  # GrpcRaftTransport + RaftTransportServer for multi-node clusters
 |   |   |-- snapshot.rs     #   Snapshot metadata types
 |   |
 |   |-- watch/              # Watch notification system
-|   |   |-- hub.rs          #   WatchHub: fan-out of KV events to matching watchers
+|   |   |-- hub.rs          #   WatchHub: fan-out of KV events, revision-based history replay
 |   |
 |   |-- lease/              # Lease management
 |   |   |-- manager.rs      #   In-memory lease tracking (grant, revoke, keepalive, expiry)
@@ -291,7 +313,8 @@ barkeeper/
 |   |   |-- manager.rs      #   In-memory cluster membership manager
 |   |
 |   |-- auth/               # Authentication and authorization
-|   |   |-- manager.rs      #   In-memory RBAC auth manager (users, roles, permissions)
+|   |   |-- manager.rs      #   RBAC auth manager (bcrypt passwords, token validation)
+|   |   |-- interceptor.rs  #   gRPC auth interceptor (tower Layer for token validation)
 |   |
 |   |-- actors/             # Rebar actor layer
 |       |-- commands.rs     #   Typed command enums for actor communication

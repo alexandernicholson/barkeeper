@@ -16,14 +16,14 @@ Tested against: **etcd 3.5.17**
 | Range | Yes | `POST /v3/kv/range` | Full | Prefix ranges, limit, revision queries |
 | Put | Yes | `POST /v3/kv/put` | Full | Supports prev_kv, lease attachment |
 | DeleteRange | Yes | `POST /v3/kv/deleterange` | Full | Prefix deletes, prev_kv |
-| Txn | Yes | `POST /v3/kv/txn` | Partial | All compare targets (Value, Version, Create, Mod, Lease) and result operators (Equal, Greater, Less, NotEqual) supported. Nested txn returns UNIMPLEMENTED. Watch notifications for mutations inside a txn are deferred. |
-| Compact | Yes | `POST /v3/kv/compaction` | Partial | gRPC calls real compaction on redb. HTTP gateway returns 501 Not Implemented. |
+| Txn | Yes | `POST /v3/kv/txn` | Full | All compare targets (Value, Version, Create, Mod, Lease) and result operators (Equal, Greater, Less, NotEqual) supported. Nested txn returns UNIMPLEMENTED. Watch notifications fire for mutations inside txns. |
+| Compact | Yes | `POST /v3/kv/compaction` | Full | Real compaction on redb via both gRPC and HTTP gateway. |
 
 ### Watch Service (`etcdserverpb.Watch`)
 
 | RPC | gRPC | HTTP Gateway | Status | Notes |
 |-----|------|-------------|--------|-------|
-| Watch | Yes | Not exposed | Full | Bidirectional streaming. Supports CreateRequest, CancelRequest, and ProgressRequest (stub response). |
+| Watch | Yes | Not exposed | Full | Bidirectional streaming. Supports CreateRequest, CancelRequest, ProgressRequest (stub response), and revision-based history replay via start_revision. |
 
 ### Lease Service (`etcdserverpb.Lease`)
 
@@ -62,11 +62,11 @@ Tested against: **etcd 3.5.17**
 
 | RPC | gRPC | HTTP Gateway | Status | Notes |
 |-----|------|-------------|--------|-------|
-| AuthEnable | Yes | Not exposed | Full | Enables auth flag |
-| AuthDisable | Yes | Not exposed | Full | Disables auth flag |
-| AuthStatus | Yes | Not exposed | Full | Reports enabled state, auth_revision=0 |
-| Authenticate | Yes | Not exposed | Full | Returns token on valid credentials |
-| UserAdd | Yes | Not exposed | Full | |
+| AuthEnable | Yes | `POST /v3/auth/enable` | Full | Enables auth flag; enforces token validation on all subsequent requests |
+| AuthDisable | Yes | `POST /v3/auth/disable` | Full | Disables auth flag |
+| AuthStatus | Yes | `POST /v3/auth/status` | Full | Reports enabled state, auth_revision=0 |
+| Authenticate | Yes | `POST /v3/auth/authenticate` | Full | Returns token on valid credentials (bcrypt password hashing) |
+| UserAdd | Yes | `POST /v3/auth/user/add` | Full | |
 | UserGet | Yes | Not exposed | Full | Returns user's roles |
 | UserList | Yes | Not exposed | Full | |
 | UserDelete | Yes | Not exposed | Full | |
@@ -137,9 +137,14 @@ Watch is implemented as a gRPC bidirectional stream on the `Watch` RPC.
 - **ProgressRequest** is accepted but returns a stub response (empty
   events, `watch_id=-1`). Full progress notification is not implemented.
 
-- **Txn watch notifications** are not yet wired. Individual put/delete
-  operations within a transaction do not currently trigger watcher
-  notifications. This is tracked as a known limitation.
+- **Txn watch notifications** fire for put and delete mutations inside
+  transactions. The service layer zips the executed ops with their responses
+  to reconstruct key/value data for notifications.
+
+- **Revision-based watching** is supported via the `start_revision` field in
+  `WatchCreateRequest`. When a watcher is created with `start_revision > 0`,
+  the WatchHub replays historical events from the KvStore's revision table
+  before delivering live events.
 
 ---
 
@@ -168,44 +173,6 @@ Watch is implemented as a gRPC bidirectional stream on the `Watch` RPC.
 ---
 
 ## Known Differences and Limitations
-
-### Single-node only
-
-barkeeper currently operates as a single-node cluster. A Raft
-implementation exists with leader election (the node elects itself), but
-multi-node Raft transport is not yet connected. `raft_term` in response
-headers reflects the real election term.
-
-### Writes bypass Raft
-
-Write operations (Put, DeleteRange, Txn) go directly to the KvStore
-rather than through Raft log replication. This is correct for single-node
-operation and provides lower latency, but means writes are not replicated
-when multi-node support is added.
-
-### Auth not enforced
-
-All Auth RPCs (user/role CRUD, enable/disable, authenticate) are
-implemented and functional, but authentication is not enforced on KV,
-Watch, Lease, Cluster, or Maintenance requests. Requests proceed
-regardless of auth state.
-
-### No TLS
-
-All connections are plaintext. TLS termination must be handled externally
-(e.g., via a reverse proxy).
-
-### Compaction
-
-gRPC `Compact` calls real compaction on the redb storage engine (removes
-old revisions while preserving the latest entry per key). The HTTP gateway
-endpoint `/v3/kv/compaction` returns 501 Not Implemented.
-
-### Txn watch notifications
-
-Mutations inside a `Txn` (put/delete in success or failure branches) do
-not emit watch notifications. Direct Put and DeleteRange RPCs do notify
-watchers correctly.
 
 ### Nested transactions
 

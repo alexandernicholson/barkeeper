@@ -220,19 +220,6 @@ barkeeper is a from-scratch implementation, not a fork of etcd. It aims for API 
 | Concurrency | goroutines | Rebar actor runtime (BEAM-inspired) |
 | Storage | bbolt (cgo) | redb (pure Rust, no C deps) |
 
-### Previously Known Gaps (all closed)
-
-All eight previously documented behavioral gaps have been resolved:
-
-1. **Writes go through Raft** -- all KV mutations (put, delete, txn, compact) are proposed through Raft consensus before being applied to the state machine.
-2. **Multi-node networking** -- gRPC-based `RaftTransport` with cluster bootstrap CLI (`--initial-cluster`, `--initial-cluster-state`).
-3. **TLS support** -- auto-TLS (self-signed certs) and manual certificate configuration for both client and peer connections.
-4. **Auth enforcement** -- when auth is enabled, HTTP middleware and gRPC interceptors validate tokens on every request; bcrypt password hashing.
-5. **Raft-proposed lease expiry** -- lease expiry is proposed through Raft so all nodes agree on cleanup.
-6. **Txn watch notifications** -- mutations inside transactions now fire watch events.
-7. **HTTP compaction endpoint** -- `/v3/kv/compaction` is fully functional.
-8. **Revision-based watching** -- WatchHub replays history from a specified start revision.
-
 ## Building from Source
 
 ### Prerequisites

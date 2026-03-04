@@ -332,37 +332,48 @@ The data flow:
   RaftTransport impl  --- network -->  inbound channel
 ```
 
-### Example: QUIC transport with Rebar
+### Production implementation: GrpcRaftTransport
 
-A QUIC-based transport for production multi-node clusters would:
+The `GrpcRaftTransport` in `src/raft/grpc_transport.rs` implements the
+`RaftTransport` trait using gRPC for multi-node clusters. It uses the
+`RaftTransport` service defined in `proto/raftpb/raft_transport.proto`.
 
-1. Use Rebar's `DistributedRouter` for node discovery and addressing.
-2. Serialize `RaftMessage` using `encode_raft_message()` (JSON inside
-   MessagePack binary).
-3. Send via QUIC streams for low-latency, multiplexed delivery.
-4. On the receiving side, decode with `decode_raft_message()` and forward
-   to the node's command channel.
+The client side (`GrpcRaftTransport`) maps node IDs to gRPC endpoints and
+sends messages via the `SendMessage` RPC. The server side
+(`RaftTransportServer`) receives inbound messages and pushes them to the
+Raft node's inbound channel.
+
+The transport is configured via CLI flags:
+
+```bash
+./target/release/barkeeper \
+  --node-id 1 \
+  --initial-cluster "1=http://10.0.0.1:2380,2=http://10.0.0.2:2380" \
+  --listen-peer-urls "http://0.0.0.0:2380"
+```
+
+### Example: custom transport
+
+To implement a different transport (e.g., QUIC), implement the
+`RaftTransport` trait:
 
 ```rust
 use std::sync::Arc;
 use async_trait::async_trait;
-use crate::raft::messages::{RaftMessage, encode_raft_message};
+use crate::raft::messages::RaftMessage;
 use crate::raft::transport::RaftTransport;
 
-pub struct QuicTransport {
-    router: Arc<rebar_cluster::DistributedRouter>,
-}
+pub struct MyTransport { /* ... */ }
 
 #[async_trait]
-impl RaftTransport for QuicTransport {
+impl RaftTransport for MyTransport {
     async fn send(&self, to: u64, message: RaftMessage) {
-        let payload = encode_raft_message(&message);
-        self.router.send(to, payload).await;
+        // Serialize and send to the target node.
     }
 }
 ```
 
-### Existing implementation: LocalTransport
+### In-process testing: LocalTransport
 
 The `LocalTransport` in `src/raft/transport.rs` routes messages in-process
 using a `HashMap<u64, mpsc::Sender<(u64, RaftMessage)>>`. It is used for
@@ -436,9 +447,11 @@ pub struct GatewayState {
     pub watch_hub: Arc<WatchHub>,
     pub lease_manager: Arc<LeaseManager>,
     pub cluster_manager: Arc<ClusterManager>,
+    pub auth_manager: Arc<AuthManager>,
     pub cluster_id: u64,
     pub member_id: u64,
     pub raft_term: Arc<AtomicU64>,
+    pub raft_handle: RaftHandle,
 }
 ```
 
@@ -505,6 +518,11 @@ Follow etcd's grpc-gateway URL structure:
 /v3/lease/leases      -- Lease Leases
 /v3/cluster/member/list  -- Cluster MemberList
 /v3/maintenance/status   -- Maintenance Status
+/v3/auth/enable       -- Auth Enable
+/v3/auth/disable      -- Auth Disable
+/v3/auth/status       -- Auth Status
+/v3/auth/authenticate -- Auth Authenticate
+/v3/auth/user/add     -- User Add
 ```
 
 All endpoints use `POST` method. This matches etcd's grpc-gateway behavior
@@ -547,7 +565,35 @@ async fn start_test_instance() -> (SocketAddr, tempfile::TempDir) {
         .add_initial_member(1, "test-node".to_string(), vec![], vec![])
         .await;
 
-    let watch_hub = Arc::new(WatchHub::new());
+    let watch_hub = Arc::new(WatchHub::with_store(Arc::clone(&store)));
+    let auth_manager = Arc::new(AuthManager::new());
+
+    // Spawn lease expiry timer — checks every 500ms for expired leases.
+    {
+        let lm = Arc::clone(&lease_manager);
+        let st = Arc::clone(&store);
+        let wh = Arc::clone(&watch_hub);
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+                let expired = lm.check_expired().await;
+                for lease in expired {
+                    for key in &lease.keys {
+                        if let Ok(result) = st.delete_range(key, b"") {
+                            for prev in &result.prev_kvs {
+                                let tombstone = barkeeper::proto::mvccpb::KeyValue {
+                                    key: prev.key.clone(),
+                                    mod_revision: result.revision,
+                                    ..Default::default()
+                                };
+                                wh.notify(&prev.key, 1, tombstone, Some(prev.clone())).await;
+                            }
+                        }
+                    }
+                }
+            }
+        });
+    }
 
     let app = gateway::create_router(
         raft_handle.clone(),
@@ -557,6 +603,7 @@ async fn start_test_instance() -> (SocketAddr, tempfile::TempDir) {
         Arc::clone(&cluster_manager),
         1, 1,
         Arc::clone(&raft_handle.current_term),
+        Arc::clone(&auth_manager),
     );
 
     let http_port = portpicker::pick_unused_port().expect("no free port");
