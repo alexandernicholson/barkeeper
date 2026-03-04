@@ -13,7 +13,7 @@ use tokio::time::{sleep, Duration};
 
 use barkeeper::api::gateway;
 use barkeeper::auth::manager::AuthManager;
-use barkeeper::cluster::manager::ClusterManager;
+use barkeeper::cluster::actor::spawn_cluster_actor;
 use barkeeper::kv::state_machine::spawn_state_machine;
 use barkeeper::kv::store::KvStore;
 use barkeeper::lease::manager::LeaseManager;
@@ -39,7 +39,8 @@ async fn start_instance_with_lease_expiry() -> (SocketAddr, Arc<KvStore>, Arc<Le
 
     let lease_manager = Arc::new(LeaseManager::new());
     let watch_hub = Arc::new(WatchHub::with_store(Arc::clone(&store)));
-    let cluster_manager = Arc::new(ClusterManager::new(1));
+    let cluster_runtime = rebar_core::runtime::Runtime::new(1);
+    let cluster_manager = spawn_cluster_actor(&cluster_runtime, 1).await;
     cluster_manager.add_initial_member(1, "test".to_string(), vec![], vec![]).await;
 
     // Spawn a lease expiry timer that checks every 500ms.
@@ -75,7 +76,7 @@ async fn start_instance_with_lease_expiry() -> (SocketAddr, Arc<KvStore>, Arc<Le
         Arc::clone(&store),
         Arc::clone(&watch_hub),
         Arc::clone(&lease_manager),
-        Arc::clone(&cluster_manager),
+        cluster_manager,
         1, 1,
         Arc::clone(&raft_handle.current_term),
         Arc::clone(&auth_manager),

@@ -22,7 +22,7 @@ use serde::{Deserialize, Serialize, Serializer};
 
 use crate::auth::manager::AuthManager;
 use crate::proto::etcdserverpb::{alarm_request::AlarmAction, AlarmMember, AlarmType};
-use crate::cluster::manager::ClusterManager;
+use crate::cluster::actor::ClusterActorHandle;
 use crate::kv::state_machine::KvCommand;
 use crate::kv::store::{KvStore, TxnCompare, TxnCompareResult, TxnCompareTarget, TxnOp, TxnOpResponse};
 use crate::lease::manager::LeaseManager;
@@ -67,7 +67,7 @@ pub struct GatewayState {
     pub store: Arc<KvStore>,
     pub watch_hub: Arc<WatchHub>,
     pub lease_manager: Arc<LeaseManager>,
-    pub cluster_manager: Arc<ClusterManager>,
+    pub cluster_manager: ClusterActorHandle,
     pub auth_manager: Arc<AuthManager>,
     pub cluster_id: u64,
     pub member_id: u64,
@@ -495,7 +495,7 @@ pub fn create_router(
     store: Arc<KvStore>,
     watch_hub: Arc<WatchHub>,
     lease_manager: Arc<LeaseManager>,
-    cluster_manager: Arc<ClusterManager>,
+    cluster_manager: ClusterActorHandle,
     cluster_id: u64,
     member_id: u64,
     raft_term: Arc<AtomicU64>,

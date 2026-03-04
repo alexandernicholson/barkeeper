@@ -1,3 +1,4 @@
+pub mod actor;
 pub mod discovery;
 pub mod manager;
 pub mod membership_sync;

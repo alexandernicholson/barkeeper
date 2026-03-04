@@ -15,7 +15,7 @@ use tokio::sync::mpsc;
 
 use barkeeper::api::gateway;
 use barkeeper::auth::manager::AuthManager;
-use barkeeper::cluster::manager::ClusterManager;
+use barkeeper::cluster::actor::spawn_cluster_actor;
 use barkeeper::kv::state_machine::spawn_state_machine;
 use barkeeper::kv::store::KvStore;
 use barkeeper::lease::manager::LeaseManager;
@@ -47,7 +47,8 @@ async fn start_test_instance() -> (SocketAddr, tempfile::TempDir) {
     let raft_handle = spawn_raft_node(config, apply_tx).await;
 
     let lease_manager = Arc::new(LeaseManager::new());
-    let cluster_manager = Arc::new(ClusterManager::new(1));
+    let cluster_runtime = rebar_core::runtime::Runtime::new(1);
+    let cluster_manager = spawn_cluster_actor(&cluster_runtime, 1).await;
     cluster_manager
         .add_initial_member(1, "test-node".to_string(), vec![], vec![])
         .await;
@@ -60,7 +61,7 @@ async fn start_test_instance() -> (SocketAddr, tempfile::TempDir) {
         Arc::clone(&store),
         Arc::clone(&watch_hub),
         Arc::clone(&lease_manager),
-        Arc::clone(&cluster_manager),
+        cluster_manager,
         1,
         1,
         Arc::clone(&raft_handle.current_term),

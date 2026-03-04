@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use tonic::{Request, Response, Status};
 
-use crate::cluster::manager::ClusterManager;
+use crate::cluster::actor::ClusterActorHandle;
 use crate::proto::etcdserverpb::cluster_server::Cluster;
 use crate::proto::etcdserverpb::{
     Member as ProtoMember, MemberAddRequest, MemberAddResponse, MemberListRequest,
@@ -13,14 +13,14 @@ use crate::proto::etcdserverpb::{
 
 /// gRPC Cluster service implementing the etcd Cluster API.
 pub struct ClusterService {
-    manager: Arc<ClusterManager>,
+    manager: ClusterActorHandle,
     cluster_id: u64,
     member_id: u64,
     raft_term: Arc<AtomicU64>,
 }
 
 impl ClusterService {
-    pub fn new(manager: Arc<ClusterManager>, cluster_id: u64, member_id: u64, raft_term: Arc<AtomicU64>) -> Self {
+    pub fn new(manager: ClusterActorHandle, cluster_id: u64, member_id: u64, raft_term: Arc<AtomicU64>) -> Self {
         ClusterService {
             manager,
             cluster_id,

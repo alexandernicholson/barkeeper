@@ -1,5 +1,9 @@
+use std::sync::Arc;
+
 use tokio::sync::oneshot;
 
+use crate::cluster::manager::Member;
+use crate::cluster::membership_sync::MembershipSync;
 use crate::kv::state_machine::KvCommand;
 use crate::kv::store::{DeleteResult, PutResult, TxnResult};
 use crate::proto::mvccpb;
@@ -59,3 +63,50 @@ pub enum LeaseCmd {
 }
 
 pub use crate::lease::manager::ExpiredLease;
+
+/// Commands sent to the ClusterActor.
+pub enum ClusterCmd {
+    /// Query the cluster ID.
+    ClusterId {
+        reply: oneshot::Sender<u64>,
+    },
+    /// Add the initial local member (bootstrap).
+    AddInitialMember {
+        id: u64,
+        name: String,
+        peer_urls: Vec<String>,
+        client_urls: Vec<String>,
+        reply: oneshot::Sender<()>,
+    },
+    /// List all cluster members.
+    MemberList {
+        reply: oneshot::Sender<Vec<Member>>,
+    },
+    /// Add a new member to the cluster.
+    MemberAdd {
+        peer_urls: Vec<String>,
+        is_learner: bool,
+        reply: oneshot::Sender<Member>,
+    },
+    /// Remove a member by ID.
+    MemberRemove {
+        id: u64,
+        reply: oneshot::Sender<bool>,
+    },
+    /// Update a member's peer URLs.
+    MemberUpdate {
+        id: u64,
+        peer_urls: Vec<String>,
+        reply: oneshot::Sender<bool>,
+    },
+    /// Promote a learner to a voting member.
+    MemberPromote {
+        id: u64,
+        reply: oneshot::Sender<bool>,
+    },
+    /// Attach a SWIM membership sync for peer discovery.
+    SetMembershipSync {
+        sync: Arc<std::sync::Mutex<MembershipSync>>,
+        reply: oneshot::Sender<()>,
+    },
+}

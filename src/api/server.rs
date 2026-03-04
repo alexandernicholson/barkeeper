@@ -26,7 +26,7 @@ use crate::api::maintenance_service::MaintenanceService;
 use crate::api::watch_service::WatchService;
 use crate::auth::interceptor::GrpcAuthLayer;
 use crate::auth::manager::AuthManager;
-use crate::cluster::manager::ClusterManager;
+use crate::cluster::actor::spawn_cluster_actor;
 use crate::cluster::swim_service::SwimService;
 use crate::config::ClusterConfig;
 use crate::kv::state_machine::spawn_state_machine;
@@ -217,8 +217,10 @@ impl BarkeepServer {
 
         let scheme = if tls_paths.is_some() { "https" } else { "http" };
 
-        // Create the Cluster manager and gRPC service.
-        let cluster_manager = Arc::new(ClusterManager::new(cluster_id));
+        // Spawn the Cluster actor on a standalone runtime (not tied to the
+        // DistributedRuntime borrow) and get a handle.
+        let cluster_runtime = rebar_core::runtime::Runtime::new(config.node_id);
+        let cluster_manager = spawn_cluster_actor(&cluster_runtime, cluster_id).await;
         cluster_manager
             .add_initial_member(
                 member_id,
@@ -228,7 +230,7 @@ impl BarkeepServer {
             )
             .await;
         let cluster_service =
-            ClusterService::new(Arc::clone(&cluster_manager), cluster_id, member_id, Arc::clone(&raft_term));
+            ClusterService::new(cluster_manager.clone(), cluster_id, member_id, Arc::clone(&raft_term));
 
         // Create the Auth manager and gRPC service.
         let auth_manager = Arc::new(AuthManager::new());
@@ -294,7 +296,7 @@ impl BarkeepServer {
             Arc::clone(&store),
             Arc::clone(&watch_hub),
             Arc::clone(&lease_manager),
-            Arc::clone(&cluster_manager),
+            cluster_manager,
             cluster_id,
             member_id,
             Arc::clone(&raft_term),
