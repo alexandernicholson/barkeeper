@@ -66,29 +66,27 @@ graph TD
     S --> Reg["Registry<br>OR-Set CRDT distributed process name resolution"]
 ```
 
-**Planned actor layout (full Rebar processes):**
+**Rebar actor migration status:**
 
-```mermaid
-graph TD
-    S["BarkeepSupervisor (OneForAll)"]
-    S --> R["RaftProcess<br>consensus engine"]
-    S --> St["StoreProcess<br>MVCC KV store"]
-    S --> W["WatchProcess<br>change notification"]
-    S --> L["LeaseProcess<br>TTL management (partially migrated)"]
-    S --> C["ClusterProcess<br>membership"]
-    S --> A["AuthProcess<br>RBAC"]
-```
+| Component | Status | How |
+|-----------|--------|-----|
+| RaftNode | Migrated | `spawn_raft_node_rebar` — Rebar distributed actor with `ProcessContext` mailbox |
+| LeaseExpiryTimer | Migrated | Supervised `ChildEntry` (Permanent restart) under `BarkeepSupervisor` |
+| KvStore | Not yet | Shared via `Arc`, accessed directly by service layer |
+| WatchHub | Not yet | Shared via `Arc`, fan-out notifications |
+| ClusterManager | Not yet | Shared via `Arc`, SWIM-backed membership tracking |
+| AuthManager | Not yet | Shared via `Arc`, RBAC |
 
-Actor command enums are already defined in `src/actors/commands.rs`:
+Actor command enums are defined in `src/actors/commands.rs`:
 `RaftCmd`, `StoreCmd`, `WatchCmd`, `LeaseCmd`. Each uses `oneshot::Sender`
-for request-response patterns.
+for request-response patterns. These are used by the non-Rebar code paths
+and will be replaced as components migrate to Rebar actors.
 
-The `SWIM MembershipList` actor runs independently alongside the supervisor
-tree. It gossips with peer nodes to maintain a live cluster view and notifies
-the `RaftProcess` when membership changes (nodes joining or leaving). The
-`Registry` actor holds an OR-Set CRDT replicated across all nodes via the
-Rebar `DistributedRuntime`, providing eventually-consistent distributed
-process name resolution.
+The SWIM protocol runs in a dedicated `tokio::spawn` tick loop alongside the
+supervisor tree. It gossips with peer nodes to maintain a live cluster view.
+The `Registry` holds an OR-Set CRDT shared across all nodes via the Rebar
+`DistributedRuntime`, providing eventually-consistent distributed process
+name resolution (e.g. `raft:{node_id}` → `ProcessId`).
 
 ---
 
