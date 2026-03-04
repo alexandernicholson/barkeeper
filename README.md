@@ -161,7 +161,7 @@ KvStore  (MVCC store backed by redb)
 | `POST /v3/kv/put` | Put a key-value pair |
 | `POST /v3/kv/range` | Get key(s) by key or key range |
 | `POST /v3/kv/deleterange` | Delete key(s) |
-| `POST /v3/kv/txn` | Transactional compare-and-swap (stub) |
+| `POST /v3/kv/txn` | Transactional compare-and-swap |
 | `POST /v3/kv/compaction` | Compact revision history (stub) |
 | `POST /v3/lease/grant` | Grant a lease |
 | `POST /v3/lease/revoke` | Revoke a lease |
@@ -191,21 +191,28 @@ cargo test
 
 ## Differences from etcd
 
-| Feature | etcd | barkeeper |
-|---------|------|-----------|
-| Language | Go | Rust |
-| Actor runtime | -- | Rebar (BEAM-inspired) |
-| Storage engine | bbolt (cgo) | redb (pure Rust) |
-| C dependencies | Yes (cgo) | None |
-| Watch notifications | Real-time | Working (PUT/DELETE events, prefix watching) |
-| Lease expiry | Timer-driven via Raft | Working (automatic key cleanup on TTL expiry) |
-| Auth | Token-based | RBAC structure implemented, token enforcement in progress |
-| Multi-node | Production-ready | Transport layer implemented, cluster bootstrap in progress |
-| TLS | Full support | Not yet implemented |
-| MVCC | Full | Implemented with revision history and compaction |
-| Transactions | Full Txn API | Compare-and-swap with version/value targets |
-
 barkeeper is a from-scratch implementation, not a fork of etcd. It aims for API compatibility, not code compatibility.
+
+### Architecture (by design)
+
+| | etcd | barkeeper |
+|-|------|-----------|
+| Language | Go | Rust |
+| Concurrency | goroutines | Rebar actor runtime (BEAM-inspired) |
+| Storage | bbolt (cgo) | redb (pure Rust, no C deps) |
+
+### Known Gaps
+
+| Gap | Details |
+|-----|---------|
+| **Writes bypass Raft** | KV mutations (put, delete, txn) go directly to the store instead of being proposed through Raft consensus. The Raft engine runs and elects a leader, but the write path doesn't use it yet. RaftProcess actor is implemented but not wired into the service layer. |
+| **Single-node only** | No multi-node clustering. The `RaftTransport` trait and message serialization exist, but no networked transport is implemented. |
+| **No TLS** | Neither gRPC nor HTTP gateway support TLS. |
+| **Auth not enforced** | The Auth gRPC API works (create users, roles, permissions) but requests are not checked for auth tokens. |
+| **Lease expiry is local** | etcd proposes lease expiry through Raft so all nodes agree. barkeeper uses a local timer that deletes keys directly from the store. Fine for single-node, incorrect for multi-node. |
+| **Txn watch notifications** | Mutations inside a transaction do not fire watch events. Direct put/delete calls do. |
+| **HTTP compaction stubbed** | gRPC `Compact` works. The HTTP gateway endpoint `/v3/kv/compaction` returns 501. |
+| **No revision-based watching** | etcd supports watching from a specific start revision. barkeeper's watch hub only streams events from the point of subscription. |
 
 ## Building from Source
 
