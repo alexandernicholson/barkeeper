@@ -235,26 +235,34 @@ cargo test
 
 ### Test Files
 
-The test suite contains **99 tests** across 16 files:
+The test suite contains **181 tests** across 24 test files:
 
 | File                              | Tests | Description                                                     |
 |-----------------------------------|-------|-----------------------------------------------------------------|
 | `src/tls.rs` (unit tests)         | 7     | TLS configuration, auto-TLS cert generation, tonic/acceptor     |
+| `auth_actor_test.rs`              | 29    | AuthActor handle tests (users, roles, permissions, tokens)      |
+| `auth_test.rs`                    | 1     | Auth enforcement (unauthenticated rejection, token validation)  |
+| `cluster_actor_test.rs`           | 12    | ClusterActor handle tests (add, remove, update, promote members)|
+| `cluster_test.rs`                 | 3     | Multi-node Raft cluster integration tests (election, leader)    |
 | `compat_test.rs`                  | 30    | End-to-end etcd compatibility tests against the HTTP gateway    |
-| `integration_test.rs`             | 5     | gRPC integration tests using tonic clients                      |
+| `integration_test.rs`             | 5     | State machine and KvStore actor integration tests               |
+| `kv_store_actor_test.rs`          | 12    | KvStoreActor handle tests (put, range, delete, txn, compact)    |
 | `kv_store_test.rs`                | 8     | MVCC key-value store unit tests (put, get, range, delete, compact) |
 | `lease_expiry_test.rs`            | 3     | Lease manager expiry logic unit tests                           |
 | `lease_expiry_integration_test.rs`| 1     | Full-stack lease expiry test (grant, attach, expire, verify)    |
 | `log_store_test.rs`               | 7     | Raft log store persistence tests (append, truncate, hard state) |
 | `raft_election_test.rs`           | 9     | Raft election state machine tests (single-node, multi-node, split vote) |
 | `raft_types_test.rs`              | 6     | Raft type serialization and message encoding tests              |
-| `txn_test.rs`                     | 7     | Transaction (compare-and-swap) tests against the KV store       |
-| `watch_notify_test.rs`            | 3     | Watch hub notification and key-matching tests                   |
-| `txn_watch_test.rs`               | 2     | Watch notifications fired by transaction mutations              |
-| `watch_revision_test.rs`          | 4     | Revision-based history replay and `changes_since` tests         |
-| `auth_test.rs`                    | 1     | Auth enforcement (unauthenticated rejection, token validation)  |
-| `cluster_test.rs`                 | 3     | Multi-node Raft cluster integration tests (election, leader)    |
+| `rebar_raft_transport_test.rs`    | 3     | Rebar TCP transport serialization and frame tests               |
+| `registry_raft_test.rs`           | 4     | Registry OR-Set CRDT tests (register, lookup, conflict merge)   |
 | `replication_test.rs`             | 3     | Multi-node data replication tests (put, multi-put, delete)      |
+| `swim_discovery_test.rs`          | 7     | SWIM cluster discovery and DNS SRV resolution tests             |
+| `swim_membership_test.rs`         | 5     | SWIM membership protocol tests (join, suspect, fail)            |
+| `txn_test.rs`                     | 7     | Transaction (compare-and-swap) tests against the KV store       |
+| `txn_watch_test.rs`               | 2     | Watch notifications fired by transaction mutations              |
+| `watch_hub_actor_test.rs`         | 10    | WatchHubActor handle tests (create, cancel, notify, prefix)     |
+| `watch_notify_test.rs`            | 3     | Watch hub notification and key-matching tests                   |
+| `watch_revision_test.rs`          | 4     | Revision-based history replay and `changes_since` tests         |
 
 ---
 
@@ -293,6 +301,7 @@ barkeeper/
 |   |
 |   |-- kv/                 # Key-value storage layer
 |   |   |-- store.rs        #   MVCC KV store backed by redb (put, range, delete, txn, compact, snapshot, changes_since)
+|   |   |-- actor.rs        #   KvStoreActor (Rebar actor wrapping KvStore with spawn_blocking)
 |   |   |-- state_machine.rs#   Raft state machine (logs committed entries for observability)
 |   |
 |   |-- raft/               # Raft consensus implementation
@@ -306,22 +315,26 @@ barkeeper/
 |   |   |-- snapshot.rs     #   Snapshot metadata types
 |   |
 |   |-- watch/              # Watch notification system
-|   |   |-- hub.rs          #   WatchHub: fan-out of KV events, revision-based history replay
+|   |   |-- hub.rs          #   WatchEvent type and key_matches utility
+|   |   |-- actor.rs        #   WatchHubActor (Rebar actor for watch fan-out and revision replay)
 |   |
 |   |-- lease/              # Lease management
 |   |   |-- manager.rs      #   In-memory lease tracking (grant, revoke, keepalive, expiry)
 |   |
 |   |-- cluster/            # Cluster membership
-|   |   |-- manager.rs      #   In-memory cluster membership manager
+|   |   |-- manager.rs      #   Member type definition
+|   |   |-- actor.rs        #   ClusterActor (Rebar actor for membership management)
+|   |   |-- membership_sync.rs # MembershipSync bridge between SWIM and cluster actor
 |   |   |-- swim.rs         #   SWIM MembershipList actor (gossip-based failure detection)
 |   |   |-- registry.rs     #   Registry actor (OR-Set CRDT distributed process name resolution)
 |   |
 |   |-- auth/               # Authentication and authorization
-|   |   |-- manager.rs      #   RBAC auth manager (bcrypt passwords, token validation)
+|   |   |-- manager.rs      #   User, Role, Permission type definitions
+|   |   |-- actor.rs        #   AuthActor (Rebar actor for RBAC with bcrypt via spawn_blocking)
 |   |   |-- interceptor.rs  #   gRPC auth interceptor (tower Layer for token validation)
 |   |
 |   |-- actors/             # Rebar actor layer
-|       |-- commands.rs     #   Typed command enums for actor communication
+|       |-- commands.rs     #   Typed command enums (RaftCmd, KvStoreCmd, WatchHubCmd, AuthCmd, ClusterCmd)
 |
 |-- tests/                  # Integration and unit test files (see table above)
 |
@@ -395,7 +408,7 @@ timers and channels, calls `core.step()`, and executes the returned actions.
 
 ### Actor-per-concern with typed channels
 
-Each subsystem runs as its own async task communicating through typed
+Each subsystem runs as a Rebar actor communicating through typed
 `tokio::sync::mpsc` channels. Command enums in `actors/commands.rs` define
 the message vocabulary:
 
@@ -403,13 +416,15 @@ the message vocabulary:
 graph LR
     Req["gRPC/HTTP request"] --> Svc["KvService / Gateway"]
     Svc --> RC["RaftCmd"] --> RP["RaftProcess"]
-    Svc --> SC["StoreCmd"] --> SM["StateMachine"]
-    Svc --> WC["WatchCmd"] --> WH["WatchHub"]
-    Svc --> LC["LeaseCmd"] --> LM["LeaseManager"]
+    Svc --> KSC["KvStoreCmd"] --> KSA["KvStoreActor"]
+    Svc --> WHC["WatchHubCmd"] --> WHA["WatchHubActor"]
+    Svc --> AC["AuthCmd"] --> AA["AuthActor"]
+    Svc --> CC["ClusterCmd"] --> CA["ClusterActor"]
 ```
 
 Each command enum carries a `oneshot::Sender` for the response, giving
-the caller a typed future to await.
+the caller a typed future to await. Actor handles (e.g. `KvStoreActorHandle`,
+`WatchHubActorHandle`) wrap the `mpsc::Sender` with ergonomic methods.
 
 ### Proto3 JSON conventions
 

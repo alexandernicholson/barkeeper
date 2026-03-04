@@ -144,11 +144,12 @@ Don't forget to add `pub mod my_service;` to `src/api/mod.rs`.
 
 ---
 
-## 2. Adding a New Actor Process
+## 2. Adding a New Rebar Actor
 
 Barkeeper uses the actor-per-concern pattern with typed command channels.
-Each actor is a long-running tokio task that receives commands via
-`mpsc::Sender<T>` and communicates results back through `oneshot` channels.
+Each actor is spawned as a Rebar process using `runtime.spawn()`, receiving
+commands via `mpsc::Receiver<T>` and Rebar messages via `ctx.recv()`.
+Results are sent back through `oneshot` channels.
 
 ### Step 1: Define the command enum
 
@@ -158,7 +159,7 @@ of typed enums with `oneshot::Sender` reply channels:
 ```rust
 use tokio::sync::oneshot;
 
-/// Commands sent to the MyProcess actor.
+/// Commands sent to the MyActor.
 pub enum MyCmd {
     /// Do something and return the result.
     DoWork {
@@ -178,90 +179,106 @@ pub struct MyResult {
 
 The existing command enums demonstrate two patterns:
 - **Request-reply**: include a `reply: oneshot::Sender<Result<T, E>>` field
-  (see `RaftCmd::Propose`, `StoreCmd::Apply`).
-- **Fire-and-forget**: no reply channel (see `WatchCmd::Notify`).
+  (see `KvStoreCmd::Put`, `AuthCmd::Authenticate`).
+- **Fire-and-forget**: no reply channel (see `WatchHubCmd::Notify`).
 
-### Step 2: Create the process module
+### Step 2: Create the actor module
 
-Create `src/actors/my_process.rs`. The process is a `spawn` function that
-returns the command sender:
+Create a `actor.rs` file in the appropriate module directory (e.g.,
+`src/my_module/actor.rs`). Follow the pattern established by
+`src/cluster/actor.rs`, `src/auth/actor.rs`, `src/kv/actor.rs`, and
+`src/watch/actor.rs`:
 
 ```rust
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
+use rebar_core::runtime::Runtime;
 use crate::actors::commands::MyCmd;
 
-/// Spawn the MyProcess actor. Returns a sender for submitting commands.
-pub fn spawn_my_process() -> mpsc::Sender<MyCmd> {
+/// Spawn the MyActor. Returns a handle for submitting commands.
+pub async fn spawn_my_actor(runtime: &Runtime) -> MyActorHandle {
     let (cmd_tx, mut cmd_rx) = mpsc::channel::<MyCmd>(256);
 
-    tokio::spawn(async move {
-        my_process_loop(&mut cmd_rx).await;
-    });
-
-    cmd_tx
-}
-
-async fn my_process_loop(cmd_rx: &mut mpsc::Receiver<MyCmd>) {
-    loop {
-        tokio::select! {
-            Some(cmd) = cmd_rx.recv() => {
-                match cmd {
-                    MyCmd::DoWork { input, reply } => {
-                        let result = MyResult { output: input };
-                        let _ = reply.send(Ok(result));
-                    }
-                    MyCmd::Notify { data } => {
-                        tracing::info!(%data, "notification received");
+    runtime.spawn(move |mut ctx| async move {
+        loop {
+            tokio::select! {
+                Some(cmd) = cmd_rx.recv() => {
+                    match cmd {
+                        MyCmd::DoWork { input, reply } => {
+                            let result = MyResult { output: input };
+                            let _ = reply.send(Ok(result));
+                        }
+                        MyCmd::Notify { data } => {
+                            tracing::info!(%data, "notification received");
+                        }
                     }
                 }
+                Some(_msg) = ctx.recv() => {
+                    // Reserved for distributed Rebar messages.
+                }
+                else => break,
             }
         }
+    });
+
+    MyActorHandle { cmd_tx }
+}
+
+/// Cloneable handle for interacting with the MyActor.
+#[derive(Clone)]
+pub struct MyActorHandle {
+    cmd_tx: mpsc::Sender<MyCmd>,
+}
+
+impl MyActorHandle {
+    pub async fn do_work(&self, input: Vec<u8>) -> Result<MyResult, String> {
+        let (reply, rx) = oneshot::channel();
+        self.cmd_tx
+            .send(MyCmd::DoWork { input, reply })
+            .await
+            .expect("my actor dead");
+        rx.await.expect("my actor dropped")
+    }
+
+    pub async fn notify(&self, data: String) {
+        let _ = self.cmd_tx
+            .send(MyCmd::Notify { data })
+            .await;
     }
 }
 ```
 
-The architecture for an actor process looks like this:
+The architecture for a Rebar actor:
 
 ```mermaid
 graph LR
-    Callers["Callers<br>(services, other actors)"] -->|"mpsc::channel(256)"| Chan["cmd_tx / cmd_rx"]
-    Chan --> Loop["tokio::spawn loop<br>match on MyCmd variants"]
+    Callers["Callers<br>(services, other actors)"] -->|"MyActorHandle"| Handle["cmd_tx<br>mpsc::Sender"]
+    Handle --> Loop["runtime.spawn loop<br>tokio::select! on cmd_rx + ctx.recv()"]
     Loop -->|"oneshot::Sender::send()"| Reply["reply to caller"]
-    Chan --> Sender["mpsc::Sender&lt;MyCmd&gt;"]
 ```
 
 Key conventions:
-- Channel buffer size is 256 (matching `RaftCmd` and `StoreCmd`).
-- The process loop uses `tokio::select!` to multiplex commands with timers
-  or other async sources (see `raft/node.rs` for election/heartbeat timers).
-- The spawn function returns `mpsc::Sender<MyCmd>` which callers clone as needed.
+- Channel buffer size is 256 (matching all existing actors).
+- The actor loop uses `tokio::select!` on both `cmd_rx.recv()` (typed
+  commands) and `ctx.recv()` (Rebar distributed messages).
+- The spawn function returns a `MyActorHandle` (not a raw `Sender`).
+- Handle methods use `.expect("actor dead")` for consistent error handling.
+- For blocking operations (e.g., file I/O, bcrypt), use
+  `tokio::task::spawn_blocking` inside the actor to avoid blocking the loop.
 
-### Step 3: Register with the supervisor
+### Step 3: Wire into the server
 
-In `src/api/server.rs`, the Rebar supervisor is initialized with a
-`SupervisorSpec`:
-
-```rust
-let supervisor_spec = SupervisorSpec::new(RestartStrategy::OneForAll)
-    .max_restarts(5)
-    .max_seconds(30);
-
-let _supervisor = start_supervisor(runtime.clone(), supervisor_spec, vec![]).await;
-```
-
-Currently actor processes are spawned directly via `tokio::spawn`. To register
-your process with the supervisor for automatic restarts, you would add a
-`ChildEntry` to the supervisor's child list. The Rebar `SupervisorSpec`
-accepts a `Vec<ChildEntry>` as its third argument to `start_supervisor()`.
-
-### Step 4: Update `src/actors/mod.rs`
-
-Add your module:
+In `src/api/server.rs`, create a `Runtime` for your actor and spawn it:
 
 ```rust
-pub mod commands;
-pub mod my_process;  // <-- new
+let my_runtime = Runtime::new(config.node_id);
+let my_handle = spawn_my_actor(&my_runtime).await;
 ```
+
+Pass the handle to any services that need it.
+
+### Step 4: Update module declarations
+
+Add `pub mod actor;` to your module's `mod.rs` file.
 
 ---
 
@@ -486,81 +503,36 @@ async fn start_test_instance() -> (SocketAddr, tempfile::TempDir) {
         ..Default::default()
     };
 
-    let store = Arc::new(
-        KvStore::open(dir.path().join("kv.redb")).expect("open KvStore"),
-    );
+    // All components are accessed through Rebar actor handles.
+    let kv_store = KvStore::open(dir.path().join("kv.redb")).expect("open KvStore");
+    let kv_runtime = Runtime::new(1);
+    let store = spawn_kv_store_actor(&kv_runtime, kv_store).await;
 
     let (apply_tx, apply_rx) = mpsc::channel(256);
-    spawn_state_machine(Arc::clone(&store), apply_rx).await;
-    let raft_handle = spawn_raft_node(config, apply_tx, None).await;
+    spawn_state_machine(apply_rx).await;
+    let raft_handle = spawn_raft_node(config, apply_tx).await;
 
     let lease_manager = Arc::new(LeaseManager::new());
-    let cluster_runtime = rebar_core::runtime::Runtime::new(1);
+    let cluster_runtime = Runtime::new(1);
     let cluster_manager = spawn_cluster_actor(&cluster_runtime, 1).await;
     cluster_manager
         .add_initial_member(1, "test-node".to_string(), vec![], vec![])
         .await;
 
-    let watch_hub = Arc::new(WatchHub::with_store(Arc::clone(&store)));
-    let auth_manager = Arc::new(AuthManager::new());
+    let watch_runtime = Runtime::new(1);
+    let watch_hub = spawn_watch_hub_actor(&watch_runtime, Some(store.clone())).await;
+    let auth_runtime = Runtime::new(1);
+    let auth_manager = spawn_auth_actor(&auth_runtime).await;
 
-    // Spawn lease expiry timer — checks every 500ms for expired leases.
-    {
-        let lm = Arc::clone(&lease_manager);
-        let st = Arc::clone(&store);
-        let wh = Arc::clone(&watch_hub);
-        tokio::spawn(async move {
-            loop {
-                tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-                let expired = lm.check_expired().await;
-                for lease in expired {
-                    for key in &lease.keys {
-                        if let Ok(result) = st.delete_range(key, b"") {
-                            for prev in &result.prev_kvs {
-                                let tombstone = barkeeper::proto::mvccpb::KeyValue {
-                                    key: prev.key.clone(),
-                                    mod_revision: result.revision,
-                                    ..Default::default()
-                                };
-                                wh.notify(&prev.key, 1, tombstone, Some(prev.clone())).await;
-                            }
-                        }
-                    }
-                }
-            }
-        });
-    }
-
-    let alarms = Arc::new(std::sync::Mutex::new(vec![]));
-    let app = gateway::create_router(
-        raft_handle.clone(),
-        Arc::clone(&store),
-        Arc::clone(&watch_hub),
-        Arc::clone(&lease_manager),
-        Arc::clone(&cluster_manager),
-        1, 1,
-        Arc::clone(&raft_handle.current_term),
-        Arc::clone(&auth_manager),
-        alarms,
-    );
-
-    let http_port = portpicker::pick_unused_port().expect("no free port");
-    let http_addr = SocketAddr::from(([127, 0, 0, 1], http_port));
-    let listener = tokio::net::TcpListener::bind(http_addr).await.expect("bind");
-    let bound_addr = listener.local_addr().unwrap();
-
-    tokio::spawn(async move {
-        axum::serve(listener, app).await.expect("HTTP server failed");
-    });
-
-    // Wait for single-node Raft election.
-    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+    // ... lease expiry timer, router setup, HTTP listener ...
 
     (bound_addr, dir)
 }
 ```
 
-Note: The `TempDir` is returned and held by the test to keep the data directory
+Note: All shared components (KvStore, WatchHub, ClusterManager, AuthManager)
+are accessed through Rebar actor handles — no `Arc<T>` wrappers needed.
+The `TempDir` is returned and held by the test to keep the data directory
 alive for the duration of the test. Dropping it cleans up automatically.
 
 ### Writing a test

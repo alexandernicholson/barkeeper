@@ -107,11 +107,11 @@ barkeeper is structured as a Rebar actor tree with supervised processes:
 graph TD
     S["BarkeepSupervisor<br>(OneForAll)"]
     S --> R["RaftProcess<br>consensus engine"]
-    S --> St["StoreProcess<br>MVCC KV store"]
-    S --> W["WatchProcess<br>change notification with revision replay"]
+    S --> KSA["KvStoreActor<br>MVCC KV store (redb via spawn_blocking)"]
+    S --> WHA["WatchHubActor<br>change notification with revision replay"]
     S --> L["LeaseProcess<br>TTL management (Raft-proposed expiry)"]
-    S --> C["ClusterProcess<br>membership"]
-    S --> A["AuthProcess<br>RBAC with enforcement"]
+    S --> CA["ClusterActor<br>membership management"]
+    S --> AA["AuthActor<br>RBAC with bcrypt (spawn_blocking)"]
     S --> SWIM["SWIM MembershipList<br>cluster discovery and failure detection"]
     S --> Reg["Registry<br>OR-Set CRDT process name resolution"]
 ```
@@ -121,8 +121,9 @@ graph TD
     Client["Client Request"] --> API["gRPC Service / HTTP Gateway"]
     API --> Raft["RaftNode Actor<br>(leader election, log replication)"]
     Raft -->|"msgpack over Rebar TCP frames"| Peers["Peer Nodes<br>(Rebar DistributedRuntime)"]
-    Raft --> SM["StateMachine Actor<br>(applies committed entries)"]
-    SM --> KV["KvStore<br>(MVCC store backed by redb)"]
+    Raft --> SM["StateMachine<br>(logs committed entries)"]
+    API --> KSA["KvStoreActor<br>(MVCC store backed by redb)"]
+    API --> WHA["WatchHubActor<br>(fan-out events to watchers)"]
     SWIM["SWIM Protocol"] -->|"membership events"| Raft
 ```
 
@@ -134,11 +135,11 @@ graph TD
 
 **Rebar DistributedRuntime** -- inter-node Raft messages travel over TCP using Rebar frames with msgpack serialization, replacing the previous gRPC transport layer. The `Registry` actor provides an OR-Set CRDT for distributed process name resolution across the cluster.
 
-**State machine** receives committed log entries from Raft and applies KvCommands (Put, DeleteRange, Txn, Compact) to the KvStore.
+**State machine** receives committed log entries from Raft and logs them for observability. Actual KV mutations are applied at the service layer after Raft commit.
 
-**KvStore** implements MVCC semantics with revision-indexed storage. Each mutation increments a global revision counter. Range queries can read at any historical revision. Compaction removes old revisions to reclaim space.
+**KvStoreActor** wraps the MVCC KV store as a Rebar actor, using `spawn_blocking` for redb I/O. Implements revision-indexed storage where each mutation increments a global revision counter. Range queries can read at any historical revision. Compaction removes old revisions to reclaim space.
 
-**Watch hub** delivers real-time notifications for PUT and DELETE events. Supports exact-key and prefix-based watching, streaming events to connected watchers as keys change.
+**WatchHubActor** delivers real-time notifications for PUT and DELETE events as a Rebar actor. Supports exact-key and prefix-based watching, streaming events to connected watchers as keys change, with revision-based history replay.
 
 **Lease manager** handles TTL-based key lifecycle. When a lease expires, all keys attached to it are automatically cleaned up. Supports grant, revoke, keepalive, and time-to-live queries.
 
@@ -299,7 +300,7 @@ Byte fields (key, value) are base64-encoded in JSON, matching etcd's HTTP gatewa
 cargo test
 ```
 
-99 tests across 16 test suites covering Raft consensus, log store, KV store (MVCC, transactions, compaction), etcd HTTP gateway API compatibility, watch notifications (including revision replay), lease expiry, TLS configuration, auth enforcement, multi-node clustering, multi-node data replication, and gRPC transport.
+181 tests across 24 test files covering Raft consensus, log store, KV store (MVCC, transactions, compaction), etcd HTTP gateway API compatibility, watch notifications (including revision replay), lease expiry, TLS configuration, auth enforcement, multi-node clustering, multi-node data replication, SWIM membership, registry CRDT, Rebar actor handles (KvStore, WatchHub, Auth, Cluster), and gRPC transport.
 
 ## Differences from etcd
 

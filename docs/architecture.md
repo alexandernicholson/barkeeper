@@ -52,16 +52,17 @@ graph TD
 ```mermaid
 graph TD
     S["BarkeepSupervisor (OneForAll)<br>max_restarts=5/30s"]
-    S --> R["RaftProcess<br>Raft consensus engine (tokio::spawn)"]
+    S --> R["RaftProcess<br>Rebar distributed actor (ProcessContext mailbox)"]
     R --> RC["RaftCore<br>pure Event-&gt;Action state machine"]
     R --> LS["LogStore<br>durable log (redb: raft.redb)"]
-    S --> SM["StateMachine<br>applies committed entries to KvStore"]
-    SM --> KV["KvStore<br>MVCC store (redb: kv.redb)"]
-    S --> LET["LeaseExpiryTimer<br>supervised Rebar child (ChildEntry, Permanent)<br>checks for expired leases, deletes keys, notifies watchers"]
-    S --> WH["WatchHub<br>fan-out change notifications"]
+    S --> SM["StateMachine<br>observability logging for committed entries"]
+    S --> KVA["KvStoreActor<br>Rebar actor (KvStoreCmd, spawn_blocking for redb)"]
+    KVA --> KV["KvStore<br>MVCC store (redb: kv.redb)"]
+    S --> LET["LeaseExpiryTimer<br>supervised Rebar child (ChildEntry, Permanent)"]
+    S --> WHA["WatchHubActor<br>Rebar actor (WatchHubCmd, streaming via mpsc)"]
     S --> LM["LeaseManager<br>TTL tracking, expiry detection"]
-    S --> CM["ClusterManager<br>membership tracking"]
-    S --> AM["AuthManager<br>RBAC users/roles/permissions"]
+    S --> CA["ClusterActor<br>Rebar actor (ClusterCmd, SWIM-backed membership)"]
+    S --> AA["AuthActor<br>Rebar actor (AuthCmd, spawn_blocking for bcrypt)"]
     S --> SWIM["SWIM MembershipList<br>cluster discovery and failure detection"]
     S --> Reg["Registry<br>OR-Set CRDT distributed process name resolution"]
 ```
@@ -410,8 +411,9 @@ CLI entry point using clap. Parses `--name`, `--data-dir`,
 ### `src/actors/`
 
 - **`commands.rs`** -- Command enums for actor communication: `RaftCmd`,
-  `StoreCmd`, `WatchCmd`, `LeaseCmd`. Each wraps a `oneshot::Sender` for
-  request-response.
+  `ClusterCmd`, `AuthCmd`, `KvStoreCmd`, `WatchHubCmd`. Each wraps a
+  `oneshot::Sender` for request-response (except fire-and-forget variants
+  like `WatchHubCmd::Notify`).
 
 ### `src/api/`
 
@@ -468,15 +470,22 @@ CLI entry point using clap. Parses `--name`, `--data-dir`,
   `put`, `range`, `delete_range`, `txn` (compare-and-swap), `compact`,
   `snapshot_bytes` (full db snapshot), `compact_db` (redb compaction).
   Uses three redb tables: `kv`, `revisions`, `kv_meta`.
+- **`actor.rs`** -- `KvStoreActor` and `KvStoreActorHandle`. Rebar actor
+  wrapping KvStore with typed `KvStoreCmd` commands. All redb operations
+  use `spawn_blocking` for non-blocking I/O.
 - **`state_machine.rs`** -- `StateMachine` apply loop and `KvCommand` enum
   (Put/DeleteRange/Txn/Compact). Spawned via `spawn_state_machine()`, receives
-  committed log entries from Raft over an mpsc channel.
+  committed log entries from Raft over an mpsc channel. Logs entries for
+  observability only; actual application happens at the service layer.
 
 ### `src/watch/`
 
-- **`hub.rs`** -- `WatchHub` maintains a `HashMap<i64, Watcher>`. Methods:
-  `create_watch` (returns receiver), `cancel_watch`, `notify` (fan-out to
-  matching watchers). Supports exact key, range, and prefix matching.
+- **`hub.rs`** -- `WatchEvent` type and `key_matches` utility function for
+  exact key, range, and prefix matching.
+- **`actor.rs`** -- `WatchHubActor` and `WatchHubActorHandle`. Rebar actor
+  with typed `WatchHubCmd` commands. Maintains a `HashMap<i64, Watcher>`.
+  `create_watch` returns a streaming `mpsc::Receiver<WatchEvent>`.
+  `notify` is fire-and-forget with automatic dead watcher cleanup.
 
 ### `src/lease/`
 
@@ -486,9 +495,10 @@ CLI entry point using clap. Parses `--name`, `--data-dir`,
 
 ### `src/cluster/`
 
-- **`manager.rs`** -- In-memory `ClusterManager`. Tracks members with peer/client
-  URLs. Methods: `add_initial_member`, `add_member`, `remove_member`,
-  `update_member`, `promote_member`, `list_members`.
+- **`manager.rs`** -- `Member` type definition for cluster membership tracking.
+- **`actor.rs`** -- `ClusterActor` and `ClusterActorHandle`. Rebar actor
+  with typed `ClusterCmd` commands. Tracks members with peer/client URLs.
+  Supports optional SWIM `MembershipSync` for peer discovery.
 - **`swim.rs`** -- `SWIM MembershipList` actor. Implements the SWIM gossip
   protocol for cluster membership discovery and failure detection. Emits
   `MembershipEvent` notifications consumed by `RaftProcess`.
@@ -498,9 +508,11 @@ CLI entry point using clap. Parses `--name`, `--data-dir`,
 
 ### `src/auth/`
 
-- **`manager.rs`** -- In-memory RBAC `AuthManager`. Tracks users (with bcrypt
-  password hashes and roles) and roles (with key-range permissions). Full CRUD
-  for users and roles, permission grant/revoke. Token generation and validation.
+- **`manager.rs`** -- `User`, `Role`, and `Permission` type definitions
+  for the RBAC auth system.
+- **`actor.rs`** -- `AuthActor` and `AuthActorHandle`. Rebar actor with
+  typed `AuthCmd` commands (18 variants). bcrypt operations use
+  `spawn_blocking` to avoid blocking the actor loop.
 - **`interceptor.rs`** -- gRPC auth interceptor (`GrpcAuthLayer`). Validates
   tokens on all requests when auth is enabled; auth endpoints pass through.
 
@@ -527,13 +539,15 @@ graph TD
     Client["Client (etcdctl)"]
     Client -->|"gRPC :2379"| GRPC["tonic gRPC<br>services"]
     Client -->|"HTTP :2380"| HTTP["axum HTTP<br>gateway"]
-    GRPC -->|"shared Arc"| KV["KvStore"]
-    HTTP -->|"shared Arc"| KV
-    KV --> WH["WatchHub"]
-    KV --> LM["LeaseManager"]
-    WH --> W["watchers<br>(mpsc)"]
-    KV --> KVDB["redb (kv.redb)"]
-    KV --> Raft["RaftNode"]
+    GRPC -->|"actor handles"| KVA["KvStoreActorHandle"]
+    HTTP -->|"actor handles"| KVA
+    KVA -->|"spawn_blocking"| KVDB["redb (kv.redb)"]
+    GRPC --> WHA["WatchHubActorHandle"]
+    HTTP --> WHA
+    WHA --> W["watchers<br>(mpsc)"]
+    GRPC --> CA["ClusterActorHandle"]
+    GRPC --> AA["AuthActorHandle"]
+    KVA --> Raft["RaftNode"]
     Raft --> RDB["redb (raft.redb)"]
-    LM --> MEM["in-memory"]
+    GRPC --> LM["LeaseManager<br>(in-memory)"]
 ```
