@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
@@ -18,6 +19,7 @@ use crate::api::watch_service::WatchService;
 use crate::auth::interceptor::GrpcAuthLayer;
 use crate::auth::manager::AuthManager;
 use crate::cluster::manager::ClusterManager;
+use crate::config::ClusterConfig;
 use crate::kv::state_machine::spawn_state_machine;
 use crate::kv::store::KvStore;
 use crate::lease::manager::LeaseManager;
@@ -27,7 +29,9 @@ use crate::proto::etcdserverpb::kv_server::KvServer;
 use crate::proto::etcdserverpb::lease_server::LeaseServer;
 use crate::proto::etcdserverpb::maintenance_server::MaintenanceServer;
 use crate::proto::etcdserverpb::watch_server::WatchServer;
+use crate::raft::grpc_transport::{GrpcRaftTransport, RaftTransportServer};
 use crate::raft::node::{spawn_raft_node, RaftConfig};
+use crate::raft::transport::RaftTransport;
 use crate::tls::TlsConfig;
 use crate::watch::hub::WatchHub;
 
@@ -35,15 +39,19 @@ use crate::watch::hub::WatchHub;
 pub struct BarkeepServer;
 
 impl BarkeepServer {
-    /// Start a single-node barkeeper instance.
+    /// Start a barkeeper instance.
     ///
     /// This creates the data directory, opens the KV store, spawns the Raft
-    /// node and state machine, and starts the tonic gRPC server.
+    /// node and state machine, and starts the tonic gRPC server. When
+    /// `cluster_config` specifies peers, a gRPC-based Raft transport is used
+    /// for inter-node communication and a peer listener is started on
+    /// `listen_peer_url`.
     pub async fn start(
         config: RaftConfig,
         addr: SocketAddr,
         name: String,
         tls_config: TlsConfig,
+        cluster_config: ClusterConfig,
     ) -> Result<(), Box<dyn std::error::Error>> {
         // Create data directory.
         std::fs::create_dir_all(&config.data_dir)?;
@@ -68,9 +76,50 @@ impl BarkeepServer {
         // Spawn the state machine apply loop.
         spawn_state_machine(Arc::clone(&store), apply_rx).await;
 
+        // Build transport based on cluster configuration.
+        let transport: Option<Arc<dyn RaftTransport>> = if cluster_config.is_clustered() {
+            // Multi-node: build peer map excluding self.
+            let mut peer_map = HashMap::new();
+            for (id, url) in &cluster_config.peers {
+                if *id != config.node_id {
+                    peer_map.insert(*id, url.clone());
+                }
+            }
+            Some(Arc::new(GrpcRaftTransport::new(config.node_id, peer_map)))
+        } else {
+            None
+        };
+
         // Spawn the Raft node.
-        let raft_handle = spawn_raft_node(config.clone(), apply_tx, None).await;
+        let raft_handle = spawn_raft_node(config.clone(), apply_tx, transport).await;
         let raft_term = Arc::clone(&raft_handle.current_term);
+
+        // If clustered, start the peer gRPC listener for inbound Raft messages.
+        if cluster_config.is_clustered() {
+            let peer_addr: SocketAddr = cluster_config
+                .listen_peer_url
+                .trim_start_matches("http://")
+                .trim_start_matches("https://")
+                .parse()
+                .expect("invalid --listen-peer-urls address");
+
+            let raft_transport_server =
+                RaftTransportServer::new(raft_handle.inbound_tx.clone());
+
+            tracing::info!(%peer_addr, "starting peer gRPC listener for Raft transport");
+
+            tokio::spawn(async move {
+                Server::builder()
+                    .add_service(
+                        crate::proto::raftpb::raft_transport_server::RaftTransportServer::new(
+                            raft_transport_server,
+                        ),
+                    )
+                    .serve(peer_addr)
+                    .await
+                    .expect("peer gRPC server failed");
+            });
+        }
 
         // Create the Watch hub and gRPC service.
         let cluster_id = 1;
