@@ -118,6 +118,22 @@ pub fn decode_raft_message(val: &Value) -> Option<RaftMessage> {
     }
 }
 
+/// Serialize a RaftMessage to an rmpv::Value for Rebar frame transport.
+pub fn raft_message_to_value(msg: &RaftMessage) -> rmpv::Value {
+    let bytes = rmp_serde::to_vec(msg).expect("serialize raft message");
+    rmpv::Value::Binary(bytes)
+}
+
+/// Deserialize a RaftMessage from an rmpv::Value.
+pub fn raft_message_from_value(value: &rmpv::Value) -> Result<RaftMessage, String> {
+    match value {
+        rmpv::Value::Binary(bytes) => {
+            rmp_serde::from_slice(bytes).map_err(|e| format!("deserialize raft message: {}", e))
+        }
+        _ => Err("expected Binary value".into()),
+    }
+}
+
 /// Wrapper enum for all Raft RPC messages sent between nodes.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum RaftMessage {
