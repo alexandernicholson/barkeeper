@@ -21,6 +21,7 @@ prost-types = "0.13"
 
 # HTTP gateway
 axum = "0.7"
+http = "1"
 tower = "0.4"
 tower-http = { version = "0.5", features = ["cors"] }
 
@@ -44,6 +45,9 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # Async traits
 async-trait = "0.1"
+
+# Auth
+bcrypt = "0.15"
 
 # Utilities
 rand = "0.8"

@@ -9,8 +9,9 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-use axum::extract::State;
+use axum::extract::{Request, State};
 use axum::http::StatusCode;
+use axum::middleware::{self, Next};
 use axum::response::IntoResponse;
 use axum::routing::post;
 use axum::Router;
@@ -425,6 +426,53 @@ fn parse_json<T: serde::de::DeserializeOwned + Default>(body: &[u8]) -> T {
     serde_json::from_slice(body).unwrap_or_default()
 }
 
+// ── Auth middleware ─────────────────────────────────────────────────────────
+
+/// Axum middleware that enforces authentication when auth is enabled.
+///
+/// - Auth endpoints (`/v3/auth/*`) always pass through so clients can
+///   authenticate, enable/disable auth, and manage users and roles.
+/// - When auth is disabled, all requests pass through.
+/// - When auth is enabled, non-auth requests must include a valid token in
+///   the `Authorization` header. Requests without a valid token are rejected
+///   with 401 Unauthorized.
+async fn auth_middleware(
+    State(state): State<GatewayState>,
+    request: Request,
+    next: Next,
+) -> axum::response::Response {
+    let path = request.uri().path().to_string();
+
+    // Auth endpoints are always accessible.
+    if path.starts_with("/v3/auth/") {
+        return next.run(request).await;
+    }
+
+    // If auth is not enabled, pass through.
+    if !state.auth_manager.is_enabled().await {
+        return next.run(request).await;
+    }
+
+    // Auth is enabled — check for a valid token.
+    let token = request
+        .headers()
+        .get("authorization")
+        .and_then(|v| v.to_str().ok());
+
+    match token {
+        Some(token_str) => {
+            if state.auth_manager.validate_token(token_str).await.is_some() {
+                next.run(request).await
+            } else {
+                json_error(StatusCode::UNAUTHORIZED, "invalid auth token").into_response()
+            }
+        }
+        None => {
+            json_error(StatusCode::UNAUTHORIZED, "auth token is not provided").into_response()
+        }
+    }
+}
+
 // ── Router constructor ──────────────────────────────────────────────────────
 
 pub fn create_router(
@@ -480,6 +528,10 @@ pub fn create_router(
         .route("/v3/auth/role/delete", post(handle_auth_role_delete))
         .route("/v3/auth/role/grant", post(handle_auth_role_grant_permission))
         .route("/v3/auth/role/revoke", post(handle_auth_role_revoke_permission))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            auth_middleware,
+        ))
         .with_state(state)
 }
 

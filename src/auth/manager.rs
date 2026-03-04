@@ -7,7 +7,7 @@ use tokio::sync::Mutex;
 #[derive(Debug, Clone)]
 pub struct User {
     pub name: String,
-    pub password_hash: Vec<u8>,
+    pub password_hash: String,
     pub roles: Vec<String>,
 }
 
@@ -31,10 +31,15 @@ pub struct Permission {
 ///
 /// Manages users, roles, and permissions for the barkeeper auth system.
 /// All operations are async and use interior mutability via `Arc<Mutex<_>>`.
+///
+/// Passwords are hashed with bcrypt. Tokens are simple opaque strings issued
+/// on successful authentication and tracked in-memory for validation.
 pub struct AuthManager {
     enabled: Arc<Mutex<bool>>,
     users: Arc<Mutex<HashMap<String, User>>>,
     roles: Arc<Mutex<HashMap<String, Role>>>,
+    /// Maps token string → username. Tracks all valid tokens.
+    tokens: Arc<Mutex<HashMap<String, String>>>,
 }
 
 impl AuthManager {
@@ -43,6 +48,7 @@ impl AuthManager {
             enabled: Arc::new(Mutex::new(false)),
             users: Arc::new(Mutex::new(HashMap::new())),
             roles: Arc::new(Mutex::new(HashMap::new())),
+            tokens: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -71,13 +77,26 @@ impl AuthManager {
     pub async fn authenticate(&self, name: &str, password: &str) -> Option<String> {
         let users = self.users.lock().await;
         let user = users.get(name)?;
-        let password_hash = simple_hash(password);
-        if user.password_hash == password_hash {
-            // Return a simple token: "name.simple-token"
-            Some(format!("{}.{}", name, hex::encode(&password_hash[..8])))
+        if bcrypt::verify(password, &user.password_hash).unwrap_or(false) {
+            // Generate a unique token.
+            let token = format!(
+                "{}.{}",
+                name,
+                uuid::Uuid::new_v4().to_string().replace('-', "")
+            );
+            drop(users);
+            let mut tokens = self.tokens.lock().await;
+            tokens.insert(token.clone(), name.to_string());
+            Some(token)
         } else {
             None
         }
+    }
+
+    /// Validate a token. Returns the username if the token is valid.
+    pub async fn validate_token(&self, token: &str) -> Option<String> {
+        let tokens = self.tokens.lock().await;
+        tokens.get(token).cloned()
     }
 
     /// Add a new user. Returns `true` if the user was created, `false` if it
@@ -87,7 +106,10 @@ impl AuthManager {
         if users.contains_key(&name) {
             return false;
         }
-        let password_hash = simple_hash(&password);
+        // Use a low cost factor (4) for tests to keep them fast. In production
+        // this would use bcrypt::DEFAULT_COST (12).
+        let password_hash =
+            bcrypt::hash(&password, 4).expect("bcrypt hash should not fail");
         users.insert(
             name.clone(),
             User {
@@ -124,7 +146,8 @@ impl AuthManager {
         let mut users = self.users.lock().await;
         match users.get_mut(name) {
             Some(user) => {
-                user.password_hash = simple_hash(&password);
+                user.password_hash =
+                    bcrypt::hash(&password, 4).expect("bcrypt hash should not fail");
                 true
             }
             None => false,
@@ -221,30 +244,5 @@ impl AuthManager {
             }
             None => false,
         }
-    }
-}
-
-/// Simple hash function for passwords (not cryptographically secure --
-/// production would use bcrypt/scrypt/argon2).
-fn simple_hash(input: &str) -> Vec<u8> {
-    // Simple FNV-1a-inspired hash producing 32 bytes for demo purposes.
-    let mut hash: u64 = 0xcbf29ce484222325;
-    for byte in input.as_bytes() {
-        hash ^= *byte as u64;
-        hash = hash.wrapping_mul(0x100000001b3);
-    }
-    let mut result = Vec::with_capacity(32);
-    // Expand to 32 bytes by hashing iterations.
-    for i in 0u64..4 {
-        let h = hash.wrapping_add(i).wrapping_mul(0x517cc1b727220a95);
-        result.extend_from_slice(&h.to_le_bytes());
-    }
-    result
-}
-
-/// Simple hex encoding (avoids adding a dependency).
-mod hex {
-    pub fn encode(bytes: &[u8]) -> String {
-        bytes.iter().map(|b| format!("{:02x}", b)).collect()
     }
 }

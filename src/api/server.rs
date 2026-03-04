@@ -15,6 +15,7 @@ use crate::api::kv_service::KvService;
 use crate::api::lease_service::LeaseService;
 use crate::api::maintenance_service::MaintenanceService;
 use crate::api::watch_service::WatchService;
+use crate::auth::interceptor::GrpcAuthLayer;
 use crate::auth::manager::AuthManager;
 use crate::cluster::manager::ClusterManager;
 use crate::kv::state_machine::spawn_state_machine;
@@ -167,8 +168,11 @@ impl BarkeepServer {
 
         tracing::info!(%addr, "starting gRPC server");
 
-        // Start the tonic gRPC server.
+        // Start the tonic gRPC server with auth enforcement layer.
+        let auth_layer = GrpcAuthLayer::new(Arc::clone(&auth_manager));
+
         Server::builder()
+            .layer(auth_layer)
             .add_service(KvServer::new(kv_service))
             .add_service(WatchServer::new(watch_service))
             .add_service(LeaseServer::new(lease_service))
