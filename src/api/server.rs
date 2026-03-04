@@ -72,7 +72,7 @@ impl BarkeepServer {
         // Create the Watch hub and gRPC service.
         let cluster_id = 1;
         let member_id = config.node_id;
-        let watch_hub = Arc::new(WatchHub::new());
+        let watch_hub = Arc::new(WatchHub::with_store(Arc::clone(&store)));
         let watch_service = WatchService::new(Arc::clone(&watch_hub), cluster_id, member_id, Arc::clone(&raft_term));
 
         // Create the Lease manager and gRPC service.

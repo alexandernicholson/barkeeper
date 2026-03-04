@@ -47,7 +47,7 @@ async fn start_test_instance() -> (SocketAddr, tempfile::TempDir) {
         .add_initial_member(1, "test-node".to_string(), vec![], vec![])
         .await;
 
-    let watch_hub = Arc::new(WatchHub::new());
+    let watch_hub = Arc::new(WatchHub::with_store(Arc::clone(&store)));
 
     let app = gateway::create_router(
         raft_handle.clone(),

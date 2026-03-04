@@ -37,7 +37,7 @@ async fn start_instance_with_lease_expiry() -> (SocketAddr, Arc<KvStore>, Arc<Le
     let raft_handle = spawn_raft_node(config, apply_tx, None).await;
 
     let lease_manager = Arc::new(LeaseManager::new());
-    let watch_hub = Arc::new(WatchHub::new());
+    let watch_hub = Arc::new(WatchHub::with_store(Arc::clone(&store)));
     let cluster_manager = Arc::new(ClusterManager::new(1));
     cluster_manager.add_initial_member(1, "test".to_string(), vec![], vec![]).await;
 

@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::{mpsc, Mutex};
 
+use crate::kv::store::KvStore;
 use crate::proto::mvccpb;
 
 /// A single watcher watching a key or range.
@@ -10,7 +11,6 @@ struct Watcher {
     key: Vec<u8>,
     range_end: Vec<u8>,
     tx: mpsc::Sender<WatchEvent>,
-    #[allow(dead_code)]
     start_revision: i64,
 }
 
@@ -27,6 +27,7 @@ pub struct WatchEvent {
 pub struct WatchHub {
     watchers: Arc<Mutex<HashMap<i64, Watcher>>>,
     next_id: Arc<Mutex<i64>>,
+    store: Option<Arc<KvStore>>,
 }
 
 impl WatchHub {
@@ -34,10 +35,24 @@ impl WatchHub {
         WatchHub {
             watchers: Arc::new(Mutex::new(HashMap::new())),
             next_id: Arc::new(Mutex::new(1)),
+            store: None,
+        }
+    }
+
+    /// Create a WatchHub with an attached KvStore for historical replay.
+    pub fn with_store(store: Arc<KvStore>) -> Self {
+        WatchHub {
+            watchers: Arc::new(Mutex::new(HashMap::new())),
+            next_id: Arc::new(Mutex::new(1)),
+            store: Some(store),
         }
     }
 
     /// Create a watch and return (watch_id, event_receiver).
+    ///
+    /// If `start_revision > 0` and the hub has a store reference, historical
+    /// events from that revision onward are replayed to the watcher before it
+    /// begins receiving live events.
     pub async fn create_watch(
         &self,
         key: Vec<u8>,
@@ -51,6 +66,11 @@ impl WatchHub {
         *next_id += 1;
         drop(next_id);
 
+        // Clone key/range_end/tx for replay before the watcher takes ownership.
+        let replay_key = key.clone();
+        let replay_range_end = range_end.clone();
+        let replay_tx = tx.clone();
+
         let watcher = Watcher {
             id,
             key,
@@ -60,6 +80,44 @@ impl WatchHub {
         };
 
         self.watchers.lock().await.insert(id, watcher);
+
+        // Replay historical events if start_revision > 0 and we have a store.
+        if start_revision > 0 {
+            if let Some(ref store) = self.store {
+                // changes_since is exclusive, so pass start_revision - 1
+                // to include events AT start_revision.
+                match store.changes_since(start_revision - 1) {
+                    Ok(changes) => {
+                        for (change_key, event_type, kv) in changes {
+                            if !key_matches(&replay_key, &replay_range_end, &change_key) {
+                                continue;
+                            }
+
+                            let event = mvccpb::Event {
+                                r#type: event_type,
+                                kv: Some(kv),
+                                prev_kv: None,
+                            };
+
+                            let watch_event = WatchEvent {
+                                watch_id: id,
+                                events: vec![event],
+                                compact_revision: 0,
+                            };
+
+                            // If the receiver is gone, stop replaying.
+                            if replay_tx.send(watch_event).await.is_err() {
+                                break;
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!("failed to replay watch history: {}", e);
+                    }
+                }
+            }
+        }
+
         (id, rx)
     }
 
