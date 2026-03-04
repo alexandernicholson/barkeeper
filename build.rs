@@ -12,12 +12,5 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             &["proto/"],
         )?;
 
-    // Compile raft transport proto (both server and client needed for
-    // inter-node communication).
-    tonic_build::configure()
-        .build_server(true)
-        .build_client(true)
-        .compile_protos(&["proto/raftpb/raft_transport.proto"], &["proto/"])?;
-
     Ok(())
 }

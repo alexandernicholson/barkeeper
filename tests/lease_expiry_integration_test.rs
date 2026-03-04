@@ -35,7 +35,7 @@ async fn start_instance_with_lease_expiry() -> (SocketAddr, Arc<KvStore>, Arc<Le
     let store = Arc::new(KvStore::open(dir.path().join("kv.redb")).unwrap());
     let (apply_tx, apply_rx) = mpsc::channel(256);
     spawn_state_machine(Arc::clone(&store), apply_rx).await;
-    let raft_handle = spawn_raft_node(config, apply_tx, None).await;
+    let raft_handle = spawn_raft_node(config, apply_tx).await;
 
     let lease_manager = Arc::new(LeaseManager::new());
     let watch_hub = Arc::new(WatchHub::with_store(Arc::clone(&store)));

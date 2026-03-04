@@ -44,7 +44,7 @@ async fn start_test_instance() -> (SocketAddr, tempfile::TempDir) {
     let (apply_tx, apply_rx) = mpsc::channel(256);
     spawn_state_machine(Arc::clone(&store), apply_rx).await;
 
-    let raft_handle = spawn_raft_node(config, apply_tx, None).await;
+    let raft_handle = spawn_raft_node(config, apply_tx).await;
 
     let lease_manager = Arc::new(LeaseManager::new());
     let cluster_manager = Arc::new(ClusterManager::new(1));
