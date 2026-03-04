@@ -1,56 +1,44 @@
 //! Multi-node Raft data replication tests.
 //!
-//! Spawns a 3-node cluster where each node has its own KvStore and an active
-//! state machine that applies committed entries. Verifies that writes to the
-//! leader are replicated to all followers' stores.
+//! Spawns a 3-node cluster using the Rebar actor runtime where each node has
+//! its own KvStore and an active state machine that applies committed entries.
+//! Verifies that writes to the leader are replicated to all followers' stores.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use tokio::sync::mpsc;
 use tokio::time::{sleep, timeout, Duration};
 
+use rebar_core::process::ProcessId;
+use rebar_core::process::table::ProcessTable;
+use rebar_core::runtime::Runtime;
+use rebar_cluster::registry::orset::Registry;
+use rebar_cluster::router::{deliver_inbound_frame, DistributedRouter, RouterCommand};
+
 use barkeeper::kv::state_machine::KvCommand;
 use barkeeper::kv::store::KvStore;
-use barkeeper::raft::messages::{ClientProposalResult, LogEntry, LogEntryData, RaftMessage};
-use barkeeper::raft::node::{spawn_raft_node, RaftConfig, RaftHandle};
-use barkeeper::raft::transport::RaftTransport;
+use barkeeper::raft::messages::{ClientProposalResult, LogEntry, LogEntryData};
+use barkeeper::raft::node::{spawn_raft_node_rebar, RaftConfig, RaftHandle};
 
 // ---------------------------------------------------------------------------
-// Per-node transport wrapper (same pattern as cluster_test.rs)
-// ---------------------------------------------------------------------------
-
-struct NodeTransport {
-    local_id: u64,
-    peers: Arc<tokio::sync::Mutex<HashMap<u64, mpsc::Sender<(u64, RaftMessage)>>>>,
-}
-
-impl NodeTransport {
-    fn new(
-        local_id: u64,
-        peers: Arc<tokio::sync::Mutex<HashMap<u64, mpsc::Sender<(u64, RaftMessage)>>>>,
-    ) -> Self {
-        Self { local_id, peers }
-    }
-}
-
-#[async_trait::async_trait]
-impl RaftTransport for NodeTransport {
-    async fn send(&self, to: u64, message: RaftMessage) {
-        let peers = self.peers.lock().await;
-        if let Some(tx) = peers.get(&to) {
-            let _ = tx.send((self.local_id, message)).await;
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Replication test cluster with real KV stores
+// Replication test cluster with real KV stores (Rebar runtime)
 // ---------------------------------------------------------------------------
 
 struct ReplicationCluster {
     nodes: Vec<ReplicationNode>,
     _tmp: tempfile::TempDir,
+    // Keep tables alive for the duration of the test so processes can deliver.
+    _tables: Arc<HashMap<u64, Arc<ProcessTable>>>,
+    _relay_handles: Vec<tokio::task::JoinHandle<()>>,
+}
+
+impl Drop for ReplicationCluster {
+    fn drop(&mut self) {
+        for h in &self._relay_handles {
+            h.abort();
+        }
+    }
 }
 
 struct ReplicationNode {
@@ -60,15 +48,21 @@ struct ReplicationNode {
 }
 
 impl ReplicationCluster {
-    /// Spawn a 3-node cluster where each node has its own KvStore and state
-    /// machine that actively applies committed entries.
+    /// Spawn a 3-node cluster using Rebar runtimes where each node has its
+    /// own KvStore and state machine that actively applies committed entries.
     async fn new() -> Self {
         let tmp = tempfile::tempdir().unwrap();
         let node_ids: Vec<u64> = vec![1, 2, 3];
 
-        let peers: Arc<tokio::sync::Mutex<HashMap<u64, mpsc::Sender<(u64, RaftMessage)>>>> =
-            Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+        // Shared registry across all nodes (fine for testing).
+        let registry = Arc::new(Mutex::new(Registry::new()));
 
+        // Shared peers map — populated after all nodes are spawned.
+        let peers: Arc<Mutex<HashMap<u64, ProcessId>>> = Arc::new(Mutex::new(HashMap::new()));
+
+        // Per-node ProcessTables, stored in a shared map for relay delivery.
+        let mut tables_map: HashMap<u64, Arc<ProcessTable>> = HashMap::new();
+        let mut remote_rxs: Vec<(u64, mpsc::Receiver<RouterCommand>)> = Vec::new();
         let mut nodes = Vec::new();
 
         for &id in &node_ids {
@@ -89,20 +83,83 @@ impl ReplicationCluster {
                 KvStore::open(data_dir.join("kv.redb")).expect("open KvStore"),
             );
 
+            // Create ProcessTable and DistributedRouter for this node.
+            let table = Arc::new(ProcessTable::new(id));
+            let (remote_tx, remote_rx) = mpsc::channel::<RouterCommand>(1024);
+            let router = Arc::new(DistributedRouter::new(
+                id,
+                Arc::clone(&table),
+                remote_tx,
+            ));
+            let runtime = Runtime::with_router(id, Arc::clone(&table), router);
+
             // Create apply channel and spawn a real state machine that applies
             // KvCommands to this node's store.
             let (apply_tx, apply_rx) = mpsc::channel::<Vec<LogEntry>>(64);
             spawn_apply_loop(Arc::clone(&store), apply_rx);
 
-            let transport = Arc::new(NodeTransport::new(id, Arc::clone(&peers)));
-            let handle = spawn_raft_node(config, apply_tx, Some(transport)).await;
+            let handle = spawn_raft_node_rebar(
+                config,
+                apply_tx,
+                &runtime,
+                Arc::clone(&registry),
+                Arc::clone(&peers),
+            )
+            .await;
 
-            peers.lock().await.insert(id, handle.inbound_tx.clone());
-
+            tables_map.insert(id, table);
+            remote_rxs.push((id, remote_rx));
             nodes.push(ReplicationNode { id, handle, store });
         }
 
-        ReplicationCluster { nodes, _tmp: tmp }
+        let tables = Arc::new(tables_map);
+
+        // Spawn relay tasks: drain each node's remote_rx and deliver to target.
+        let mut relay_handles = Vec::new();
+        for (_node_id, mut remote_rx) in remote_rxs {
+            let tables_ref = Arc::clone(&tables);
+            let h = tokio::spawn(async move {
+                while let Some(RouterCommand::Send { node_id, frame }) = remote_rx.recv().await {
+                    if let Some(target_table) = tables_ref.get(&node_id) {
+                        let _ = deliver_inbound_frame(target_table, &frame);
+                    }
+                }
+            });
+            relay_handles.push(h);
+        }
+
+        // Poll until all raft processes have registered (or timeout)
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(500);
+        loop {
+            let all_registered = {
+                let reg = registry.lock().unwrap();
+                node_ids.iter().all(|id| reg.lookup(&format!("raft:{}", *id)).is_some())
+            };
+            if all_registered {
+                break;
+            }
+            if tokio::time::Instant::now() > deadline {
+                panic!("timed out waiting for all raft processes to register in registry");
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+        {
+            let reg = registry.lock().unwrap();
+            let mut peers_guard = peers.lock().unwrap();
+            for &id in &node_ids {
+                let name = format!("raft:{}", id);
+                if let Some(entry) = reg.lookup(&name) {
+                    peers_guard.insert(id, entry.pid);
+                }
+            }
+        }
+
+        ReplicationCluster {
+            nodes,
+            _tmp: tmp,
+            _tables: tables,
+            _relay_handles: relay_handles,
+        }
     }
 
     /// Wait for leader election to stabilise.
