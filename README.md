@@ -32,7 +32,7 @@ barkeeper implements the etcd v3 API surface -- both gRPC and HTTP/JSON gateway 
 - **Rebar actor supervision** -- process supervision via BarkeepSupervisor (OneForAll strategy)
 - **Cluster membership** -- member list, add, remove, update, promote
 - **Auth (RBAC)** -- user/role/permission management with enforcement
-- **Snapshots** -- state machine snapshot types for recovery
+- **Snapshots** -- chunked streaming snapshot over gRPC and HTTP for backup/recovery
 - **Transport layer** -- gRPC-based Raft message transport for multi-node clusters
 - **Pure Rust** -- no C dependencies; storage via redb, not boltdb
 
@@ -170,7 +170,7 @@ KvStore  (MVCC store backed by redb)
 | Watch | Watch (bidirectional stream) | Implemented |
 | Lease | LeaseGrant, LeaseRevoke, LeaseKeepAlive, LeaseTimeToLive, LeaseLeases | Implemented |
 | Cluster | MemberAdd, MemberRemove, MemberUpdate, MemberList, MemberPromote | Implemented |
-| Maintenance | Status, Defragment, Alarm, Hash | Implemented |
+| Maintenance | Status, Defragment, Alarm, Hash, Snapshot | Implemented |
 | Auth | AuthEnable, UserAdd, UserGet, UserList, UserDelete, UserChangePassword, RoleAdd, RoleGet, RoleList, RoleDelete, RoleGrantPermission, RoleRevokePermission, UserGrantRole, UserRevokeRole | Implemented |
 
 ### HTTP/JSON Gateway (port 2380)
@@ -188,6 +188,10 @@ KvStore  (MVCC store backed by redb)
 | `POST /v3/lease/leases` | List all leases |
 | `POST /v3/cluster/member/list` | List cluster members |
 | `POST /v3/maintenance/status` | Cluster status |
+| `POST /v3/maintenance/defragment` | Trigger database compaction |
+| `POST /v3/maintenance/alarm` | Get/activate/deactivate alarms |
+| `POST /v3/maintenance/snapshot` | Download database snapshot |
+| `POST /v3/watch` | Watch keys via Server-Sent Events (SSE) |
 
 Byte fields (key, value) are base64-encoded in JSON, matching etcd's HTTP gateway behavior.
 
@@ -206,7 +210,7 @@ Byte fields (key, value) are base64-encoded in JSON, matching etcd's HTTP gatewa
 cargo test
 ```
 
-96 tests across 17 test suites covering Raft consensus, log store, KV store (MVCC, transactions, compaction), etcd HTTP gateway API compatibility, watch notifications (including revision replay), lease expiry, TLS configuration, auth enforcement, multi-node clustering, and gRPC transport.
+99 tests across 16 test suites covering Raft consensus, log store, KV store (MVCC, transactions, compaction), etcd HTTP gateway API compatibility, watch notifications (including revision replay), lease expiry, TLS configuration, auth enforcement, multi-node clustering, multi-node data replication, and gRPC transport.
 
 ## Differences from etcd
 

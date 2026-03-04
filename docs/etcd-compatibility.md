@@ -23,7 +23,7 @@ Tested against: **etcd 3.5.17**
 
 | RPC | gRPC | HTTP Gateway | Status | Notes |
 |-----|------|-------------|--------|-------|
-| Watch | Yes | Not exposed | Full | Bidirectional streaming. Supports CreateRequest, CancelRequest, ProgressRequest (stub response), and revision-based history replay via start_revision. |
+| Watch | Yes | `POST /v3/watch` (SSE) | Full | gRPC bidirectional streaming + HTTP SSE. Supports CreateRequest, CancelRequest, ProgressRequest (stub response), and revision-based history replay via start_revision. |
 
 ### Lease Service (`etcdserverpb.Lease`)
 
@@ -50,11 +50,11 @@ Tested against: **etcd 3.5.17**
 | RPC | gRPC | HTTP Gateway | Status | Notes |
 |-----|------|-------------|--------|-------|
 | Status | Yes | `POST /v3/maintenance/status` | Full | Reports version, dbSize, leader, raft term |
-| Alarm | Yes | Not exposed | Stub | Always returns empty alarm list |
-| Defragment | Yes | Not exposed | Stub | No-op; redb manages its own compaction |
+| Alarm | Yes | `POST /v3/maintenance/alarm` | Full | GET/ACTIVATE/DEACTIVATE with in-memory AlarmMember store (NOSPACE, CORRUPT) |
+| Defragment | Yes | `POST /v3/maintenance/defragment` | Full | Triggers real redb compaction via empty write transaction commit |
 | Hash | Yes | Not exposed | Stub | Returns zero hash |
 | HashKV | Yes | Not exposed | Stub | Returns zero hash |
-| Snapshot | Yes | Not exposed | Stub | Returns an empty single-chunk snapshot |
+| Snapshot | Yes | `POST /v3/maintenance/snapshot` | Full | Chunked 64KB streaming snapshot of the database file |
 | MoveLeader | Yes | Not exposed | Stub | Returns UNIMPLEMENTED (single-node) |
 | Downgrade | Yes | Not exposed | Stub | Returns UNIMPLEMENTED |
 
@@ -180,9 +180,9 @@ Nested `Txn` inside a `Txn` request op returns `UNIMPLEMENTED`.
 
 ### Maintenance stubs
 
-`Alarm`, `Defragment`, `Hash`, `HashKV`, and `Snapshot` return valid
-but empty/zero responses. `MoveLeader` and `Downgrade` return
-`UNIMPLEMENTED`.
+`Hash` and `HashKV` return zero hashes. `MoveLeader` and `Downgrade`
+return `UNIMPLEMENTED`. `Alarm`, `Defragment`, and `Snapshot` are fully
+implemented.
 
 ### Watch ProgressRequest
 

@@ -24,7 +24,7 @@ goroutines.
 | API       | gRPC | HTTP Gateway |
 |-----------|------|--------------|
 | KV        | Yes  | Yes          |
-| Watch     | Yes  | No (gRPC streaming only) |
+| Watch     | Yes  | Yes (SSE at `/v3/watch`) |
 | Lease     | Yes  | Yes          |
 | Cluster   | Yes  | Yes          |
 | Maintenance | Yes | Yes        |
@@ -63,6 +63,9 @@ BarkeepSupervisor (OneForAll, max_restarts=5/30s)<br>
 +-- StateMachine         -- applies committed entries to KvStore<br>
 |   +-- KvStore          -- MVCC store (redb: kv.redb)<br>
 |<br>
++-- LeaseExpiryTimer     -- supervised Rebar child (ChildEntry, Permanent)<br>
+|                           checks for expired leases, deletes keys, notifies watchers<br>
+|<br>
 +-- WatchHub             -- fan-out change notifications (Arc<WatchHub>)<br>
 +-- LeaseManager         -- TTL tracking, expiry detection (Arc<LeaseManager>)<br>
 +-- ClusterManager       -- membership tracking (Arc<ClusterManager>)<br>
@@ -76,7 +79,7 @@ BarkeepSupervisor (OneForAll)<br>
 +-- RaftProcess          -- consensus engine<br>
 +-- StoreProcess         -- MVCC KV store<br>
 +-- WatchProcess         -- change notification<br>
-+-- LeaseProcess         -- TTL management<br>
++-- LeaseProcess         -- TTL management (partially migrated: expiry timer supervised)<br>
 +-- ClusterProcess       -- membership<br>
 +-- AuthProcess          -- RBAC<br>
 ```
@@ -465,7 +468,8 @@ CLI entry point using clap. Parses `--name`, `--data-dir`,
 - **`cluster_service.rs`** -- gRPC Cluster service: `MemberList`, `MemberAdd`,
   `MemberRemove`, `MemberUpdate`, `MemberPromote`.
 - **`maintenance_service.rs`** -- gRPC Maintenance service: `Status`,
-  `HashKV`, `Alarm`, `Defragment`, `Snapshot`.
+  `HashKV`, `Alarm` (GET/ACTIVATE/DEACTIVATE with in-memory alarm store),
+  `Defragment` (real redb compaction), `Snapshot` (chunked 64KB streaming).
 - **`auth_service.rs`** -- gRPC Auth service: `AuthEnable`, `AuthDisable`,
   `UserAdd`, `UserDelete`, `UserChangePassword`, `UserGrant`, `UserRevoke`,
   `UserList`, `UserGet`, `RoleAdd`, `RoleDelete`, `RoleGrant`, `RoleRevoke`,
@@ -480,7 +484,8 @@ CLI entry point using clap. Parses `--name`, `--data-dir`,
   elections, log replication, commit advancement. Zero async, zero I/O.
 - **`node.rs`** -- `RaftHandle` and `spawn_raft_node()`. Wraps RaftCore in a
   tokio select loop handling election/heartbeat timers, client proposals, and
-  inbound peer messages.
+  inbound peer messages. Fills AppendEntries with log entries and prev_log_term
+  from the LogStore before sending to followers.
 - **`state.rs`** -- `RaftState`, `RaftRole` (Follower/Candidate/Leader),
   `PersistentState`, `VolatileState`, `LeaderState` (next_index/match_index).
 - **`messages.rs`** -- `LogEntry`, `LogEntryData` (Command/ConfigChange/Noop),
@@ -498,7 +503,8 @@ CLI entry point using clap. Parses `--name`, `--data-dir`,
 ### `src/kv/`
 
 - **`store.rs`** -- MVCC KvStore backed by redb. Compound key encoding,
-  `put`, `range`, `delete_range`, `txn` (compare-and-swap), `compact`.
+  `put`, `range`, `delete_range`, `txn` (compare-and-swap), `compact`,
+  `snapshot_bytes` (full db snapshot), `compact_db` (redb compaction).
   Uses three redb tables: `kv`, `revisions`, `kv_meta`.
 - **`state_machine.rs`** -- `StateMachine` apply loop and `KvCommand` enum
   (Put/DeleteRange/Txn/Compact). Spawned via `spawn_state_machine()`, receives

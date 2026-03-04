@@ -448,6 +448,7 @@ pub struct GatewayState {
     pub lease_manager: Arc<LeaseManager>,
     pub cluster_manager: Arc<ClusterManager>,
     pub auth_manager: Arc<AuthManager>,
+    pub alarms: Arc<Mutex<Vec<AlarmMember>>>,
     pub cluster_id: u64,
     pub member_id: u64,
     pub raft_term: Arc<AtomicU64>,
@@ -517,7 +518,11 @@ Follow etcd's grpc-gateway URL structure:
 /v3/lease/timetolive  -- Lease TimeToLive
 /v3/lease/leases      -- Lease Leases
 /v3/cluster/member/list  -- Cluster MemberList
-/v3/maintenance/status   -- Maintenance Status
+/v3/maintenance/status      -- Maintenance Status
+/v3/maintenance/defragment  -- Maintenance Defragment
+/v3/maintenance/alarm       -- Maintenance Alarm
+/v3/maintenance/snapshot    -- Maintenance Snapshot
+/v3/watch                   -- Watch (SSE stream)
 /v3/auth/enable       -- Auth Enable
 /v3/auth/disable      -- Auth Disable
 /v3/auth/status       -- Auth Status
@@ -595,6 +600,7 @@ async fn start_test_instance() -> (SocketAddr, tempfile::TempDir) {
         });
     }
 
+    let alarms = Arc::new(std::sync::Mutex::new(vec![]));
     let app = gateway::create_router(
         raft_handle.clone(),
         Arc::clone(&store),
@@ -604,6 +610,7 @@ async fn start_test_instance() -> (SocketAddr, tempfile::TempDir) {
         1, 1,
         Arc::clone(&raft_handle.current_term),
         Arc::clone(&auth_manager),
+        alarms,
     );
 
     let http_port = portpicker::pick_unused_port().expect("no free port");

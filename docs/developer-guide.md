@@ -233,10 +233,11 @@ cargo test
 
 ### Test Files
 
-The test suite contains **89 tests** across 14 files in `tests/`:
+The test suite contains **99 tests** across 16 files:
 
 | File                              | Tests | Description                                                     |
 |-----------------------------------|-------|-----------------------------------------------------------------|
+| `src/tls.rs` (unit tests)         | 7     | TLS configuration, auto-TLS cert generation, tonic/acceptor     |
 | `compat_test.rs`                  | 30    | End-to-end etcd compatibility tests against the HTTP gateway    |
 | `integration_test.rs`             | 5     | gRPC integration tests using tonic clients                      |
 | `kv_store_test.rs`                | 8     | MVCC key-value store unit tests (put, get, range, delete, compact) |
@@ -251,6 +252,7 @@ The test suite contains **89 tests** across 14 files in `tests/`:
 | `watch_revision_test.rs`          | 4     | Revision-based history replay and `changes_since` tests         |
 | `auth_test.rs`                    | 1     | Auth enforcement (unauthenticated rejection, token validation)  |
 | `cluster_test.rs`                 | 3     | Multi-node Raft cluster integration tests (election, leader)    |
+| `replication_test.rs`             | 3     | Multi-node data replication tests (put, multi-put, delete)      |
 
 ---
 
@@ -287,10 +289,10 @@ barkeeper/
 |   |   |-- lease_service.rs#   gRPC Lease service (Grant, Revoke, KeepAlive, TimeToLive)
 |   |   |-- cluster_service.rs  # gRPC Cluster service (MemberList, MemberAdd, etc.)
 |   |   |-- auth_service.rs #   gRPC Auth service (AuthEnable, UserAdd, RoleAdd, etc.)
-|   |   |-- maintenance_service.rs # gRPC Maintenance service (Status, Defragment stubs)
+|   |   |-- maintenance_service.rs # gRPC Maintenance service (Status, Defragment, Alarm, Snapshot)
 |   |
 |   |-- kv/                 # Key-value storage layer
-|   |   |-- store.rs        #   MVCC KV store backed by redb (put, range, delete, txn, compact, changes_since)
+|   |   |-- store.rs        #   MVCC KV store backed by redb (put, range, delete, txn, compact, snapshot, changes_since)
 |   |   |-- state_machine.rs#   Raft state machine (logs committed entries for observability)
 |   |
 |   |-- raft/               # Raft consensus implementation
@@ -323,11 +325,15 @@ barkeeper/
 |-- tests/                  # Integration and unit test files (see table above)
 |
 |-- benchmark/              # Performance benchmarking scripts and results
-    |-- run_barkeeper_benchmark.sh
-    |-- run_etcd_benchmark.sh
-    |-- compare.sh
-    |-- results/
-    |-- RESULTS.md
+|   |-- run_barkeeper_benchmark.sh
+|   |-- run_etcd_benchmark.sh
+|   |-- run_perf_benchmark.sh  # HTTP throughput/latency benchmarks
+|   |-- compare.sh
+|   |-- results/
+|   |-- RESULTS.md
+|
+|-- benches/                # Criterion microbenchmarks
+    |-- kv_bench.rs         # KvStore benchmarks (put, range, txn)
 ```
 
 ---
