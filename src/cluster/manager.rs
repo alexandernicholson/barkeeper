@@ -3,6 +3,8 @@ use std::sync::Arc;
 
 use tokio::sync::Mutex;
 
+use crate::cluster::membership_sync::MembershipSync;
+
 /// A cluster member tracked in memory.
 #[derive(Debug, Clone)]
 pub struct Member {
@@ -13,15 +15,18 @@ pub struct Member {
     pub is_learner: bool,
 }
 
-/// In-memory cluster membership manager.
+/// In-memory cluster membership manager with optional SWIM backing.
 ///
-/// Tracks the set of members that belong to this cluster. The actual SWIM
-/// bridge will be added when we integrate with Rebar's cluster layer;
-/// for now every mutation is local.
+/// Tracks the set of members that belong to this cluster. When a
+/// `MembershipSync` is attached, `member_list()` supplements the
+/// locally-tracked members with peers discovered via the SWIM protocol,
+/// giving the Cluster API visibility into the live cluster topology.
 pub struct ClusterManager {
     members: Arc<Mutex<HashMap<u64, Member>>>,
     cluster_id: u64,
     next_id: Arc<Mutex<u64>>,
+    /// Optional SWIM membership sync for peer discovery.
+    membership_sync: Option<Arc<std::sync::Mutex<MembershipSync>>>,
 }
 
 impl ClusterManager {
@@ -30,7 +35,16 @@ impl ClusterManager {
             members: Arc::new(Mutex::new(HashMap::new())),
             cluster_id,
             next_id: Arc::new(Mutex::new(100)), // start generated IDs at 100
+            membership_sync: None,
         }
+    }
+
+    /// Set the SWIM membership sync for this manager.
+    ///
+    /// When set, `member_list()` will include peers discovered via the
+    /// SWIM protocol that are not already tracked as explicit members.
+    pub fn set_membership_sync(&mut self, sync: Arc<std::sync::Mutex<MembershipSync>>) {
+        self.membership_sync = Some(sync);
     }
 
     /// Return the cluster ID.
@@ -63,8 +77,30 @@ impl ClusterManager {
     }
 
     /// List all members.
+    ///
+    /// When a `MembershipSync` is attached, SWIM-discovered peers that
+    /// are not already tracked as explicit members are included with
+    /// auto-generated entries.
     pub async fn member_list(&self) -> Vec<Member> {
-        self.members.lock().await.values().cloned().collect()
+        let mut members: Vec<Member> = self.members.lock().await.values().cloned().collect();
+
+        // Supplement with SWIM-discovered peers not already tracked.
+        if let Some(ref sync) = self.membership_sync {
+            let sync = sync.lock().unwrap();
+            for (node_id, addr) in sync.peer_addrs() {
+                if !members.iter().any(|m| m.id == *node_id) {
+                    members.push(Member {
+                        id: *node_id,
+                        name: String::new(),
+                        peer_urls: vec![format!("http://{}", addr)],
+                        client_urls: vec![],
+                        is_learner: false,
+                    });
+                }
+            }
+        }
+
+        members
     }
 
     /// Add a new member. Returns the newly created member.
