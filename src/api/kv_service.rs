@@ -5,6 +5,7 @@ use tonic::{Request, Response, Status};
 use crate::kv::store::{
     KvStore, TxnCompare, TxnCompareResult, TxnCompareTarget, TxnOp, TxnOpResponse,
 };
+use crate::lease::manager::LeaseManager;
 use crate::proto::etcdserverpb::compare::{CompareResult, CompareTarget, TargetUnion};
 use crate::proto::etcdserverpb::kv_server::Kv;
 use crate::proto::etcdserverpb::{
@@ -18,15 +19,23 @@ use crate::watch::hub::WatchHub;
 pub struct KvService {
     store: Arc<KvStore>,
     watch_hub: Arc<WatchHub>,
+    lease_manager: Arc<LeaseManager>,
     cluster_id: u64,
     member_id: u64,
 }
 
 impl KvService {
-    pub fn new(store: Arc<KvStore>, watch_hub: Arc<WatchHub>, cluster_id: u64, member_id: u64) -> Self {
+    pub fn new(
+        store: Arc<KvStore>,
+        watch_hub: Arc<WatchHub>,
+        lease_manager: Arc<LeaseManager>,
+        cluster_id: u64,
+        member_id: u64,
+    ) -> Self {
         KvService {
             store,
             watch_hub,
+            lease_manager,
             cluster_id,
             member_id,
         }
@@ -90,6 +99,11 @@ impl Kv for KvService {
             lease: req.lease,
         };
         self.watch_hub.notify(&req.key, 0, notify_kv, result.prev_kv.clone()).await;
+
+        // Attach the key to its lease so the expiry timer can clean it up.
+        if req.lease != 0 {
+            self.lease_manager.attach_key(req.lease, req.key.clone()).await;
+        }
 
         let prev_kv = if req.prev_kv {
             result.prev_kv

@@ -496,6 +496,11 @@ async fn handle_put(
             };
             state.watch_hub.notify(&key, 0, notify_kv, result.prev_kv.clone()).await;
 
+            // Attach the key to its lease so the expiry timer can clean it up.
+            if lease_id != 0 {
+                state.lease_manager.attach_key(lease_id, key.clone()).await;
+            }
+
             let prev_kv = if req.prev_kv.unwrap_or(false) {
                 result.prev_kv.as_ref().map(proto_kv_to_json)
             } else {
