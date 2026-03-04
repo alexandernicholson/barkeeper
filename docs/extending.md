@@ -373,11 +373,11 @@ All handlers share `GatewayState` via axum's state extraction:
 ```rust
 #[derive(Clone)]
 pub struct GatewayState {
-    pub store: Arc<KvStore>,
-    pub watch_hub: Arc<WatchHub>,
+    pub store: KvStoreActorHandle,
+    pub watch_hub: WatchHubActorHandle,
     pub lease_manager: Arc<LeaseManager>,
-    pub cluster_manager: Arc<ClusterManager>,
-    pub auth_manager: Arc<AuthManager>,
+    pub cluster_manager: ClusterActorHandle,
+    pub auth_manager: AuthActorHandle,
     pub alarms: Arc<Mutex<Vec<AlarmMember>>>,
     pub cluster_id: u64,
     pub member_id: u64,

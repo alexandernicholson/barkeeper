@@ -26,34 +26,6 @@ pub struct ProposeResult {
     pub txn_result: Option<TxnResult>,
 }
 
-/// Commands sent to the StoreProcess actor.
-pub enum StoreCmd {
-    /// Apply a committed KV command to the store.
-    Apply {
-        command: KvCommand,
-        reply: oneshot::Sender<Result<ApplyResult, String>>,
-    },
-}
-
-/// Result of applying a command to the store.
-pub enum ApplyResult {
-    Put(PutResult),
-    Delete(DeleteResult),
-    Txn(TxnResult),
-    Compact,
-}
-
-/// Commands sent to the WatchProcess actor.
-pub enum WatchCmd {
-    /// Notify watchers of a mutation event.
-    Notify {
-        key: Vec<u8>,
-        event_type: i32, // 0 = PUT, 1 = DELETE
-        kv: mvccpb::KeyValue,
-        prev_kv: Option<mvccpb::KeyValue>,
-    },
-}
-
 /// Commands sent to the WatchHubActor.
 pub enum WatchHubCmd {
     /// Create a new watch on a key or range. Returns the watch_id and an event
@@ -77,16 +49,6 @@ pub enum WatchHubCmd {
         prev_kv: Option<mvccpb::KeyValue>,
     },
 }
-
-/// Commands sent to the LeaseProcess actor.
-pub enum LeaseCmd {
-    /// Check for expired leases (called by timer tick).
-    CheckExpiry {
-        reply: oneshot::Sender<Vec<ExpiredLease>>,
-    },
-}
-
-pub use crate::lease::manager::ExpiredLease;
 
 use crate::auth::manager::{Permission, Role, User};
 

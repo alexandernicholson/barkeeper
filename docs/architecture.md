@@ -72,15 +72,15 @@ graph TD
 |-----------|--------|-----|
 | RaftNode | Migrated | `spawn_raft_node_rebar` — Rebar distributed actor with `ProcessContext` mailbox |
 | LeaseExpiryTimer | Migrated | Supervised `ChildEntry` (Permanent restart) under `BarkeepSupervisor` |
-| KvStore | Not yet | Shared via `Arc`, accessed directly by service layer |
-| WatchHub | Not yet | Shared via `Arc`, fan-out notifications |
-| ClusterManager | Not yet | Shared via `Arc`, SWIM-backed membership tracking |
-| AuthManager | Not yet | Shared via `Arc`, RBAC |
+| KvStore | Migrated | `spawn_kv_store_actor` — Rebar actor with `KvStoreCmd` typed commands, `spawn_blocking` for all redb ops |
+| WatchHub | Migrated | `spawn_watch_hub_actor` — Rebar actor with `WatchHubCmd`, streaming via mpsc channels |
+| ClusterManager | Migrated | `spawn_cluster_actor` — Rebar actor with `ClusterCmd`, SWIM-backed membership |
+| AuthManager | Migrated | `spawn_auth_actor` — Rebar actor with `AuthCmd`, `spawn_blocking` for bcrypt |
 
 Actor command enums are defined in `src/actors/commands.rs`:
-`RaftCmd`, `StoreCmd`, `WatchCmd`, `LeaseCmd`. Each uses `oneshot::Sender`
-for request-response patterns. These are used by the non-Rebar code paths
-and will be replaced as components migrate to Rebar actors.
+`RaftCmd`, `ClusterCmd`, `AuthCmd`, `KvStoreCmd`, `WatchHubCmd`. Each uses
+`oneshot::Sender` for request-response patterns (except fire-and-forget
+variants like `WatchHubCmd::Notify`).
 
 The SWIM protocol runs in a dedicated `tokio::spawn` tick loop alongside the
 supervisor tree. It gossips with peer nodes to maintain a live cluster view.

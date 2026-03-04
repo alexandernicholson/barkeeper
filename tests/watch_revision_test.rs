@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use barkeeper::kv::actor::spawn_kv_store_actor;
 use barkeeper::kv::store::KvStore;
-use barkeeper::watch::hub::WatchHub;
+use barkeeper::watch::actor::spawn_watch_hub_actor;
 use rebar_core::runtime::Runtime;
 use tokio::time::{timeout, Duration};
 
@@ -61,7 +61,8 @@ async fn test_watchhub_replays_history() {
     let kv_store = KvStore::open(dir.path().join("kv.redb")).unwrap();
     let kv_runtime = Runtime::new(1);
     let handle = spawn_kv_store_actor(&kv_runtime, kv_store).await;
-    let hub = WatchHub::with_store(handle.clone());
+    let watch_runtime = Runtime::new(1);
+    let hub = spawn_watch_hub_actor(&watch_runtime, Some(handle.clone())).await;
 
     // Create some history via the actor handle.
     handle.put(b"hist".to_vec(), b"v1".to_vec(), 0).await.unwrap(); // rev 1

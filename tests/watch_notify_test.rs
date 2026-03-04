@@ -4,15 +4,17 @@ use std::sync::Arc;
 use tokio::time::{timeout, Duration};
 
 use barkeeper::kv::store::KvStore;
-use barkeeper::watch::hub::WatchHub;
 use barkeeper::proto::mvccpb;
+use barkeeper::watch::actor::spawn_watch_hub_actor;
+use rebar_core::runtime::Runtime;
 
 /// After a put, the WatchHub should receive a notification for watchers on that key.
 #[tokio::test]
 async fn test_watch_hub_receives_put_notification() {
     let dir = tempfile::tempdir().unwrap();
     let store = Arc::new(KvStore::open(dir.path().join("kv.redb")).unwrap());
-    let hub = Arc::new(WatchHub::new());
+    let runtime = Runtime::new(1);
+    let hub = spawn_watch_hub_actor(&runtime, None).await;
 
     // Create a watch on key "foo".
     let (watch_id, mut event_rx) = hub.create_watch(b"foo".to_vec(), vec![], 0).await;
@@ -28,7 +30,7 @@ async fn test_watch_hub_receives_put_notification() {
         value: b"bar".to_vec(),
         lease: 0,
     };
-    hub.notify(b"foo", 0, kv, None).await; // 0 = PUT
+    hub.notify(b"foo".to_vec(), 0, kv, None).await; // 0 = PUT
 
     // The watcher should receive the event.
     let event = timeout(Duration::from_secs(2), event_rx.recv())
@@ -49,7 +51,8 @@ async fn test_watch_hub_receives_put_notification() {
 async fn test_watch_hub_receives_delete_notification() {
     let dir = tempfile::tempdir().unwrap();
     let store = Arc::new(KvStore::open(dir.path().join("kv.redb")).unwrap());
-    let hub = Arc::new(WatchHub::new());
+    let runtime = Runtime::new(1);
+    let hub = spawn_watch_hub_actor(&runtime, None).await;
 
     // Put then create watch.
     store.put(b"delme", b"val", 0).unwrap();
@@ -67,7 +70,7 @@ async fn test_watch_hub_receives_delete_notification() {
         value: vec![],
         lease: 0,
     };
-    hub.notify(b"delme", 1, kv, None).await; // 1 = DELETE
+    hub.notify(b"delme".to_vec(), 1, kv, None).await; // 1 = DELETE
 
     let event = timeout(Duration::from_secs(2), event_rx.recv())
         .await
@@ -80,7 +83,8 @@ async fn test_watch_hub_receives_delete_notification() {
 /// Watch with prefix range_end should match multiple keys.
 #[tokio::test]
 async fn test_watch_hub_prefix_notification() {
-    let hub = Arc::new(WatchHub::new());
+    let runtime = Runtime::new(1);
+    let hub = spawn_watch_hub_actor(&runtime, None).await;
 
     // Watch prefix "pfx/" — range_end is "pfx0" (next byte after '/')
     let (_watch_id, mut event_rx) = hub
@@ -96,7 +100,7 @@ async fn test_watch_hub_prefix_notification() {
         value: b"val".to_vec(),
         lease: 0,
     };
-    hub.notify(b"pfx/a", 0, kv, None).await;
+    hub.notify(b"pfx/a".to_vec(), 0, kv, None).await;
 
     let event = timeout(Duration::from_secs(2), event_rx.recv())
         .await
@@ -113,7 +117,7 @@ async fn test_watch_hub_prefix_notification() {
         value: b"nope".to_vec(),
         lease: 0,
     };
-    hub.notify(b"other", 0, kv2, None).await;
+    hub.notify(b"other".to_vec(), 0, kv2, None).await;
 
     // Give it a moment — should NOT receive anything.
     let result = timeout(Duration::from_millis(200), event_rx.recv()).await;

@@ -4,14 +4,16 @@ use std::sync::Arc;
 use tokio::time::{timeout, Duration};
 
 use barkeeper::kv::store::KvStore;
-use barkeeper::watch::hub::WatchHub;
+use barkeeper::watch::actor::spawn_watch_hub_actor;
+use rebar_core::runtime::Runtime;
 
 /// A put inside a txn should fire a watch notification.
 #[tokio::test]
 async fn test_txn_put_fires_watch_notification() {
     let dir = tempfile::tempdir().unwrap();
     let store = Arc::new(KvStore::open(dir.path().join("kv.redb")).unwrap());
-    let hub = Arc::new(WatchHub::new());
+    let runtime = Runtime::new(1);
+    let hub = spawn_watch_hub_actor(&runtime, None).await;
 
     // Watch key "txnkey".
     let (_wid, mut rx) = hub.create_watch(b"txnkey".to_vec(), vec![], 0).await;
@@ -43,7 +45,7 @@ async fn test_txn_put_fires_watch_notification() {
                     value: b"txnval".to_vec(),
                     lease: 0,
                 };
-                hub.notify(b"txnkey", 0, kv, r.prev_kv.clone()).await;
+                hub.notify(b"txnkey".to_vec(), 0, kv, r.prev_kv.clone()).await;
             }
             _ => {}
         }
@@ -65,7 +67,8 @@ async fn test_txn_put_fires_watch_notification() {
 async fn test_txn_delete_fires_watch_notification() {
     let dir = tempfile::tempdir().unwrap();
     let store = Arc::new(KvStore::open(dir.path().join("kv.redb")).unwrap());
-    let hub = Arc::new(WatchHub::new());
+    let runtime = Runtime::new(1);
+    let hub = spawn_watch_hub_actor(&runtime, None).await;
 
     // Pre-populate key.
     store.put(b"delkey", b"val", 0).unwrap();
@@ -96,7 +99,7 @@ async fn test_txn_delete_fires_watch_notification() {
                         value: vec![],
                         lease: 0,
                     };
-                    hub.notify(&prev.key, 1, tombstone, Some(prev.clone())).await;
+                    hub.notify(prev.key.clone(), 1, tombstone, Some(prev.clone())).await;
                 }
             }
             _ => {}
