@@ -5,10 +5,13 @@ use tokio::sync::mpsc;
 use tonic::transport::Server;
 
 use crate::api::kv_service::KvService;
+use crate::api::watch_service::WatchService;
 use crate::kv::state_machine::spawn_state_machine;
 use crate::kv::store::KvStore;
 use crate::proto::etcdserverpb::kv_server::KvServer;
+use crate::proto::etcdserverpb::watch_server::WatchServer;
 use crate::raft::node::{spawn_raft_node, RaftConfig};
+use crate::watch::hub::WatchHub;
 
 /// The top-level barkeeper gRPC server.
 pub struct BarkeepServer;
@@ -42,11 +45,16 @@ impl BarkeepServer {
         let member_id = config.node_id;
         let kv_service = KvService::new(raft_handle, Arc::clone(&store), cluster_id, member_id);
 
+        // Create the Watch hub and gRPC service.
+        let watch_hub = Arc::new(WatchHub::new());
+        let watch_service = WatchService::new(Arc::clone(&watch_hub), cluster_id, member_id);
+
         tracing::info!(%addr, "starting gRPC server");
 
         // Start the tonic gRPC server.
         Server::builder()
             .add_service(KvServer::new(kv_service))
+            .add_service(WatchServer::new(watch_service))
             .serve(addr)
             .await?;
 
