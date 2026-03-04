@@ -77,11 +77,15 @@ impl Kv for KvService {
             .map_err(|e| Status::internal(format!("put failed: {}", e)))?;
 
         // Notify watchers of the put event.
+        let (create_rev, ver) = match &result.prev_kv {
+            Some(prev) => (prev.create_revision, prev.version + 1),
+            None => (result.revision, 1),
+        };
         let notify_kv = crate::proto::mvccpb::KeyValue {
             key: req.key.clone(),
-            create_revision: result.revision,
+            create_revision: create_rev,
             mod_revision: result.revision,
-            version: 1,
+            version: ver,
             value: req.value.clone(),
             lease: req.lease,
         };

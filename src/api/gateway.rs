@@ -482,11 +482,15 @@ async fn handle_put(
     match state.store.put(&key, &value, lease_id) {
         Ok(result) => {
             // Notify watchers of the put event.
+            let (create_rev, ver) = match &result.prev_kv {
+                Some(prev) => (prev.create_revision, prev.version + 1),
+                None => (result.revision, 1),
+            };
             let notify_kv = crate::proto::mvccpb::KeyValue {
                 key: key.clone(),
-                create_revision: result.revision,
+                create_revision: create_rev,
                 mod_revision: result.revision,
-                version: 1,
+                version: ver,
                 value: value.clone(),
                 lease: lease_id,
             };
@@ -633,6 +637,11 @@ async fn handle_txn(
 
     match state.store.txn(compares, success, failure) {
         Ok(result) => {
+            // TODO: Wire txn watch notifications. Individual put/delete operations
+            // within a txn should notify watchers, but this requires iterating over
+            // the TxnOpResponse results and extracting the mutated keys. This will
+            // be wired in the StoreProcess layer later.
+
             let responses: Vec<TxnResponseOp> = result
                 .responses
                 .into_iter()
