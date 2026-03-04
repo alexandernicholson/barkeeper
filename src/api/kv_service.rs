@@ -181,16 +181,51 @@ impl Kv for KvService {
             .map(|op| convert_request_op(op))
             .collect::<Result<Vec<_>, _>>()?;
 
+        // Clone ops before the store consumes them — needed for watch notifications.
+        let success_ops = success.clone();
+        let failure_ops = failure.clone();
+
         // Execute the transaction directly on the store.
         let result = self
             .store
             .txn(compares, success, failure)
             .map_err(|e| Status::internal(format!("txn failed: {}", e)))?;
 
-        // TODO: Wire txn watch notifications. Individual put/delete operations
-        // within a txn should notify watchers, but this requires iterating over
-        // the TxnOpResponse results and extracting the mutated keys. This will
-        // be wired in the StoreProcess layer later.
+        // Notify watchers for txn mutations.
+        let executed_ops = if result.succeeded { &success_ops } else { &failure_ops };
+        for (op, resp) in executed_ops.iter().zip(result.responses.iter()) {
+            match (op, resp) {
+                (TxnOp::Put { key, value, lease_id }, TxnOpResponse::Put(r)) => {
+                    let (create_rev, ver) = match &r.prev_kv {
+                        Some(prev) => (prev.create_revision, prev.version + 1),
+                        None => (r.revision, 1),
+                    };
+                    let notify_kv = crate::proto::mvccpb::KeyValue {
+                        key: key.clone(),
+                        create_revision: create_rev,
+                        mod_revision: r.revision,
+                        version: ver,
+                        value: value.clone(),
+                        lease: *lease_id,
+                    };
+                    self.watch_hub.notify(key, 0, notify_kv, r.prev_kv.clone()).await;
+                }
+                (TxnOp::DeleteRange { .. }, TxnOpResponse::DeleteRange(r)) => {
+                    for prev in &r.prev_kvs {
+                        let tombstone = crate::proto::mvccpb::KeyValue {
+                            key: prev.key.clone(),
+                            create_revision: 0,
+                            mod_revision: r.revision,
+                            version: 0,
+                            value: vec![],
+                            lease: 0,
+                        };
+                        self.watch_hub.notify(&prev.key, 1, tombstone, Some(prev.clone())).await;
+                    }
+                }
+                _ => {} // Range ops don't need notifications
+            }
+        }
 
         // Convert results to proto responses.
         let responses: Vec<ResponseOp> = result

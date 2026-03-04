@@ -656,13 +656,46 @@ async fn handle_txn(
 
     let success = convert_ops(&req.success);
     let failure = convert_ops(&req.failure);
+    let success_clone = success.clone();
+    let failure_clone = failure.clone();
 
     match state.store.txn(compares, success, failure) {
         Ok(result) => {
-            // TODO: Wire txn watch notifications. Individual put/delete operations
-            // within a txn should notify watchers, but this requires iterating over
-            // the TxnOpResponse results and extracting the mutated keys. This will
-            // be wired in the StoreProcess layer later.
+            // Notify watchers for txn mutations.
+            let executed_ops = if result.succeeded { &success_clone } else { &failure_clone };
+            for (op, resp) in executed_ops.iter().zip(result.responses.iter()) {
+                match (op, resp) {
+                    (TxnOp::Put { key, value, lease_id }, TxnOpResponse::Put(r)) => {
+                        let (create_rev, ver) = match &r.prev_kv {
+                            Some(prev) => (prev.create_revision, prev.version + 1),
+                            None => (r.revision, 1),
+                        };
+                        let notify_kv = crate::proto::mvccpb::KeyValue {
+                            key: key.clone(),
+                            create_revision: create_rev,
+                            mod_revision: r.revision,
+                            version: ver,
+                            value: value.clone(),
+                            lease: *lease_id,
+                        };
+                        state.watch_hub.notify(key, 0, notify_kv, r.prev_kv.clone()).await;
+                    }
+                    (TxnOp::DeleteRange { .. }, TxnOpResponse::DeleteRange(r)) => {
+                        for prev in &r.prev_kvs {
+                            let tombstone = crate::proto::mvccpb::KeyValue {
+                                key: prev.key.clone(),
+                                create_revision: 0,
+                                mod_revision: r.revision,
+                                version: 0,
+                                value: vec![],
+                                lease: 0,
+                            };
+                            state.watch_hub.notify(&prev.key, 1, tombstone, Some(prev.clone())).await;
+                        }
+                    }
+                    _ => {} // Range ops don't need notifications
+                }
+            }
 
             let responses: Vec<TxnResponseOp> = result
                 .responses
