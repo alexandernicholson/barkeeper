@@ -5,6 +5,7 @@ use tokio::sync::mpsc;
 use tonic::transport::Server;
 
 use crate::api::cluster_service::ClusterService;
+use crate::api::gateway;
 use crate::api::kv_service::KvService;
 use crate::api::lease_service::LeaseService;
 use crate::api::watch_service::WatchService;
@@ -49,7 +50,12 @@ impl BarkeepServer {
         // Create the KV gRPC service.
         let cluster_id = 1;
         let member_id = config.node_id;
-        let kv_service = KvService::new(raft_handle, Arc::clone(&store), cluster_id, member_id);
+        let kv_service = KvService::new(
+            raft_handle.clone(),
+            Arc::clone(&store),
+            cluster_id,
+            member_id,
+        );
 
         // Create the Watch hub and gRPC service.
         let watch_hub = Arc::new(WatchHub::new());
@@ -71,6 +77,27 @@ impl BarkeepServer {
             .await;
         let cluster_service =
             ClusterService::new(Arc::clone(&cluster_manager), cluster_id, member_id);
+
+        // Start the HTTP/JSON gateway on port + 1.
+        let http_addr = SocketAddr::new(addr.ip(), addr.port() + 1);
+        let http_app = gateway::create_router(
+            raft_handle.clone(),
+            Arc::clone(&store),
+            Arc::clone(&lease_manager),
+            Arc::clone(&cluster_manager),
+            cluster_id,
+            member_id,
+        );
+
+        tracing::info!(%http_addr, "starting HTTP gateway");
+        tokio::spawn(async move {
+            let listener = tokio::net::TcpListener::bind(http_addr)
+                .await
+                .expect("bind HTTP gateway");
+            axum::serve(listener, http_app)
+                .await
+                .expect("HTTP gateway failed");
+        });
 
         tracing::info!(%addr, "starting gRPC server");
 
