@@ -19,8 +19,11 @@ use base64::Engine;
 use serde::{Deserialize, Serialize, Serializer};
 
 use crate::cluster::manager::ClusterManager;
+use crate::kv::state_machine::KvCommand;
 use crate::kv::store::{KvStore, TxnCompare, TxnCompareResult, TxnCompareTarget, TxnOp, TxnOpResponse};
 use crate::lease::manager::LeaseManager;
+use crate::raft::messages::ClientProposalResult;
+use crate::raft::node::RaftHandle;
 use crate::watch::hub::WatchHub;
 
 // ── Proto3 JSON serialization helpers ──────────────────────────────────────
@@ -64,6 +67,7 @@ pub struct GatewayState {
     pub cluster_id: u64,
     pub member_id: u64,
     pub raft_term: Arc<AtomicU64>,
+    pub raft_handle: RaftHandle,
 }
 
 // ── JSON request / response types ───────────────────────────────────────────
@@ -422,7 +426,7 @@ fn parse_json<T: serde::de::DeserializeOwned + Default>(body: &[u8]) -> T {
 // ── Router constructor ──────────────────────────────────────────────────────
 
 pub fn create_router(
-    _raft: crate::raft::node::RaftHandle,
+    raft_handle: RaftHandle,
     store: Arc<KvStore>,
     watch_hub: Arc<WatchHub>,
     lease_manager: Arc<LeaseManager>,
@@ -439,6 +443,7 @@ pub fn create_router(
         cluster_id,
         member_id,
         raft_term,
+        raft_handle,
     };
 
     Router::new()
@@ -496,42 +501,68 @@ async fn handle_put(
     let value = decode_b64(&req.value);
     let lease_id = req.lease.unwrap_or(0);
 
-    match state.store.put(&key, &value, lease_id) {
-        Ok(result) => {
-            // Notify watchers of the put event.
-            let (create_rev, ver) = match &result.prev_kv {
-                Some(prev) => (prev.create_revision, prev.version + 1),
-                None => (result.revision, 1),
-            };
-            let notify_kv = crate::proto::mvccpb::KeyValue {
-                key: key.clone(),
-                create_revision: create_rev,
-                mod_revision: result.revision,
-                version: ver,
-                value: value.clone(),
-                lease: lease_id,
-            };
-            state.watch_hub.notify(&key, 0, notify_kv, result.prev_kv.clone()).await;
+    // Serialize command and propose through Raft.
+    let cmd = KvCommand::Put {
+        key: key.clone(),
+        value: value.clone(),
+        lease_id,
+    };
+    let data = match serde_json::to_vec(&cmd) {
+        Ok(d) => d,
+        Err(e) => return json_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    };
 
-            // Attach the key to its lease so the expiry timer can clean it up.
-            if lease_id != 0 {
-                state.lease_manager.attach_key(lease_id, key.clone()).await;
+    let proposal_result = match state.raft_handle.propose(data).await {
+        Ok(r) => r,
+        Err(e) => return json_error(StatusCode::SERVICE_UNAVAILABLE, format!("raft: {}", e)).into_response(),
+    };
+
+    match proposal_result {
+        ClientProposalResult::Success { .. } => {
+            match state.store.put(&key, &value, lease_id) {
+                Ok(result) => {
+                    // Notify watchers of the put event.
+                    let (create_rev, ver) = match &result.prev_kv {
+                        Some(prev) => (prev.create_revision, prev.version + 1),
+                        None => (result.revision, 1),
+                    };
+                    let notify_kv = crate::proto::mvccpb::KeyValue {
+                        key: key.clone(),
+                        create_revision: create_rev,
+                        mod_revision: result.revision,
+                        version: ver,
+                        value: value.clone(),
+                        lease: lease_id,
+                    };
+                    state.watch_hub.notify(&key, 0, notify_kv, result.prev_kv.clone()).await;
+
+                    // Attach the key to its lease so the expiry timer can clean it up.
+                    if lease_id != 0 {
+                        state.lease_manager.attach_key(lease_id, key.clone()).await;
+                    }
+
+                    let prev_kv = if req.prev_kv.unwrap_or(false) {
+                        result.prev_kv.as_ref().map(proto_kv_to_json)
+                    } else {
+                        None
+                    };
+
+                    axum::Json(PutResponse {
+                        header: state.make_header(result.revision),
+                        prev_kv,
+                    })
+                    .into_response()
+                }
+                Err(e) => {
+                    json_error(StatusCode::INTERNAL_SERVER_ERROR, format!("put: {}", e)).into_response()
+                }
             }
-
-            let prev_kv = if req.prev_kv.unwrap_or(false) {
-                result.prev_kv.as_ref().map(proto_kv_to_json)
-            } else {
-                None
-            };
-
-            axum::Json(PutResponse {
-                header: state.make_header(result.revision),
-                prev_kv,
-            })
-            .into_response()
         }
-        Err(e) => {
-            json_error(StatusCode::INTERNAL_SERVER_ERROR, format!("put: {}", e)).into_response()
+        ClientProposalResult::NotLeader { .. } => {
+            json_error(StatusCode::SERVICE_UNAVAILABLE, "not leader").into_response()
+        }
+        ClientProposalResult::Error(e) => {
+            json_error(StatusCode::INTERNAL_SERVER_ERROR, e).into_response()
         }
     }
 }
@@ -544,39 +575,64 @@ async fn handle_delete_range(
     let key = decode_b64(&req.key);
     let range_end = decode_b64(&req.range_end);
 
-    match state.store.delete_range(&key, &range_end) {
-        Ok(result) => {
-            // Notify watchers for each deleted key.
-            for prev in &result.prev_kvs {
-                let tombstone = crate::proto::mvccpb::KeyValue {
-                    key: prev.key.clone(),
-                    create_revision: 0,
-                    mod_revision: result.revision,
-                    version: 0,
-                    value: vec![],
-                    lease: 0,
-                };
-                state.watch_hub.notify(&prev.key, 1, tombstone, Some(prev.clone())).await;
+    // Serialize command and propose through Raft.
+    let cmd = KvCommand::DeleteRange {
+        key: key.clone(),
+        range_end: range_end.clone(),
+    };
+    let data = match serde_json::to_vec(&cmd) {
+        Ok(d) => d,
+        Err(e) => return json_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    };
+
+    let proposal_result = match state.raft_handle.propose(data).await {
+        Ok(r) => r,
+        Err(e) => return json_error(StatusCode::SERVICE_UNAVAILABLE, format!("raft: {}", e)).into_response(),
+    };
+
+    match proposal_result {
+        ClientProposalResult::Success { .. } => {
+            match state.store.delete_range(&key, &range_end) {
+                Ok(result) => {
+                    // Notify watchers for each deleted key.
+                    for prev in &result.prev_kvs {
+                        let tombstone = crate::proto::mvccpb::KeyValue {
+                            key: prev.key.clone(),
+                            create_revision: 0,
+                            mod_revision: result.revision,
+                            version: 0,
+                            value: vec![],
+                            lease: 0,
+                        };
+                        state.watch_hub.notify(&prev.key, 1, tombstone, Some(prev.clone())).await;
+                    }
+
+                    let prev_kvs = if req.prev_kv.unwrap_or(false) {
+                        result.prev_kvs.iter().map(proto_kv_to_json).collect()
+                    } else {
+                        vec![]
+                    };
+
+                    axum::Json(DeleteRangeResponse {
+                        header: state.make_header(result.revision),
+                        deleted: result.deleted,
+                        prev_kvs,
+                    })
+                    .into_response()
+                }
+                Err(e) => json_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("delete: {}", e),
+                )
+                .into_response(),
             }
-
-            let prev_kvs = if req.prev_kv.unwrap_or(false) {
-                result.prev_kvs.iter().map(proto_kv_to_json).collect()
-            } else {
-                vec![]
-            };
-
-            axum::Json(DeleteRangeResponse {
-                header: state.make_header(result.revision),
-                deleted: result.deleted,
-                prev_kvs,
-            })
-            .into_response()
         }
-        Err(e) => json_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("delete: {}", e),
-        )
-        .into_response(),
+        ClientProposalResult::NotLeader { .. } => {
+            json_error(StatusCode::SERVICE_UNAVAILABLE, "not leader").into_response()
+        }
+        ClientProposalResult::Error(e) => {
+            json_error(StatusCode::INTERNAL_SERVER_ERROR, e).into_response()
+        }
     }
 }
 
@@ -656,92 +712,119 @@ async fn handle_txn(
 
     let success = convert_ops(&req.success);
     let failure = convert_ops(&req.failure);
-    let success_clone = success.clone();
-    let failure_clone = failure.clone();
 
-    match state.store.txn(compares, success, failure) {
-        Ok(result) => {
-            // Notify watchers for txn mutations.
-            let executed_ops = if result.succeeded { &success_clone } else { &failure_clone };
-            for (op, resp) in executed_ops.iter().zip(result.responses.iter()) {
-                match (op, resp) {
-                    (TxnOp::Put { key, value, lease_id }, TxnOpResponse::Put(r)) => {
-                        let (create_rev, ver) = match &r.prev_kv {
-                            Some(prev) => (prev.create_revision, prev.version + 1),
-                            None => (r.revision, 1),
-                        };
-                        let notify_kv = crate::proto::mvccpb::KeyValue {
-                            key: key.clone(),
-                            create_revision: create_rev,
-                            mod_revision: r.revision,
-                            version: ver,
-                            value: value.clone(),
-                            lease: *lease_id,
-                        };
-                        state.watch_hub.notify(key, 0, notify_kv, r.prev_kv.clone()).await;
-                    }
-                    (TxnOp::DeleteRange { .. }, TxnOpResponse::DeleteRange(r)) => {
-                        for prev in &r.prev_kvs {
-                            let tombstone = crate::proto::mvccpb::KeyValue {
-                                key: prev.key.clone(),
-                                create_revision: 0,
-                                mod_revision: r.revision,
-                                version: 0,
-                                value: vec![],
-                                lease: 0,
-                            };
-                            state.watch_hub.notify(&prev.key, 1, tombstone, Some(prev.clone())).await;
+    // Serialize command and propose through Raft.
+    let cmd = KvCommand::Txn {
+        compares: compares.clone(),
+        success: success.clone(),
+        failure: failure.clone(),
+    };
+    let data = match serde_json::to_vec(&cmd) {
+        Ok(d) => d,
+        Err(e) => return json_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    };
+
+    let proposal_result = match state.raft_handle.propose(data).await {
+        Ok(r) => r,
+        Err(e) => return json_error(StatusCode::SERVICE_UNAVAILABLE, format!("raft: {}", e)).into_response(),
+    };
+
+    match proposal_result {
+        ClientProposalResult::Success { .. } => {
+            let success_clone = success.clone();
+            let failure_clone = failure.clone();
+
+            match state.store.txn(compares, success, failure) {
+                Ok(result) => {
+                    // Notify watchers for txn mutations.
+                    let executed_ops = if result.succeeded { &success_clone } else { &failure_clone };
+                    for (op, resp) in executed_ops.iter().zip(result.responses.iter()) {
+                        match (op, resp) {
+                            (TxnOp::Put { key, value, lease_id }, TxnOpResponse::Put(r)) => {
+                                let (create_rev, ver) = match &r.prev_kv {
+                                    Some(prev) => (prev.create_revision, prev.version + 1),
+                                    None => (r.revision, 1),
+                                };
+                                let notify_kv = crate::proto::mvccpb::KeyValue {
+                                    key: key.clone(),
+                                    create_revision: create_rev,
+                                    mod_revision: r.revision,
+                                    version: ver,
+                                    value: value.clone(),
+                                    lease: *lease_id,
+                                };
+                                state.watch_hub.notify(key, 0, notify_kv, r.prev_kv.clone()).await;
+                            }
+                            (TxnOp::DeleteRange { .. }, TxnOpResponse::DeleteRange(r)) => {
+                                for prev in &r.prev_kvs {
+                                    let tombstone = crate::proto::mvccpb::KeyValue {
+                                        key: prev.key.clone(),
+                                        create_revision: 0,
+                                        mod_revision: r.revision,
+                                        version: 0,
+                                        value: vec![],
+                                        lease: 0,
+                                    };
+                                    state.watch_hub.notify(&prev.key, 1, tombstone, Some(prev.clone())).await;
+                                }
+                            }
+                            _ => {} // Range ops don't need notifications
                         }
                     }
-                    _ => {} // Range ops don't need notifications
+
+                    let responses: Vec<TxnResponseOp> = result
+                        .responses
+                        .into_iter()
+                        .map(|resp| match resp {
+                            TxnOpResponse::Range(r) => TxnResponseOp {
+                                response_range: Some(RangeResponse {
+                                    header: state.make_header(0),
+                                    kvs: r.kvs.iter().map(proto_kv_to_json).collect(),
+                                    more: r.more,
+                                    count: r.count,
+                                }),
+                                response_put: None,
+                                response_delete_range: None,
+                            },
+                            TxnOpResponse::Put(r) => TxnResponseOp {
+                                response_range: None,
+                                response_put: Some(TxnPutResponse {
+                                    header: TxnInnerHeader {
+                                        revision: r.revision,
+                                    },
+                                    prev_kv: None, // prev_kv only when explicitly requested
+                                }),
+                                response_delete_range: None,
+                            },
+                            TxnOpResponse::DeleteRange(r) => TxnResponseOp {
+                                response_range: None,
+                                response_put: None,
+                                response_delete_range: Some(DeleteRangeResponse {
+                                    header: state.make_header(r.revision),
+                                    deleted: r.deleted,
+                                    prev_kvs: r.prev_kvs.iter().map(proto_kv_to_json).collect(),
+                                }),
+                            },
+                        })
+                        .collect();
+
+                    axum::Json(TxnResponse {
+                        header: state.make_header(result.revision),
+                        succeeded: result.succeeded,
+                        responses,
+                    })
+                    .into_response()
+                }
+                Err(e) => {
+                    json_error(StatusCode::INTERNAL_SERVER_ERROR, format!("txn: {}", e)).into_response()
                 }
             }
-
-            let responses: Vec<TxnResponseOp> = result
-                .responses
-                .into_iter()
-                .map(|resp| match resp {
-                    TxnOpResponse::Range(r) => TxnResponseOp {
-                        response_range: Some(RangeResponse {
-                            header: state.make_header(0),
-                            kvs: r.kvs.iter().map(proto_kv_to_json).collect(),
-                            more: r.more,
-                            count: r.count,
-                        }),
-                        response_put: None,
-                        response_delete_range: None,
-                    },
-                    TxnOpResponse::Put(r) => TxnResponseOp {
-                        response_range: None,
-                        response_put: Some(TxnPutResponse {
-                            header: TxnInnerHeader {
-                                revision: r.revision,
-                            },
-                            prev_kv: None, // prev_kv only when explicitly requested
-                        }),
-                        response_delete_range: None,
-                    },
-                    TxnOpResponse::DeleteRange(r) => TxnResponseOp {
-                        response_range: None,
-                        response_put: None,
-                        response_delete_range: Some(DeleteRangeResponse {
-                            header: state.make_header(r.revision),
-                            deleted: r.deleted,
-                            prev_kvs: r.prev_kvs.iter().map(proto_kv_to_json).collect(),
-                        }),
-                    },
-                })
-                .collect();
-
-            axum::Json(TxnResponse {
-                header: state.make_header(result.revision),
-                succeeded: result.succeeded,
-                responses,
-            })
-            .into_response()
         }
-        Err(e) => {
-            json_error(StatusCode::INTERNAL_SERVER_ERROR, format!("txn: {}", e)).into_response()
+        ClientProposalResult::NotLeader { .. } => {
+            json_error(StatusCode::SERVICE_UNAVAILABLE, "not leader").into_response()
+        }
+        ClientProposalResult::Error(e) => {
+            json_error(StatusCode::INTERNAL_SERVER_ERROR, e).into_response()
         }
     }
 }
@@ -757,19 +840,41 @@ async fn handle_compaction(
         .parse()
         .unwrap_or(0);
 
-    match state.store.compact(revision) {
-        Ok(()) => {
-            let rev = state.store.current_revision().unwrap_or(0);
-            axum::Json(CompactionResponse {
-                header: state.make_header(rev),
-            })
-            .into_response()
+    // Serialize command and propose through Raft.
+    let cmd = KvCommand::Compact { revision };
+    let data = match serde_json::to_vec(&cmd) {
+        Ok(d) => d,
+        Err(e) => return json_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    };
+
+    let proposal_result = match state.raft_handle.propose(data).await {
+        Ok(r) => r,
+        Err(e) => return json_error(StatusCode::SERVICE_UNAVAILABLE, format!("raft: {}", e)).into_response(),
+    };
+
+    match proposal_result {
+        ClientProposalResult::Success { .. } => {
+            match state.store.compact(revision) {
+                Ok(()) => {
+                    let rev = state.store.current_revision().unwrap_or(0);
+                    axum::Json(CompactionResponse {
+                        header: state.make_header(rev),
+                    })
+                    .into_response()
+                }
+                Err(e) => json_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("compact: {}", e),
+                )
+                .into_response(),
+            }
         }
-        Err(e) => json_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("compact: {}", e),
-        )
-        .into_response(),
+        ClientProposalResult::NotLeader { .. } => {
+            json_error(StatusCode::SERVICE_UNAVAILABLE, "not leader").into_response()
+        }
+        ClientProposalResult::Error(e) => {
+            json_error(StatusCode::INTERNAL_SERVER_ERROR, e).into_response()
+        }
     }
 }
 
@@ -899,7 +1004,7 @@ async fn handle_maintenance_status(
         leader: state.member_id,
         raft_index: 0,
         raft_term: state.raft_term.load(Ordering::Relaxed),
-        raft_applied_index: 0,
+        raft_applied_index: state.raft_handle.applied_index(),
         db_size_in_use: db_size,
     })
 }

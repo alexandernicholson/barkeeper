@@ -44,6 +44,8 @@ pub struct RaftHandle {
     pub inbound_tx: mpsc::Sender<(u64, RaftMessage)>,
     /// Current Raft term, updated by the actor after every state transition.
     pub current_term: Arc<AtomicU64>,
+    /// Last applied Raft log index, updated after entries are sent to the state machine.
+    pub applied_index: Arc<AtomicU64>,
 }
 
 impl RaftHandle {
@@ -61,6 +63,11 @@ impl RaftHandle {
             .map_err(|_| "raft node stopped".to_string())?;
         rx.await.map_err(|_| "proposal dropped".to_string())
     }
+
+    /// Returns the last applied Raft log index.
+    pub fn applied_index(&self) -> u64 {
+        self.applied_index.load(Ordering::Relaxed)
+    }
 }
 
 /// Spawn the RaftNode actor. Returns a handle for submitting proposals.
@@ -75,11 +82,14 @@ pub async fn spawn_raft_node(
     let (proposal_tx, proposal_rx) = mpsc::channel::<ClientProposal>(256);
     let (inbound_tx, inbound_rx) = mpsc::channel::<(u64, RaftMessage)>(256);
     let current_term = Arc::new(AtomicU64::new(0));
+    let applied_index = Arc::new(AtomicU64::new(0));
     let term_ref = Arc::clone(&current_term);
+    let applied_ref = Arc::clone(&applied_index);
     let handle = RaftHandle {
         proposal_tx,
         inbound_tx,
         current_term,
+        applied_index,
     };
 
     let data_dir = config.data_dir.clone();
@@ -122,6 +132,7 @@ pub async fn spawn_raft_node(
             &mut heartbeat_timer,
             &config,
             &transport,
+            &applied_ref,
         )
         .await;
         term_ref.store(core.state.persistent.current_term, Ordering::Relaxed);
@@ -131,7 +142,7 @@ pub async fn spawn_raft_node(
                 // Election timeout
                 _ = &mut election_timer => {
                     let actions = core.step(Event::ElectionTimeout);
-                    execute_actions(&actions, &log_store, &apply_tx, &mut pending_responses, &mut heartbeat_timer, &config, &transport).await;
+                    execute_actions(&actions, &log_store, &apply_tx, &mut pending_responses, &mut heartbeat_timer, &config, &transport, &applied_ref).await;
                     term_ref.store(core.state.persistent.current_term, Ordering::Relaxed);
                     election_timer = random_election_timeout(&config);
                 }
@@ -139,7 +150,7 @@ pub async fn spawn_raft_node(
                 // Heartbeat (leader only)
                 _ = heartbeat_tick(&mut heartbeat_timer) => {
                     let actions = core.step(Event::HeartbeatTimeout);
-                    execute_actions(&actions, &log_store, &apply_tx, &mut pending_responses, &mut heartbeat_timer, &config, &transport).await;
+                    execute_actions(&actions, &log_store, &apply_tx, &mut pending_responses, &mut heartbeat_timer, &config, &transport, &applied_ref).await;
                     term_ref.store(core.state.persistent.current_term, Ordering::Relaxed);
                 }
 
@@ -148,14 +159,14 @@ pub async fn spawn_raft_node(
                     let id = proposal.id;
                     pending_responses.insert(id, proposal.response_tx);
                     let actions = core.step(Event::Proposal { id, data: proposal.data });
-                    execute_actions(&actions, &log_store, &apply_tx, &mut pending_responses, &mut heartbeat_timer, &config, &transport).await;
+                    execute_actions(&actions, &log_store, &apply_tx, &mut pending_responses, &mut heartbeat_timer, &config, &transport, &applied_ref).await;
                     term_ref.store(core.state.persistent.current_term, Ordering::Relaxed);
                 }
 
                 // Inbound Raft messages from peers (via transport)
                 Some((from, message)) = inbound_rx.recv() => {
                     let actions = core.step(Event::Message { from, message });
-                    execute_actions(&actions, &log_store, &apply_tx, &mut pending_responses, &mut heartbeat_timer, &config, &transport).await;
+                    execute_actions(&actions, &log_store, &apply_tx, &mut pending_responses, &mut heartbeat_timer, &config, &transport, &applied_ref).await;
                     term_ref.store(core.state.persistent.current_term, Ordering::Relaxed);
                 }
             }
@@ -192,6 +203,7 @@ async fn execute_actions(
     heartbeat_timer: &mut Option<tokio::time::Interval>,
     config: &RaftConfig,
     transport: &Option<Arc<dyn RaftTransport>>,
+    applied_index: &Arc<AtomicU64>,
 ) {
     for action in actions {
         match action {
@@ -207,6 +219,7 @@ async fn execute_actions(
             Action::ApplyEntries { from, to } => {
                 let entries = log_store.get_range(*from, *to).unwrap();
                 apply_tx.send(entries).await.ok();
+                applied_index.store(*to, Ordering::Relaxed);
             }
             Action::RespondToProposal { id, result } => {
                 if let Some(tx) = pending_responses.remove(id) {

@@ -86,6 +86,7 @@ impl BarkeepServer {
             cluster_id,
             member_id,
             Arc::clone(&raft_term),
+            raft_handle.clone(),
         );
         let lease_service = LeaseService::new(Arc::clone(&lease_manager), cluster_id, member_id, Arc::clone(&raft_term));
 
@@ -108,7 +109,7 @@ impl BarkeepServer {
 
         // Create the Maintenance gRPC service.
         let maintenance_service =
-            MaintenanceService::new(Arc::clone(&store), cluster_id, member_id, Arc::clone(&raft_term));
+            MaintenanceService::new(Arc::clone(&store), cluster_id, member_id, Arc::clone(&raft_term), raft_handle.clone());
 
         // Spawn lease expiry timer — checks every 500ms for expired leases.
         {

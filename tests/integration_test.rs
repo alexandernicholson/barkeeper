@@ -5,6 +5,9 @@ use barkeeper::kv::store::KvStore;
 use barkeeper::raft::messages::{LogEntry, LogEntryData};
 use tempfile::tempdir;
 
+/// State machine now delegates application to the service layer.
+/// It should accept entries without panicking and leave the store unchanged
+/// (the service layer applies after Raft commit).
 #[tokio::test]
 async fn test_state_machine_apply_put() {
     let dir = tempdir().unwrap();
@@ -23,11 +26,13 @@ async fn test_state_machine_apply_put() {
         data: LogEntryData::Command(serde_json::to_vec(&cmd).unwrap()),
     };
 
+    // Should not panic — state machine accepts entries for logging.
     sm.apply(vec![entry]).await;
 
+    // Store remains empty: the service layer applies after Raft commit,
+    // not the state machine.
     let result = sm.store().range(b"hello", b"", 0, 0).unwrap();
-    assert_eq!(result.kvs.len(), 1);
-    assert_eq!(result.kvs[0].value, b"world");
+    assert_eq!(result.kvs.len(), 0);
 }
 
 #[tokio::test]
@@ -67,28 +72,23 @@ async fn test_state_machine_apply_delete() {
     assert_eq!(result.kvs.len(), 0);
 }
 
+/// State machine no longer applies to store (service layer does).
+/// Verify the state machine holds a reference to the shared store.
 #[tokio::test]
 async fn test_state_machine_shared_store() {
     let dir = tempdir().unwrap();
     let store = Arc::new(KvStore::open(dir.path().join("test.redb")).unwrap());
     let sm = StateMachine::new(Arc::clone(&store));
 
-    // Write through state machine.
-    let cmd = KvCommand::Put {
-        key: b"shared".to_vec(),
-        value: b"data".to_vec(),
-        lease_id: 0,
-    };
+    // Write directly to the store (simulating the service layer).
+    store.put(b"shared", b"data", 0).unwrap();
 
-    let entry = LogEntry {
-        term: 1,
-        index: 1,
-        data: LogEntryData::Command(serde_json::to_vec(&cmd).unwrap()),
-    };
+    // State machine's store reference should see the same data.
+    let result = sm.store().range(b"shared", b"", 0, 0).unwrap();
+    assert_eq!(result.kvs.len(), 1);
+    assert_eq!(result.kvs[0].value, b"data");
 
-    sm.apply(vec![entry]).await;
-
-    // Read through the shared store reference (simulating what the gRPC service does).
+    // Also verify through the Arc reference.
     let result = store.range(b"shared", b"", 0, 0).unwrap();
     assert_eq!(result.kvs.len(), 1);
     assert_eq!(result.kvs[0].value, b"data");
@@ -113,6 +113,9 @@ async fn test_state_machine_noop_and_config_change_ignored() {
     assert_eq!(store.current_revision().unwrap(), 0);
 }
 
+/// State machine now delegates application to the service layer.
+/// Verify it accepts multiple entries without panicking and the store
+/// remains empty (service layer handles application).
 #[tokio::test]
 async fn test_state_machine_multiple_puts() {
     let dir = tempdir().unwrap();
@@ -134,16 +137,9 @@ async fn test_state_machine_multiple_puts() {
         })
         .collect();
 
+    // Should not panic — state machine logs entries for observability.
     sm.apply(entries).await;
 
-    // All 5 keys should be present.
-    for i in 1..=5 {
-        let result = store
-            .range(format!("key{}", i).as_bytes(), b"", 0, 0)
-            .unwrap();
-        assert_eq!(result.kvs.len(), 1);
-        assert_eq!(result.kvs[0].value, format!("val{}", i).as_bytes());
-    }
-
-    assert_eq!(store.current_revision().unwrap(), 5);
+    // Store remains empty: the service layer applies after Raft commit.
+    assert_eq!(store.current_revision().unwrap(), 0);
 }

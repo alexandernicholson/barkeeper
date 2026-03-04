@@ -42,8 +42,10 @@ impl StateMachine {
         for entry in entries {
             match entry.data {
                 LogEntryData::Command(data) => {
+                    // Commands are applied by the service layer after Raft commit.
+                    // The state machine only logs for observability.
                     if let Ok(cmd) = serde_json::from_slice::<KvCommand>(&data) {
-                        self.apply_command(cmd).await;
+                        tracing::debug!(?cmd, index = entry.index, "state machine received committed entry (applied by service)");
                     }
                 }
                 LogEntryData::Noop => {}

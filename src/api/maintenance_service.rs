@@ -12,6 +12,7 @@ use crate::proto::etcdserverpb::{
     MoveLeaderRequest, MoveLeaderResponse, ResponseHeader, SnapshotRequest, SnapshotResponse,
     StatusRequest, StatusResponse,
 };
+use crate::raft::node::RaftHandle;
 
 /// gRPC Maintenance service implementing the etcd Maintenance API.
 pub struct MaintenanceService {
@@ -19,15 +20,23 @@ pub struct MaintenanceService {
     cluster_id: u64,
     member_id: u64,
     raft_term: Arc<AtomicU64>,
+    raft_handle: RaftHandle,
 }
 
 impl MaintenanceService {
-    pub fn new(store: Arc<KvStore>, cluster_id: u64, member_id: u64, raft_term: Arc<AtomicU64>) -> Self {
+    pub fn new(
+        store: Arc<KvStore>,
+        cluster_id: u64,
+        member_id: u64,
+        raft_term: Arc<AtomicU64>,
+        raft_handle: RaftHandle,
+    ) -> Self {
         MaintenanceService {
             store,
             cluster_id,
             member_id,
             raft_term,
+            raft_handle,
         }
     }
 
@@ -68,7 +77,7 @@ impl Maintenance for MaintenanceService {
             leader: self.member_id,
             raft_index: 0,
             raft_term: self.raft_term.load(Ordering::Relaxed),
-            raft_applied_index: 0,
+            raft_applied_index: self.raft_handle.applied_index(),
             errors: vec![],
             db_size_in_use: db_size,
             is_learner: false,

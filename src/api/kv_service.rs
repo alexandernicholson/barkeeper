@@ -3,6 +3,7 @@ use std::sync::Arc;
 
 use tonic::{Request, Response, Status};
 
+use crate::kv::state_machine::KvCommand;
 use crate::kv::store::{
     KvStore, TxnCompare, TxnCompareResult, TxnCompareTarget, TxnOp, TxnOpResponse,
 };
@@ -14,6 +15,8 @@ use crate::proto::etcdserverpb::{
     DeleteRangeResponse, PutRequest, PutResponse, RangeRequest, RangeResponse, RequestOp,
     ResponseHeader, ResponseOp, TxnRequest, TxnResponse,
 };
+use crate::raft::node::RaftHandle;
+use crate::raft::messages::ClientProposalResult;
 use crate::watch::hub::WatchHub;
 
 /// gRPC KV service implementing the etcd KV API.
@@ -24,6 +27,7 @@ pub struct KvService {
     cluster_id: u64,
     member_id: u64,
     raft_term: Arc<AtomicU64>,
+    raft_handle: RaftHandle,
 }
 
 impl KvService {
@@ -34,6 +38,7 @@ impl KvService {
         cluster_id: u64,
         member_id: u64,
         raft_term: Arc<AtomicU64>,
+        raft_handle: RaftHandle,
     ) -> Self {
         KvService {
             store,
@@ -42,6 +47,7 @@ impl KvService {
             cluster_id,
             member_id,
             raft_term,
+            raft_handle,
         }
     }
 
@@ -84,41 +90,63 @@ impl Kv for KvService {
     async fn put(&self, request: Request<PutRequest>) -> Result<Response<PutResponse>, Status> {
         let req = request.into_inner();
 
-        let result = self
-            .store
-            .put(&req.key, &req.value, req.lease)
-            .map_err(|e| Status::internal(format!("put failed: {}", e)))?;
-
-        // Notify watchers of the put event.
-        let (create_rev, ver) = match &result.prev_kv {
-            Some(prev) => (prev.create_revision, prev.version + 1),
-            None => (result.revision, 1),
-        };
-        let notify_kv = crate::proto::mvccpb::KeyValue {
+        // Serialize command and propose through Raft.
+        let cmd = KvCommand::Put {
             key: req.key.clone(),
-            create_revision: create_rev,
-            mod_revision: result.revision,
-            version: ver,
             value: req.value.clone(),
-            lease: req.lease,
+            lease_id: req.lease,
         };
-        self.watch_hub.notify(&req.key, 0, notify_kv, result.prev_kv.clone()).await;
+        let data = serde_json::to_vec(&cmd).map_err(|e| Status::internal(e.to_string()))?;
 
-        // Attach the key to its lease so the expiry timer can clean it up.
-        if req.lease != 0 {
-            self.lease_manager.attach_key(req.lease, req.key.clone()).await;
+        let proposal_result = self.raft_handle.propose(data).await
+            .map_err(|e| Status::unavailable(format!("raft: {}", e)))?;
+
+        match proposal_result {
+            ClientProposalResult::Success { .. } => {
+                // Committed. Apply to store.
+                let result = self
+                    .store
+                    .put(&req.key, &req.value, req.lease)
+                    .map_err(|e| Status::internal(format!("put failed: {}", e)))?;
+
+                // Notify watchers of the put event.
+                let (create_rev, ver) = match &result.prev_kv {
+                    Some(prev) => (prev.create_revision, prev.version + 1),
+                    None => (result.revision, 1),
+                };
+                let notify_kv = crate::proto::mvccpb::KeyValue {
+                    key: req.key.clone(),
+                    create_revision: create_rev,
+                    mod_revision: result.revision,
+                    version: ver,
+                    value: req.value.clone(),
+                    lease: req.lease,
+                };
+                self.watch_hub.notify(&req.key, 0, notify_kv, result.prev_kv.clone()).await;
+
+                // Attach the key to its lease so the expiry timer can clean it up.
+                if req.lease != 0 {
+                    self.lease_manager.attach_key(req.lease, req.key.clone()).await;
+                }
+
+                let prev_kv = if req.prev_kv {
+                    result.prev_kv
+                } else {
+                    None
+                };
+
+                Ok(Response::new(PutResponse {
+                    header: self.make_header(result.revision),
+                    prev_kv,
+                }))
+            }
+            ClientProposalResult::NotLeader { .. } => {
+                Err(Status::unavailable("not leader"))
+            }
+            ClientProposalResult::Error(e) => {
+                Err(Status::internal(e))
+            }
         }
-
-        let prev_kv = if req.prev_kv {
-            result.prev_kv
-        } else {
-            None
-        };
-
-        Ok(Response::new(PutResponse {
-            header: self.make_header(result.revision),
-            prev_kv,
-        }))
     }
 
     async fn delete_range(
@@ -127,35 +155,56 @@ impl Kv for KvService {
     ) -> Result<Response<DeleteRangeResponse>, Status> {
         let req = request.into_inner();
 
-        let result = self
-            .store
-            .delete_range(&req.key, &req.range_end)
-            .map_err(|e| Status::internal(format!("delete failed: {}", e)))?;
-
-        // Notify watchers for each deleted key.
-        for prev in &result.prev_kvs {
-            let tombstone = crate::proto::mvccpb::KeyValue {
-                key: prev.key.clone(),
-                create_revision: 0,
-                mod_revision: result.revision,
-                version: 0,
-                value: vec![],
-                lease: 0,
-            };
-            self.watch_hub.notify(&prev.key, 1, tombstone, Some(prev.clone())).await;
-        }
-
-        let prev_kvs = if req.prev_kv {
-            result.prev_kvs
-        } else {
-            vec![]
+        // Serialize command and propose through Raft.
+        let cmd = KvCommand::DeleteRange {
+            key: req.key.clone(),
+            range_end: req.range_end.clone(),
         };
+        let data = serde_json::to_vec(&cmd).map_err(|e| Status::internal(e.to_string()))?;
 
-        Ok(Response::new(DeleteRangeResponse {
-            header: self.make_header(result.revision),
-            deleted: result.deleted,
-            prev_kvs,
-        }))
+        let proposal_result = self.raft_handle.propose(data).await
+            .map_err(|e| Status::unavailable(format!("raft: {}", e)))?;
+
+        match proposal_result {
+            ClientProposalResult::Success { .. } => {
+                // Committed. Apply to store.
+                let result = self
+                    .store
+                    .delete_range(&req.key, &req.range_end)
+                    .map_err(|e| Status::internal(format!("delete failed: {}", e)))?;
+
+                // Notify watchers for each deleted key.
+                for prev in &result.prev_kvs {
+                    let tombstone = crate::proto::mvccpb::KeyValue {
+                        key: prev.key.clone(),
+                        create_revision: 0,
+                        mod_revision: result.revision,
+                        version: 0,
+                        value: vec![],
+                        lease: 0,
+                    };
+                    self.watch_hub.notify(&prev.key, 1, tombstone, Some(prev.clone())).await;
+                }
+
+                let prev_kvs = if req.prev_kv {
+                    result.prev_kvs
+                } else {
+                    vec![]
+                };
+
+                Ok(Response::new(DeleteRangeResponse {
+                    header: self.make_header(result.revision),
+                    deleted: result.deleted,
+                    prev_kvs,
+                }))
+            }
+            ClientProposalResult::NotLeader { .. } => {
+                Err(Status::unavailable("not leader"))
+            }
+            ClientProposalResult::Error(e) => {
+                Err(Status::internal(e))
+            }
+        }
     }
 
     async fn txn(&self, request: Request<TxnRequest>) -> Result<Response<TxnResponse>, Status> {
@@ -181,64 +230,87 @@ impl Kv for KvService {
             .map(|op| convert_request_op(op))
             .collect::<Result<Vec<_>, _>>()?;
 
-        // Clone ops before the store consumes them — needed for watch notifications.
-        let success_ops = success.clone();
-        let failure_ops = failure.clone();
+        // Serialize command and propose through Raft.
+        let cmd = KvCommand::Txn {
+            compares: compares.clone(),
+            success: success.clone(),
+            failure: failure.clone(),
+        };
+        let data = serde_json::to_vec(&cmd).map_err(|e| Status::internal(e.to_string()))?;
 
-        // Execute the transaction directly on the store.
-        let result = self
-            .store
-            .txn(compares, success, failure)
-            .map_err(|e| Status::internal(format!("txn failed: {}", e)))?;
+        let proposal_result = self.raft_handle.propose(data).await
+            .map_err(|e| Status::unavailable(format!("raft: {}", e)))?;
 
-        // Notify watchers for txn mutations.
-        let executed_ops = if result.succeeded { &success_ops } else { &failure_ops };
-        for (op, resp) in executed_ops.iter().zip(result.responses.iter()) {
-            match (op, resp) {
-                (TxnOp::Put { key, value, lease_id }, TxnOpResponse::Put(r)) => {
-                    let (create_rev, ver) = match &r.prev_kv {
-                        Some(prev) => (prev.create_revision, prev.version + 1),
-                        None => (r.revision, 1),
-                    };
-                    let notify_kv = crate::proto::mvccpb::KeyValue {
-                        key: key.clone(),
-                        create_revision: create_rev,
-                        mod_revision: r.revision,
-                        version: ver,
-                        value: value.clone(),
-                        lease: *lease_id,
-                    };
-                    self.watch_hub.notify(key, 0, notify_kv, r.prev_kv.clone()).await;
-                }
-                (TxnOp::DeleteRange { .. }, TxnOpResponse::DeleteRange(r)) => {
-                    for prev in &r.prev_kvs {
-                        let tombstone = crate::proto::mvccpb::KeyValue {
-                            key: prev.key.clone(),
-                            create_revision: 0,
-                            mod_revision: r.revision,
-                            version: 0,
-                            value: vec![],
-                            lease: 0,
-                        };
-                        self.watch_hub.notify(&prev.key, 1, tombstone, Some(prev.clone())).await;
+        match proposal_result {
+            ClientProposalResult::Success { .. } => {
+                // Committed. Apply to store.
+
+                // Clone ops before the store consumes them — needed for watch notifications.
+                let success_ops = success.clone();
+                let failure_ops = failure.clone();
+
+                // Execute the transaction directly on the store.
+                let result = self
+                    .store
+                    .txn(compares, success, failure)
+                    .map_err(|e| Status::internal(format!("txn failed: {}", e)))?;
+
+                // Notify watchers for txn mutations.
+                let executed_ops = if result.succeeded { &success_ops } else { &failure_ops };
+                for (op, resp) in executed_ops.iter().zip(result.responses.iter()) {
+                    match (op, resp) {
+                        (TxnOp::Put { key, value, lease_id }, TxnOpResponse::Put(r)) => {
+                            let (create_rev, ver) = match &r.prev_kv {
+                                Some(prev) => (prev.create_revision, prev.version + 1),
+                                None => (r.revision, 1),
+                            };
+                            let notify_kv = crate::proto::mvccpb::KeyValue {
+                                key: key.clone(),
+                                create_revision: create_rev,
+                                mod_revision: r.revision,
+                                version: ver,
+                                value: value.clone(),
+                                lease: *lease_id,
+                            };
+                            self.watch_hub.notify(key, 0, notify_kv, r.prev_kv.clone()).await;
+                        }
+                        (TxnOp::DeleteRange { .. }, TxnOpResponse::DeleteRange(r)) => {
+                            for prev in &r.prev_kvs {
+                                let tombstone = crate::proto::mvccpb::KeyValue {
+                                    key: prev.key.clone(),
+                                    create_revision: 0,
+                                    mod_revision: r.revision,
+                                    version: 0,
+                                    value: vec![],
+                                    lease: 0,
+                                };
+                                self.watch_hub.notify(&prev.key, 1, tombstone, Some(prev.clone())).await;
+                            }
+                        }
+                        _ => {} // Range ops don't need notifications
                     }
                 }
-                _ => {} // Range ops don't need notifications
+
+                // Convert results to proto responses.
+                let responses: Vec<ResponseOp> = result
+                    .responses
+                    .into_iter()
+                    .map(|resp| convert_txn_op_response(resp, self.cluster_id, self.member_id, self.raft_term.load(Ordering::Relaxed)))
+                    .collect();
+
+                Ok(Response::new(TxnResponse {
+                    header: self.make_header(result.revision),
+                    succeeded: result.succeeded,
+                    responses,
+                }))
+            }
+            ClientProposalResult::NotLeader { .. } => {
+                Err(Status::unavailable("not leader"))
+            }
+            ClientProposalResult::Error(e) => {
+                Err(Status::internal(e))
             }
         }
-
-        // Convert results to proto responses.
-        let responses: Vec<ResponseOp> = result
-            .responses
-            .into_iter()
-            .map(|resp| convert_txn_op_response(resp, self.cluster_id, self.member_id, self.raft_term.load(Ordering::Relaxed)))
-            .collect();
-
-        Ok(Response::new(TxnResponse {
-            header: self.make_header(result.revision),
-            succeeded: result.succeeded,
-            responses,
-        }))
     }
 
     async fn compact(
@@ -247,18 +319,38 @@ impl Kv for KvService {
     ) -> Result<Response<CompactionResponse>, Status> {
         let req = request.into_inner();
 
-        self.store
-            .compact(req.revision)
-            .map_err(|e| Status::internal(format!("compact failed: {}", e)))?;
+        // Serialize command and propose through Raft.
+        let cmd = KvCommand::Compact {
+            revision: req.revision,
+        };
+        let data = serde_json::to_vec(&cmd).map_err(|e| Status::internal(e.to_string()))?;
 
-        let revision = self
-            .store
-            .current_revision()
-            .map_err(|e| Status::internal(format!("revision failed: {}", e)))?;
+        let proposal_result = self.raft_handle.propose(data).await
+            .map_err(|e| Status::unavailable(format!("raft: {}", e)))?;
 
-        Ok(Response::new(CompactionResponse {
-            header: self.make_header(revision),
-        }))
+        match proposal_result {
+            ClientProposalResult::Success { .. } => {
+                // Committed. Apply to store.
+                self.store
+                    .compact(req.revision)
+                    .map_err(|e| Status::internal(format!("compact failed: {}", e)))?;
+
+                let revision = self
+                    .store
+                    .current_revision()
+                    .map_err(|e| Status::internal(format!("revision failed: {}", e)))?;
+
+                Ok(Response::new(CompactionResponse {
+                    header: self.make_header(revision),
+                }))
+            }
+            ClientProposalResult::NotLeader { .. } => {
+                Err(Status::unavailable("not leader"))
+            }
+            ClientProposalResult::Error(e) => {
+                Err(Status::internal(e))
+            }
+        }
     }
 }
 
