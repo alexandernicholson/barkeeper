@@ -71,7 +71,7 @@ async fn start_test_instance() -> (SocketAddr, tempfile::TempDir) {
         watch_hub.clone(),
         Arc::clone(&lease_manager),
         Arc::clone(&broker),
-        notifier,
+        notifier.clone(),
     ).await;
 
     let app = gateway::create_router(
@@ -87,6 +87,7 @@ async fn start_test_instance() -> (SocketAddr, tempfile::TempDir) {
         auth_manager,
         Arc::new(std::sync::Mutex::new(vec![])),
         broker,
+        notifier,
     );
 
     let http_port = portpicker::pick_unused_port().expect("no free port");

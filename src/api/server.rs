@@ -295,18 +295,20 @@ impl BarkeepServer {
             watch_hub.clone(),
             Arc::clone(&lease_manager),
             Arc::clone(&broker),
-            notifier,
+            notifier.clone(),
         ).await;
 
         // Create the KV gRPC service.
         let kv_service = KvService::new(
             store.clone(),
+            Arc::clone(&kv_store),
             Arc::clone(&lease_manager),
             cluster_id,
             member_id,
             Arc::clone(&raft_term),
             raft_handle.clone(),
             Arc::clone(&broker),
+            notifier.clone(),
         );
         let lease_service = LeaseService::new(Arc::clone(&lease_manager), store.clone(), cluster_id, member_id, Arc::clone(&raft_term));
 
@@ -420,6 +422,7 @@ impl BarkeepServer {
             auth_manager.clone(),
             alarms,
             Arc::clone(&broker),
+            notifier,
         );
 
         tracing::info!(%http_addr, %scheme, "starting HTTP gateway");

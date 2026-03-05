@@ -68,7 +68,7 @@ async fn start_test_instance() -> (SocketAddr, tempfile::TempDir) {
         watch_hub.clone(),
         Arc::clone(&lease_manager),
         Arc::clone(&broker),
-        notifier,
+        notifier.clone(),
     ).await;
 
     // Spawn lease expiry timer — checks every 500ms for expired leases.
@@ -114,6 +114,7 @@ async fn start_test_instance() -> (SocketAddr, tempfile::TempDir) {
         auth_manager,
         Arc::new(std::sync::Mutex::new(vec![])),
         broker,
+        notifier,
     );
 
     let http_port = portpicker::pick_unused_port().expect("no free port");
@@ -1102,4 +1103,109 @@ async fn test_lease_expiry_via_production_timer() {
         kvs.is_none() || kvs.unwrap().is_empty(),
         "key should be deleted after lease expiry"
     );
+}
+
+// ── Task 5/6 tests: Early ack + ReadIndex ──────────────────────────────────
+
+/// Test: Put returns a pre-assigned revision (early ack, no broker wait).
+#[tokio::test]
+async fn test_put_returns_preassigned_revision() {
+    let (addr, _dir) = start_test_instance().await;
+    let client = Client::new();
+
+    let resp: Value = client
+        .post(format!("http://{}/v3/kv/put", addr))
+        .body(format!(
+            r#"{{"key":"{}","value":"{}"}}"#,
+            b64("rev-test"),
+            b64("val1")
+        ))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    // The response must have a header with revision > 0.
+    let header = &resp["header"];
+    assert!(header.is_object(), "put response must have header");
+    let revision = str_i64(&header["revision"]);
+    assert!(revision > 0, "revision must be > 0, got {}", revision);
+
+    // cluster_id and member_id should also be present.
+    let cluster_id = str_u64(&header["cluster_id"]);
+    assert!(cluster_id > 0);
+    let member_id = str_u64(&header["member_id"]);
+    assert!(member_id > 0);
+}
+
+/// Test: Read-after-write linearizability via ReadIndex.
+/// PUT key=foo value=bar, then immediately GET key=foo and assert value == bar.
+#[tokio::test]
+async fn test_read_after_write_linearizability() {
+    let (addr, _dir) = start_test_instance().await;
+    let client = Client::new();
+
+    // Write
+    let _put: Value = client
+        .post(format!("http://{}/v3/kv/put", addr))
+        .body(format!(
+            r#"{{"key":"{}","value":"{}"}}"#,
+            b64("linear-key"),
+            b64("linear-val")
+        ))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    // Read immediately -- ReadIndex ensures we wait for apply.
+    let get: Value = client
+        .post(format!("http://{}/v3/kv/range", addr))
+        .body(format!(r#"{{"key":"{}"}}"#, b64("linear-key")))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    let kvs = get["kvs"].as_array().expect("kvs array");
+    assert_eq!(kvs.len(), 1, "should find exactly one key");
+    let value = b64_decode(kvs[0]["value"].as_str().unwrap());
+    assert_eq!(value, "linear-val", "value mismatch after read-after-write");
+}
+
+/// Test: Multiple sequential puts have monotonically increasing revisions.
+#[tokio::test]
+async fn test_put_revisions_monotonically_increase() {
+    let (addr, _dir) = start_test_instance().await;
+    let client = Client::new();
+
+    let mut prev_rev = 0i64;
+    for i in 0..5 {
+        let resp: Value = client
+            .post(format!("http://{}/v3/kv/put", addr))
+            .body(format!(
+                r#"{{"key":"{}","value":"{}"}}"#,
+                b64(&format!("seq-{}", i)),
+                b64(&format!("val-{}", i))
+            ))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+
+        let rev = str_i64(&resp["header"]["revision"]);
+        assert!(
+            rev > prev_rev,
+            "revision {} should be > previous {}", rev, prev_rev
+        );
+        prev_rev = rev;
+    }
 }

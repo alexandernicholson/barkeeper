@@ -5,9 +5,10 @@ use tonic::{Request, Response, Status};
 
 use crate::kv::actor::KvStoreActorHandle;
 use crate::kv::apply_broker::{ApplyResult, ApplyResultBroker};
+use crate::kv::apply_notifier::ApplyNotifier;
 use crate::kv::state_machine::KvCommand;
 use crate::kv::store::{
-    TxnCompare, TxnCompareResult, TxnCompareTarget, TxnOp, TxnOpResponse,
+    KvStore, TxnCompare, TxnCompareResult, TxnCompareTarget, TxnOp, TxnOpResponse,
 };
 use crate::lease::manager::LeaseManager;
 use crate::proto::etcdserverpb::compare::{CompareResult, CompareTarget, TargetUnion};
@@ -23,6 +24,7 @@ use crate::raft::messages::ClientProposalResult;
 /// gRPC KV service implementing the etcd KV API.
 pub struct KvService {
     store: KvStoreActorHandle,
+    store_direct: Arc<KvStore>,
     #[allow(dead_code)]
     lease_manager: Arc<LeaseManager>,
     cluster_id: u64,
@@ -30,26 +32,31 @@ pub struct KvService {
     raft_term: Arc<AtomicU64>,
     raft_handle: RaftHandle,
     broker: Arc<ApplyResultBroker>,
+    apply_notifier: ApplyNotifier,
 }
 
 impl KvService {
     pub fn new(
         store: KvStoreActorHandle,
+        store_direct: Arc<KvStore>,
         lease_manager: Arc<LeaseManager>,
         cluster_id: u64,
         member_id: u64,
         raft_term: Arc<AtomicU64>,
         raft_handle: RaftHandle,
         broker: Arc<ApplyResultBroker>,
+        apply_notifier: ApplyNotifier,
     ) -> Self {
         KvService {
             store,
+            store_direct,
             lease_manager,
             cluster_id,
             member_id,
             raft_term,
             raft_handle,
             broker,
+            apply_notifier,
         }
     }
 
@@ -70,6 +77,11 @@ impl Kv for KvService {
         request: Request<RangeRequest>,
     ) -> Result<Response<RangeResponse>, Status> {
         let req = request.into_inner();
+
+        // ReadIndex: wait for apply to catch up to commit index so that reads
+        // after early-acked writes see the written data (linearizability).
+        let commit = self.raft_handle.commit_index();
+        self.apply_notifier.wait_for(commit).await;
 
         let result = self
             .store
@@ -94,6 +106,26 @@ impl Kv for KvService {
     async fn put(&self, request: Request<PutRequest>) -> Result<Response<PutResponse>, Status> {
         let req = request.into_inner();
 
+        // If prev_kv requested, read it BEFORE proposing. We must first wait
+        // for all committed entries to be applied (ReadIndex) so that previous
+        // early-acked writes are visible in the store.
+        let prev_kv = if req.prev_kv {
+            let commit = self.raft_handle.commit_index();
+            self.apply_notifier.wait_for(commit).await;
+
+            let store = self.store_direct.clone();
+            let key = req.key.clone();
+            tokio::task::spawn_blocking(move || {
+                store.range(&key, &[], 0, 0).ok()
+                    .and_then(|r| r.kvs.into_iter().next())
+            })
+            .await
+            .ok()
+            .flatten()
+        } else {
+            None
+        };
+
         // Serialize command and propose through Raft.
         let cmd = KvCommand::Put {
             key: req.key.clone(),
@@ -106,24 +138,12 @@ impl Kv for KvService {
             .map_err(|e| Status::unavailable(format!("raft: {}", e)))?;
 
         match proposal_result {
-            ClientProposalResult::Success { index, .. } => {
-                // Wait for the state machine to apply this entry.
-                let result = self.broker.wait_for_result(index).await;
-                match result {
-                    ApplyResult::Put(put_result) => {
-                        let prev_kv = if req.prev_kv {
-                            put_result.prev_kv
-                        } else {
-                            None
-                        };
-
-                        Ok(Response::new(PutResponse {
-                            header: self.make_header(put_result.revision),
-                            prev_kv,
-                        }))
-                    }
-                    _ => Err(Status::internal("unexpected apply result for put")),
-                }
+            ClientProposalResult::Success { revision, .. } => {
+                // Early ack: return immediately with pre-assigned revision — no broker wait.
+                Ok(Response::new(PutResponse {
+                    header: self.make_header(revision),
+                    prev_kv,
+                }))
             }
             ClientProposalResult::NotLeader { .. } => {
                 Err(Status::unavailable("not leader"))

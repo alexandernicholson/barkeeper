@@ -52,6 +52,9 @@ pub struct RaftHandle {
     pub applied_index: Arc<AtomicU64>,
     /// Current Raft leader ID (0 = unknown).
     pub leader_id: Arc<AtomicU64>,
+    /// Last committed Raft log index. Updated when ApplyEntries actions fire.
+    /// Used by ReadIndex to determine how far the state machine needs to catch up.
+    pub commit_index: Arc<AtomicU64>,
 }
 
 impl RaftHandle {
@@ -79,6 +82,11 @@ impl RaftHandle {
     pub fn leader_id(&self) -> u64 {
         self.leader_id.load(Ordering::Relaxed)
     }
+
+    /// Returns the last committed Raft log index.
+    pub fn commit_index(&self) -> u64 {
+        self.commit_index.load(Ordering::Acquire)
+    }
 }
 
 /// Spawn the RaftNode actor. Returns a handle for submitting proposals.
@@ -96,15 +104,18 @@ pub async fn spawn_raft_node(
     let current_term = Arc::new(AtomicU64::new(0));
     let applied_index = Arc::new(AtomicU64::new(0));
     let leader_id_atomic = Arc::new(AtomicU64::new(0));
+    let commit_index = Arc::new(AtomicU64::new(0));
     let term_ref = Arc::clone(&current_term);
     let applied_ref = Arc::clone(&applied_index);
     let leader_ref = Arc::clone(&leader_id_atomic);
+    let commit_ref = Arc::clone(&commit_index);
     let handle = RaftHandle {
         proposal_tx,
         inbound_tx,
         current_term,
         applied_index,
         leader_id: leader_id_atomic,
+        commit_index,
     };
 
     let data_dir = config.data_dir.clone();
@@ -147,6 +158,7 @@ pub async fn spawn_raft_node(
             &mut heartbeat_timer,
             &config,
             &applied_ref,
+            &commit_ref,
         )
         .await;
         term_ref.store(core.state.persistent.current_term, Ordering::Relaxed);
@@ -157,7 +169,7 @@ pub async fn spawn_raft_node(
                 // Election timeout
                 _ = &mut election_timer => {
                     let actions = core.step(Event::ElectionTimeout);
-                    execute_actions(&actions, &log_store, &apply_tx, &mut pending_responses, &mut heartbeat_timer, &config, &applied_ref).await;
+                    execute_actions(&actions, &log_store, &apply_tx, &mut pending_responses, &mut heartbeat_timer, &config, &applied_ref, &commit_ref).await;
                     term_ref.store(core.state.persistent.current_term, Ordering::Relaxed);
                     leader_ref.store(core.state.leader_id.unwrap_or(0), Ordering::Relaxed);
                     election_timer = random_election_timeout(&config);
@@ -166,7 +178,7 @@ pub async fn spawn_raft_node(
                 // Heartbeat (leader only)
                 _ = heartbeat_tick(&mut heartbeat_timer) => {
                     let actions = core.step(Event::HeartbeatTimeout);
-                    execute_actions(&actions, &log_store, &apply_tx, &mut pending_responses, &mut heartbeat_timer, &config, &applied_ref).await;
+                    execute_actions(&actions, &log_store, &apply_tx, &mut pending_responses, &mut heartbeat_timer, &config, &applied_ref, &commit_ref).await;
                     term_ref.store(core.state.persistent.current_term, Ordering::Relaxed);
                     leader_ref.store(core.state.leader_id.unwrap_or(0), Ordering::Relaxed);
                 }
@@ -189,7 +201,7 @@ pub async fn spawn_raft_node(
                     }
 
                     let merged = merge_log_actions(all_actions);
-                    execute_actions(&merged, &log_store, &apply_tx, &mut pending_responses, &mut heartbeat_timer, &config, &applied_ref).await;
+                    execute_actions(&merged, &log_store, &apply_tx, &mut pending_responses, &mut heartbeat_timer, &config, &applied_ref, &commit_ref).await;
                     term_ref.store(core.state.persistent.current_term, Ordering::Relaxed);
                     leader_ref.store(core.state.leader_id.unwrap_or(0), Ordering::Relaxed);
                 }
@@ -197,7 +209,7 @@ pub async fn spawn_raft_node(
                 // Inbound Raft messages from peers (via transport)
                 Some((from, message)) = inbound_rx.recv() => {
                     let actions = core.step(Event::Message { from, message });
-                    execute_actions(&actions, &log_store, &apply_tx, &mut pending_responses, &mut heartbeat_timer, &config, &applied_ref).await;
+                    execute_actions(&actions, &log_store, &apply_tx, &mut pending_responses, &mut heartbeat_timer, &config, &applied_ref, &commit_ref).await;
                     term_ref.store(core.state.persistent.current_term, Ordering::Relaxed);
                     leader_ref.store(core.state.leader_id.unwrap_or(0), Ordering::Relaxed);
                 }
@@ -235,6 +247,7 @@ async fn execute_actions(
     heartbeat_timer: &mut Option<tokio::time::Interval>,
     config: &RaftConfig,
     applied_index: &Arc<AtomicU64>,
+    commit_index: &Arc<AtomicU64>,
 ) {
     for action in actions {
         match action {
@@ -251,6 +264,7 @@ async fn execute_actions(
                 let entries = log_store.get_range(*from, *to).unwrap();
                 apply_tx.send(entries).await.ok();
                 applied_index.store(*to, Ordering::Relaxed);
+                commit_index.store(*to, Ordering::Release);
             }
             Action::RespondToProposal { id, result } => {
                 if let Some(tx) = pending_responses.remove(id) {
@@ -310,9 +324,11 @@ pub async fn spawn_raft_node_rebar(
     let current_term = Arc::new(AtomicU64::new(0));
     let applied_index = Arc::new(AtomicU64::new(0));
     let leader_id_atomic = Arc::new(AtomicU64::new(0));
+    let commit_index = Arc::new(AtomicU64::new(0));
     let term_ref = Arc::clone(&current_term);
     let applied_ref = Arc::clone(&applied_index);
     let leader_ref = Arc::clone(&leader_id_atomic);
+    let commit_ref = Arc::clone(&commit_index);
 
     let handle = RaftHandle {
         proposal_tx,
@@ -320,6 +336,7 @@ pub async fn spawn_raft_node_rebar(
         current_term,
         applied_index,
         leader_id: leader_id_atomic,
+        commit_index,
     };
 
     let data_dir = config.data_dir.clone();
@@ -376,6 +393,7 @@ pub async fn spawn_raft_node_rebar(
                 &ctx,
                 &peers,
                 &applied_ref,
+                &commit_ref,
             )
             .await;
             term_ref.store(core.state.persistent.current_term, Ordering::Relaxed);
@@ -386,7 +404,7 @@ pub async fn spawn_raft_node_rebar(
                     // Election timeout
                     _ = &mut election_timer => {
                         let actions = core.step(Event::ElectionTimeout);
-                        let _reset = execute_actions_rebar(&actions, &log_store, &apply_tx, &mut pending_responses, &mut heartbeat_timer, &config, &ctx, &peers, &applied_ref).await;
+                        let _reset = execute_actions_rebar(&actions, &log_store, &apply_tx, &mut pending_responses, &mut heartbeat_timer, &config, &ctx, &peers, &applied_ref, &commit_ref).await;
                         term_ref.store(core.state.persistent.current_term, Ordering::Relaxed);
                     leader_ref.store(core.state.leader_id.unwrap_or(0), Ordering::Relaxed);
                         // Always reset after election timeout fires (start_election returns ResetElectionTimer)
@@ -396,7 +414,7 @@ pub async fn spawn_raft_node_rebar(
                     // Heartbeat (leader only)
                     _ = heartbeat_tick(&mut heartbeat_timer) => {
                         let actions = core.step(Event::HeartbeatTimeout);
-                        let reset = execute_actions_rebar(&actions, &log_store, &apply_tx, &mut pending_responses, &mut heartbeat_timer, &config, &ctx, &peers, &applied_ref).await;
+                        let reset = execute_actions_rebar(&actions, &log_store, &apply_tx, &mut pending_responses, &mut heartbeat_timer, &config, &ctx, &peers, &applied_ref, &commit_ref).await;
                         term_ref.store(core.state.persistent.current_term, Ordering::Relaxed);
                     leader_ref.store(core.state.leader_id.unwrap_or(0), Ordering::Relaxed);
                         if reset { election_timer = random_election_timeout(&config); }
@@ -420,7 +438,7 @@ pub async fn spawn_raft_node_rebar(
                         }
 
                         let merged = merge_log_actions(all_actions);
-                        let reset = execute_actions_rebar(&merged, &log_store, &apply_tx, &mut pending_responses, &mut heartbeat_timer, &config, &ctx, &peers, &applied_ref).await;
+                        let reset = execute_actions_rebar(&merged, &log_store, &apply_tx, &mut pending_responses, &mut heartbeat_timer, &config, &ctx, &peers, &applied_ref, &commit_ref).await;
                         term_ref.store(core.state.persistent.current_term, Ordering::Relaxed);
                         leader_ref.store(core.state.leader_id.unwrap_or(0), Ordering::Relaxed);
                         if reset { election_timer = random_election_timeout(&config); }
@@ -431,7 +449,7 @@ pub async fn spawn_raft_node_rebar(
                         if let Ok(raft_msg) = raft_message_from_value(msg.payload()) {
                             let from = msg.from().node_id();
                             let actions = core.step(Event::Message { from, message: raft_msg });
-                            let reset = execute_actions_rebar(&actions, &log_store, &apply_tx, &mut pending_responses, &mut heartbeat_timer, &config, &ctx, &peers, &applied_ref).await;
+                            let reset = execute_actions_rebar(&actions, &log_store, &apply_tx, &mut pending_responses, &mut heartbeat_timer, &config, &ctx, &peers, &applied_ref, &commit_ref).await;
                             term_ref.store(core.state.persistent.current_term, Ordering::Relaxed);
                     leader_ref.store(core.state.leader_id.unwrap_or(0), Ordering::Relaxed);
                             if reset { election_timer = random_election_timeout(&config); }
@@ -461,6 +479,7 @@ async fn execute_actions_rebar(
     ctx: &ProcessContext,
     peers: &Arc<Mutex<HashMap<u64, ProcessId>>>,
     applied_index: &Arc<AtomicU64>,
+    commit_index: &Arc<AtomicU64>,
 ) -> bool {
     let mut should_reset_election_timer = false;
     for action in actions {
@@ -478,6 +497,7 @@ async fn execute_actions_rebar(
                 let entries = log_store.get_range(*from, *to).unwrap();
                 apply_tx.send(entries).await.ok();
                 applied_index.store(*to, Ordering::Relaxed);
+                commit_index.store(*to, Ordering::Release);
             }
             Action::RespondToProposal { id, result } => {
                 if let Some(tx) = pending_responses.remove(id) {

@@ -25,6 +25,7 @@ use crate::proto::etcdserverpb::{alarm_request::AlarmAction, AlarmMember, AlarmT
 use crate::cluster::actor::ClusterActorHandle;
 use crate::kv::actor::KvStoreActorHandle;
 use crate::kv::apply_broker::{ApplyResult, ApplyResultBroker};
+use crate::kv::apply_notifier::ApplyNotifier;
 use crate::kv::state_machine::KvCommand;
 use crate::kv::store::{KvStore, TxnCompare, TxnCompareResult, TxnCompareTarget, TxnOp, TxnOpResponse};
 use crate::lease::manager::LeaseManager;
@@ -78,6 +79,7 @@ pub struct GatewayState {
     pub raft_handle: RaftHandle,
     pub alarms: Arc<Mutex<Vec<AlarmMember>>>,
     pub broker: Arc<ApplyResultBroker>,
+    pub apply_notifier: ApplyNotifier,
 }
 
 // ── JSON request / response types ───────────────────────────────────────────
@@ -507,6 +509,7 @@ pub fn create_router(
     auth_manager: AuthActorHandle,
     alarms: Arc<Mutex<Vec<AlarmMember>>>,
     broker: Arc<ApplyResultBroker>,
+    apply_notifier: ApplyNotifier,
 ) -> Router {
     let state = GatewayState {
         store,
@@ -521,6 +524,7 @@ pub fn create_router(
         raft_handle,
         alarms,
         broker,
+        apply_notifier,
     };
 
     Router::new()
@@ -579,6 +583,11 @@ async fn handle_range(
     let limit = req.limit.unwrap_or(0);
     let revision = req.revision.unwrap_or(0);
 
+    // ReadIndex: wait for apply to catch up to commit index so that reads
+    // after early-acked writes see the written data (linearizability).
+    let commit = state.raft_handle.commit_index();
+    state.apply_notifier.wait_for(commit).await;
+
     // Bypass the actor channel — run the range query directly on the
     // blocking thread pool.  redb supports concurrent read transactions
     // so multiple reads execute in parallel without serialising through
@@ -616,6 +625,27 @@ async fn handle_put(
     let value = decode_b64(&req.value);
     let lease_id = req.lease.unwrap_or(0);
 
+    // If prev_kv requested, read it BEFORE proposing. We must first wait
+    // for all committed entries to be applied (ReadIndex) so that previous
+    // early-acked writes are visible in the store.
+    let prev_kv = if req.prev_kv.unwrap_or(false) {
+        let commit = state.raft_handle.commit_index();
+        state.apply_notifier.wait_for(commit).await;
+
+        let store = Arc::clone(&state.store_direct);
+        let k = key.clone();
+        tokio::task::spawn_blocking(move || {
+            store.range(&k, &[], 0, 0).ok()
+                .and_then(|r| r.kvs.into_iter().next())
+        })
+        .await
+        .ok()
+        .flatten()
+        .map(|kv| proto_kv_to_json(&kv))
+    } else {
+        None
+    };
+
     // Serialize command and propose through Raft.
     let cmd = KvCommand::Put {
         key: key.clone(),
@@ -633,25 +663,13 @@ async fn handle_put(
     };
 
     match proposal_result {
-        ClientProposalResult::Success { index, .. } => {
-            // Wait for the state machine to apply this entry.
-            let result = state.broker.wait_for_result(index).await;
-            match result {
-                ApplyResult::Put(put_result) => {
-                    let prev_kv = if req.prev_kv.unwrap_or(false) {
-                        put_result.prev_kv.as_ref().map(proto_kv_to_json)
-                    } else {
-                        None
-                    };
-
-                    axum::Json(PutResponse {
-                        header: state.make_header(put_result.revision),
-                        prev_kv,
-                    })
-                    .into_response()
-                }
-                _ => json_error(StatusCode::INTERNAL_SERVER_ERROR, "unexpected apply result").into_response(),
-            }
+        ClientProposalResult::Success { revision, .. } => {
+            // Early ack: return immediately with pre-assigned revision — no broker wait.
+            axum::Json(PutResponse {
+                header: state.make_header(revision),
+                prev_kv,
+            })
+            .into_response()
         }
         ClientProposalResult::NotLeader { .. } => {
             json_error(StatusCode::SERVICE_UNAVAILABLE, "not leader").into_response()

@@ -60,7 +60,7 @@ async fn start_instance_with_lease_expiry() -> (SocketAddr, KvStoreActorHandle, 
         watch_hub.clone(),
         Arc::clone(&lease_manager),
         Arc::clone(&broker),
-        notifier,
+        notifier.clone(),
     ).await;
 
     // Spawn a lease expiry timer that checks every 500ms.
@@ -104,6 +104,7 @@ async fn start_instance_with_lease_expiry() -> (SocketAddr, KvStoreActorHandle, 
         auth_manager,
         Arc::new(std::sync::Mutex::new(vec![])),
         broker,
+        notifier,
     );
 
     let port = portpicker::pick_unused_port().unwrap();
