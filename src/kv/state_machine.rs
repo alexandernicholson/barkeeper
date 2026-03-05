@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 
 use super::apply_broker::{ApplyResult, ApplyResultBroker};
+use super::apply_notifier::ApplyNotifier;
 use super::store::{ApplyResultData, KvStore, TxnCompare, TxnOp};
 use crate::lease::manager::LeaseManager;
 use crate::raft::messages::{LogEntry, LogEntryData};
@@ -43,6 +44,7 @@ struct StateMachine {
     watch_hub: WatchHubActorHandle,
     lease_manager: Arc<LeaseManager>,
     broker: Arc<ApplyResultBroker>,
+    notifier: ApplyNotifier,
 }
 
 impl StateMachine {
@@ -51,8 +53,8 @@ impl StateMachine {
         // (e.g. after restart when Raft replays committed entries).
         let last_applied = self.store.last_applied_raft_index().unwrap_or(0);
 
-        // Collect applicable commands.
-        let mut commands = Vec::new();
+        // Collect applicable commands with their pre-assigned revisions.
+        let mut commands: Vec<(KvCommand, i64)> = Vec::new();
         let mut entry_indices = Vec::new();
 
         for entry in &entries {
@@ -63,7 +65,7 @@ impl StateMachine {
             }
 
             match &entry.data {
-                LogEntryData::Command { data, .. } => {
+                LogEntryData::Command { data, revision } => {
                     // Try bincode first, fall back to JSON for old entries.
                     let cmd_result = bincode::deserialize::<KvCommand>(data)
                         .or_else(|_| {
@@ -72,7 +74,7 @@ impl StateMachine {
                         });
                     match cmd_result {
                         Ok(cmd) => {
-                            commands.push(cmd);
+                            commands.push((cmd, *revision));
                             entry_indices.push(entry.index);
                         }
                         Err(_) => {
@@ -120,7 +122,7 @@ impl StateMachine {
                     }
 
                     // Attach keys to leases.
-                    if let KvCommand::Put { ref key, lease_id, .. } = commands[i] {
+                    if let KvCommand::Put { ref key, lease_id, .. } = commands[i].0 {
                         if lease_id != 0 {
                             self.lease_manager.attach_key(lease_id, key.clone()).await;
                         }
@@ -136,6 +138,9 @@ impl StateMachine {
                     };
                     self.broker.send_result(index, apply_result).await;
                 }
+
+                // Advance the notifier so waiters know entries up to last_index are applied.
+                self.notifier.advance(last_index);
             }
             Err(e) => {
                 tracing::error!(error = %e, "batch apply failed");
@@ -154,12 +159,14 @@ pub async fn spawn_state_machine(
     watch_hub: WatchHubActorHandle,
     lease_manager: Arc<LeaseManager>,
     broker: Arc<ApplyResultBroker>,
+    notifier: ApplyNotifier,
 ) {
     let sm = StateMachine {
         store,
         watch_hub,
         lease_manager,
         broker,
+        notifier,
     };
     tokio::spawn(async move {
         while let Some(entries) = apply_rx.recv().await {

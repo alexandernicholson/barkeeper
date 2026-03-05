@@ -18,6 +18,7 @@ use barkeeper::auth::actor::spawn_auth_actor;
 use barkeeper::cluster::actor::spawn_cluster_actor;
 use barkeeper::kv::actor::spawn_kv_store_actor;
 use barkeeper::kv::apply_broker::ApplyResultBroker;
+use barkeeper::kv::apply_notifier::ApplyNotifier;
 use barkeeper::kv::state_machine::spawn_state_machine;
 use barkeeper::kv::store::KvStore;
 use barkeeper::lease::manager::LeaseManager;
@@ -63,12 +64,14 @@ async fn start_test_instance() -> (SocketAddr, tempfile::TempDir) {
 
     let broker = Arc::new(ApplyResultBroker::new());
 
+    let notifier = ApplyNotifier::new(0);
     spawn_state_machine(
         apply_rx,
         Arc::clone(&kv_store),
         watch_hub.clone(),
         Arc::clone(&lease_manager),
         Arc::clone(&broker),
+        notifier,
     ).await;
 
     let app = gateway::create_router(

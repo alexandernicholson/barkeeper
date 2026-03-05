@@ -4,6 +4,7 @@ use tokio::sync::{Mutex, oneshot};
 use super::store::{DeleteResult, PutResult, TxnResult};
 
 /// Result of applying a committed Raft entry to the KV store.
+#[derive(Debug)]
 pub enum ApplyResult {
     Put(PutResult),
     DeleteRange(DeleteResult),

@@ -1,7 +1,8 @@
 use std::sync::Arc;
 
 use barkeeper::kv::actor::spawn_kv_store_actor;
-use barkeeper::kv::apply_broker::ApplyResultBroker;
+use barkeeper::kv::apply_broker::{ApplyResult, ApplyResultBroker};
+use barkeeper::kv::apply_notifier::ApplyNotifier;
 use barkeeper::kv::state_machine::{spawn_state_machine, KvCommand};
 use barkeeper::kv::store::KvStore;
 use barkeeper::lease::manager::LeaseManager;
@@ -28,8 +29,9 @@ async fn make_store_and_sm(
     let lease_manager = Arc::new(LeaseManager::new());
     let broker = Arc::new(ApplyResultBroker::new());
 
+    let notifier = ApplyNotifier::new(0);
     let (apply_tx, apply_rx) = mpsc::channel(256);
-    spawn_state_machine(apply_rx, store, watch_hub, lease_manager, broker).await;
+    spawn_state_machine(apply_rx, store, watch_hub, lease_manager, broker, notifier).await;
 
     (handle, apply_tx)
 }
@@ -170,4 +172,65 @@ async fn test_state_machine_multiple_puts() {
 
     // All 5 keys should exist.
     assert_eq!(handle.current_revision().await.unwrap(), 5);
+}
+
+/// State machine uses the pre-assigned revision from the log entry.
+#[tokio::test]
+async fn test_state_machine_uses_preassigned_revision() {
+    let dir = tempdir().unwrap();
+    let store = Arc::new(KvStore::open(dir.path().join("test.redb")).unwrap());
+    let runtime = Runtime::new(1);
+    let kv_handle = spawn_kv_store_actor(&runtime, Arc::clone(&store)).await;
+
+    let watch_runtime = Runtime::new(1);
+    let watch_hub = spawn_watch_hub_actor(&watch_runtime, Some(kv_handle.clone())).await;
+    let lease_manager = Arc::new(LeaseManager::new());
+    let broker = Arc::new(ApplyResultBroker::new());
+    let notifier = ApplyNotifier::new(0);
+
+    let (apply_tx, apply_rx) = mpsc::channel(256);
+    spawn_state_machine(
+        apply_rx,
+        Arc::clone(&store),
+        watch_hub,
+        lease_manager,
+        Arc::clone(&broker),
+        notifier.clone(),
+    )
+    .await;
+
+    // Create a log entry with pre-assigned revision 42.
+    let entry = LogEntry {
+        term: 1,
+        index: 1,
+        data: LogEntryData::Command {
+            data: bincode::serialize(&KvCommand::Put {
+                key: b"hello".to_vec(),
+                value: b"world".to_vec(),
+                lease_id: 0,
+            })
+            .unwrap(),
+            revision: 42,
+        },
+    };
+
+    apply_tx.send(vec![entry]).await.unwrap();
+
+    // Wait for the result via broker.
+    let result = broker.wait_for_result(1).await;
+    match result {
+        ApplyResult::Put(put_result) => {
+            assert_eq!(put_result.revision, 42, "broker result should have revision 42");
+        }
+        other => panic!("expected Put result, got {:?}", other),
+    }
+
+    // Verify the KV store has the key at mod_revision 42.
+    let range_result = kv_handle.range(b"hello".to_vec(), vec![], 0, 0).await.unwrap();
+    assert_eq!(range_result.kvs.len(), 1);
+    assert_eq!(range_result.kvs[0].mod_revision, 42, "stored key should have mod_revision 42");
+    assert_eq!(range_result.kvs[0].value, b"world");
+
+    // Verify the notifier was advanced.
+    assert_eq!(notifier.current(), 1, "notifier should be advanced to applied index 1");
 }

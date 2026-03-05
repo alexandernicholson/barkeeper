@@ -33,6 +33,7 @@ use crate::cluster::swim_service::SwimService;
 use crate::config::ClusterConfig;
 use crate::kv::actor::spawn_kv_store_actor;
 use crate::kv::apply_broker::ApplyResultBroker;
+use crate::kv::apply_notifier::ApplyNotifier;
 use crate::kv::state_machine::spawn_state_machine;
 use crate::kv::store::KvStore;
 use crate::lease::manager::LeaseManager;
@@ -287,12 +288,14 @@ impl BarkeepServer {
         let lease_manager = Arc::new(LeaseManager::new());
 
         // Spawn the state machine apply loop (needs Arc<KvStore>, watch_hub, lease_manager, broker).
+        let notifier = ApplyNotifier::new(0);
         spawn_state_machine(
             apply_rx,
             Arc::clone(&kv_store),
             watch_hub.clone(),
             Arc::clone(&lease_manager),
             Arc::clone(&broker),
+            notifier,
         ).await;
 
         // Create the KV gRPC service.

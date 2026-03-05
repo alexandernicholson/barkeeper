@@ -953,9 +953,13 @@ impl KvStore {
 
     /// Apply multiple KvCommands in a single redb write transaction, persisting
     /// `last_applied_index` at the end. Returns one `BatchOpResult` per command.
+    ///
+    /// Each command is paired with a pre-assigned revision. If the revision is > 0,
+    /// the store uses it instead of generating its own. If 0, the store auto-assigns
+    /// (backward-compatible behavior).
     pub fn batch_apply_with_index(
         &self,
-        commands: &[KvCommand],
+        commands: &[(KvCommand, i64)],
         last_applied_index: u64,
     ) -> Result<Vec<BatchOpResult>, redb::Error> {
         let txn = self.db.begin_write()?;
@@ -966,24 +970,24 @@ impl KvStore {
             let mut meta_table = txn.open_table(META_TABLE)?;
             let mut latest_table = txn.open_table(LATEST_TABLE)?;
 
-            for cmd in commands {
+            for (cmd, preassigned_rev) in commands {
                 let batch_result = match cmd {
                     KvCommand::Put { key, value, lease_id } => {
                         self.batch_put(
                             &mut kv_table, &mut rev_table, &mut meta_table, &mut latest_table,
-                            key, value, *lease_id,
+                            key, value, *lease_id, *preassigned_rev,
                         )?
                     }
                     KvCommand::DeleteRange { key, range_end } => {
                         self.batch_delete_range(
                             &mut kv_table, &mut rev_table, &mut meta_table, &mut latest_table,
-                            key, range_end,
+                            key, range_end, *preassigned_rev,
                         )?
                     }
                     KvCommand::Txn { compares, success, failure } => {
                         self.batch_txn(
                             &mut kv_table, &mut rev_table, &mut meta_table, &mut latest_table,
-                            compares, success, failure,
+                            compares, success, failure, *preassigned_rev,
                         )?
                     }
                     KvCommand::Compact { revision } => {
@@ -1013,6 +1017,8 @@ impl KvStore {
     }
 
     /// Put within an open write transaction. Returns BatchOpResult.
+    ///
+    /// If `preassigned_rev > 0`, the store uses it instead of auto-incrementing.
     fn batch_put(
         &self,
         kv_table: &mut redb::Table<&[u8], &[u8]>,
@@ -1022,8 +1028,14 @@ impl KvStore {
         key: &[u8],
         value: &[u8],
         lease_id: i64,
+        preassigned_rev: i64,
     ) -> Result<BatchOpResult, redb::Error> {
-        let new_rev = self.revision.fetch_add(1, Ordering::SeqCst) + 1;
+        let new_rev = if preassigned_rev > 0 {
+            self.revision.store(preassigned_rev, Ordering::SeqCst);
+            preassigned_rev
+        } else {
+            self.revision.fetch_add(1, Ordering::SeqCst) + 1
+        };
 
         let prev = self.find_latest_kv_in_table(kv_table, latest_table, key, new_rev as u64)?;
 
@@ -1080,6 +1092,8 @@ impl KvStore {
     }
 
     /// Delete range within an open write transaction. Returns BatchOpResult.
+    ///
+    /// If `preassigned_rev > 0`, the store uses it instead of auto-incrementing.
     fn batch_delete_range(
         &self,
         kv_table: &mut redb::Table<&[u8], &[u8]>,
@@ -1088,6 +1102,7 @@ impl KvStore {
         latest_table: &mut redb::Table<&[u8], u64>,
         key: &[u8],
         range_end: &[u8],
+        preassigned_rev: i64,
     ) -> Result<BatchOpResult, redb::Error> {
         let current_rev = self.revision.load(Ordering::SeqCst);
 
@@ -1120,7 +1135,12 @@ impl KvStore {
             });
         }
 
-        let new_rev = self.revision.fetch_add(1, Ordering::SeqCst) + 1;
+        let new_rev = if preassigned_rev > 0 {
+            self.revision.store(preassigned_rev, Ordering::SeqCst);
+            preassigned_rev
+        } else {
+            self.revision.fetch_add(1, Ordering::SeqCst) + 1
+        };
         let mut rev_entries = Vec::new();
         let mut prev_kvs = Vec::new();
         let mut watch_events = Vec::new();
@@ -1176,6 +1196,9 @@ impl KvStore {
     }
 
     /// Txn within an open write transaction. Returns BatchOpResult.
+    ///
+    /// If `preassigned_rev > 0`, it is used as the base revision for sub-operations.
+    /// Sub-ops get preassigned_rev, preassigned_rev+1, etc.
     fn batch_txn(
         &self,
         kv_table: &mut redb::Table<&[u8], &[u8]>,
@@ -1185,14 +1208,22 @@ impl KvStore {
         compares: &[TxnCompare],
         success: &[TxnOp],
         failure: &[TxnOp],
+        preassigned_rev: i64,
     ) -> Result<BatchOpResult, redb::Error> {
         // Evaluate compares against current in-transaction state.
         let current_rev = self.revision.load(Ordering::SeqCst);
         let succeeded = self.evaluate_compares_in_txn(kv_table, latest_table, compares, current_rev as u64)?;
 
+        // For Txn with pre-assigned revision, set up the base so sub-ops auto-increment
+        // from preassigned_rev. Sub-ops use preassigned_rev=0 (auto-assign) and the
+        // store's atomic counter provides the correct sequence.
+        if preassigned_rev > 0 {
+            self.revision.store(preassigned_rev - 1, Ordering::SeqCst);
+        }
+
         let ops = if succeeded { success } else { failure };
         let mut responses = Vec::new();
-        let mut final_revision = current_rev;
+        let mut final_revision = if preassigned_rev > 0 { preassigned_rev - 1 } else { current_rev };
         let mut all_watch_events = Vec::new();
 
         for op in ops {
@@ -1232,7 +1263,8 @@ impl KvStore {
                     responses.push(TxnOpResponse::Range(result));
                 }
                 TxnOp::Put { key, value, lease_id } => {
-                    let batch = self.batch_put(kv_table, rev_table, meta_table, latest_table, key, value, *lease_id)?;
+                    // Sub-ops use 0 (auto-assign); base was set above for pre-assigned Txn.
+                    let batch = self.batch_put(kv_table, rev_table, meta_table, latest_table, key, value, *lease_id, 0)?;
                     if let ApplyResultData::Put(ref r) = batch.apply_result {
                         final_revision = r.revision;
                         responses.push(TxnOpResponse::Put(PutResult {
@@ -1243,7 +1275,8 @@ impl KvStore {
                     all_watch_events.extend(batch.watch_events);
                 }
                 TxnOp::DeleteRange { key, range_end } => {
-                    let batch = self.batch_delete_range(kv_table, rev_table, meta_table, latest_table, key, range_end)?;
+                    // Sub-ops use 0 (auto-assign); base was set above for pre-assigned Txn.
+                    let batch = self.batch_delete_range(kv_table, rev_table, meta_table, latest_table, key, range_end, 0)?;
                     if let ApplyResultData::DeleteRange(ref r) = batch.apply_result {
                         final_revision = r.revision;
                         responses.push(TxnOpResponse::DeleteRange(DeleteResult {
