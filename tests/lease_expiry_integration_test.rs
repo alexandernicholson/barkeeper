@@ -37,7 +37,7 @@ async fn start_instance_with_lease_expiry() -> (SocketAddr, KvStoreActorHandle, 
         ..Default::default()
     };
 
-    let kv_store = Arc::new(KvStore::open(dir.path().join("kv.redb")).unwrap());
+    let kv_store = Arc::new(KvStore::open(dir.path()).unwrap());
     let kv_runtime = Runtime::new(1);
     let store = spawn_kv_store_actor(&kv_runtime, Arc::clone(&kv_store)).await;
 

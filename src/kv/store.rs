@@ -419,6 +419,19 @@ impl KvStore {
         range_end: &[u8],
     ) -> Result<DeleteResult, StoreError> {
         let mut inner = self.inner.write().unwrap();
+        // Check if anything exists to delete before bumping revision
+        let has_targets = if range_end.is_empty() {
+            find_latest_kv(&inner, key, inner.revision as u64).map_or(false, |kv| kv.version > 0)
+        } else {
+            !collect_unique_keys_in_range(&inner, key, range_end, inner.revision as u64)
+                .into_iter()
+                .filter(|k| find_latest_kv(&inner, k, inner.revision as u64).map_or(false, |kv| kv.version > 0))
+                .next()
+                .is_none()
+        };
+        if !has_targets {
+            return Ok(DeleteResult { deleted: 0, prev_kvs: vec![], revision: inner.revision });
+        }
         let new_rev = inner.revision + 1;
         inner.revision = new_rev;
         self.revision_atomic.store(new_rev, Ordering::SeqCst);

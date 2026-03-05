@@ -25,7 +25,7 @@ fn test_txn_success_path() {
     }];
     let failure = vec![];
 
-    let result = store.txn(compares, success, failure).unwrap();
+    let result = store.txn(&compares, &success, &failure).unwrap();
     assert!(result.succeeded, "txn should succeed when version matches");
     assert_eq!(result.responses.len(), 1);
 
@@ -62,7 +62,7 @@ fn test_txn_failure_path() {
         lease_id: 0,
     }];
 
-    let result = store.txn(compares, success, failure).unwrap();
+    let result = store.txn(&compares, &success, &failure).unwrap();
     assert!(
         !result.succeeded,
         "txn should fail when version does not match"
@@ -97,7 +97,7 @@ fn test_txn_with_range_op() {
     }];
     let failure = vec![];
 
-    let result = store.txn(compares, success, failure).unwrap();
+    let result = store.txn(&compares, &success, &failure).unwrap();
     assert!(result.succeeded);
     assert_eq!(result.responses.len(), 1);
 
@@ -126,7 +126,7 @@ fn test_txn_with_delete_op() {
     }];
     let failure = vec![];
 
-    let result = store.txn(compares, success, failure).unwrap();
+    let result = store.txn(&compares, &success, &failure).unwrap();
     assert!(result.succeeded, "empty compares should always succeed");
     assert_eq!(result.responses.len(), 1);
 
@@ -163,7 +163,7 @@ fn test_txn_value_compare() {
     }];
     let failure = vec![];
 
-    let result = store.txn(compares, success, failure).unwrap();
+    let result = store.txn(&compares, &success, &failure).unwrap();
     assert!(result.succeeded);
 
     let range = store.range(b"key1", b"", 0, 0).unwrap();

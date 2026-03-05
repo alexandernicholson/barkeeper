@@ -11,7 +11,7 @@ use rebar_core::runtime::Runtime;
 #[tokio::test]
 async fn test_txn_put_fires_watch_notification() {
     let dir = tempfile::tempdir().unwrap();
-    let store = Arc::new(KvStore::open(dir.path().join("kv.redb")).unwrap());
+    let store = Arc::new(KvStore::open(dir.path()).unwrap());
     let runtime = Runtime::new(1);
     let hub = spawn_watch_hub_actor(&runtime, None).await;
 
@@ -20,13 +20,13 @@ async fn test_txn_put_fires_watch_notification() {
 
     // Execute a txn that puts "txnkey".
     let result = store.txn(
-        vec![], // no compares
-        vec![barkeeper::kv::store::TxnOp::Put {
+        &[], // no compares
+        &[barkeeper::kv::store::TxnOp::Put {
             key: b"txnkey".to_vec(),
             value: b"txnval".to_vec(),
             lease_id: 0,
         }],
-        vec![],
+        &[],
     ).unwrap();
 
     // Fire notifications for the txn results.
@@ -66,7 +66,7 @@ async fn test_txn_put_fires_watch_notification() {
 #[tokio::test]
 async fn test_txn_delete_fires_watch_notification() {
     let dir = tempfile::tempdir().unwrap();
-    let store = Arc::new(KvStore::open(dir.path().join("kv.redb")).unwrap());
+    let store = Arc::new(KvStore::open(dir.path()).unwrap());
     let runtime = Runtime::new(1);
     let hub = spawn_watch_hub_actor(&runtime, None).await;
 
@@ -78,12 +78,12 @@ async fn test_txn_delete_fires_watch_notification() {
 
     // Execute a txn that deletes "delkey".
     let result = store.txn(
-        vec![],
-        vec![barkeeper::kv::store::TxnOp::DeleteRange {
+        &[],
+        &[barkeeper::kv::store::TxnOp::DeleteRange {
             key: b"delkey".to_vec(),
             range_end: vec![],
         }],
-        vec![],
+        &[],
     ).unwrap();
 
     // Fire notifications for the txn results.

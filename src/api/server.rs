@@ -88,7 +88,7 @@ impl BarkeepServer {
         std::fs::create_dir_all(&config.data_dir)?;
 
         // Open the KV store.
-        let kv_store = KvStore::open(format!("{}/kv.redb", config.data_dir))?;
+        let kv_store = KvStore::open(&config.data_dir)?;
 
         // Initialize the DistributedRuntime with TCP transport.
         let connector = Box::new(TcpConnector);

@@ -38,7 +38,7 @@ async fn start_test_instance() -> (SocketAddr, tempfile::TempDir) {
         ..Default::default()
     };
 
-    let kv_store = Arc::new(KvStore::open(dir.path().join("kv.redb")).expect("open KvStore"));
+    let kv_store = Arc::new(KvStore::open(dir.path()).expect("open KvStore"));
     let kv_runtime = Runtime::new(1);
     let store = spawn_kv_store_actor(&kv_runtime, Arc::clone(&kv_store)).await;
 

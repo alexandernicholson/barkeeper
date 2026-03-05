@@ -12,7 +12,7 @@ use rebar_core::runtime::Runtime;
 #[tokio::test]
 async fn test_watch_hub_receives_put_notification() {
     let dir = tempfile::tempdir().unwrap();
-    let store = Arc::new(KvStore::open(dir.path().join("kv.redb")).unwrap());
+    let store = Arc::new(KvStore::open(dir.path()).unwrap());
     let runtime = Runtime::new(1);
     let hub = spawn_watch_hub_actor(&runtime, None).await;
 
@@ -50,7 +50,7 @@ async fn test_watch_hub_receives_put_notification() {
 #[tokio::test]
 async fn test_watch_hub_receives_delete_notification() {
     let dir = tempfile::tempdir().unwrap();
-    let store = Arc::new(KvStore::open(dir.path().join("kv.redb")).unwrap());
+    let store = Arc::new(KvStore::open(dir.path()).unwrap());
     let runtime = Runtime::new(1);
     let hub = spawn_watch_hub_actor(&runtime, None).await;
 

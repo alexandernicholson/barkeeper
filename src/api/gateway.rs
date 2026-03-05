@@ -702,6 +702,7 @@ async fn handle_put(
     State(state): State<GatewayState>,
     body: axum::body::Bytes,
 ) -> impl IntoResponse {
+    let _put_t0 = std::time::Instant::now();
     let req: PutRequest = parse_json(&body);
     let key = decode_b64(&req.key);
     let value = decode_b64(&req.value);
@@ -744,7 +745,7 @@ async fn handle_put(
         Err(e) => return json_error(StatusCode::SERVICE_UNAVAILABLE, format!("raft: {}", e)).into_response(),
     };
 
-    match proposal_result {
+    let resp = match proposal_result {
         ClientProposalResult::Success { revision, .. } => {
             // No broker wait needed — WriteBuffer populated before this response.
             axum::Json(PutResponse {
@@ -759,7 +760,9 @@ async fn handle_put(
         ClientProposalResult::Error(e) => {
             json_error(StatusCode::INTERNAL_SERVER_ERROR, e).into_response()
         }
-    }
+    };
+    tracing::info!(elapsed_us = _put_t0.elapsed().as_micros() as u64, "handle_put");
+    resp
 }
 
 async fn handle_delete_range(

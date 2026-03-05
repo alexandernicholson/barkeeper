@@ -81,7 +81,7 @@ impl ReplicationCluster {
 
             // Each node gets its own KvStore.
             let store = Arc::new(
-                KvStore::open(data_dir.join("kv.redb")).expect("open KvStore"),
+                KvStore::open(&data_dir).expect("open KvStore"),
             );
 
             // Create ProcessTable and DistributedRouter for this node.
@@ -262,7 +262,7 @@ fn spawn_apply_loop(store: Arc<KvStore>, mut apply_rx: mpsc::Receiver<Vec<LogEnt
                                 let _ = store.delete_range(&key, &range_end);
                             }
                             KvCommand::Txn { compares, success, failure } => {
-                                let _ = store.txn(compares, success, failure);
+                                let _ = store.txn(&compares, &success, &failure);
                             }
                             KvCommand::Compact { revision } => {
                                 let _ = store.compact(revision);

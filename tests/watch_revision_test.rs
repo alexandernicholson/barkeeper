@@ -12,7 +12,7 @@ use tokio::time::{timeout, Duration};
 #[tokio::test]
 async fn test_changes_since_returns_mutations() {
     let dir = tempfile::tempdir().unwrap();
-    let store = Arc::new(KvStore::open(dir.path().join("kv.redb")).unwrap());
+    let store = Arc::new(KvStore::open(dir.path()).unwrap());
 
     // Create 3 revisions.
     store.put(b"a", b"v1", 0).unwrap(); // rev 1
@@ -30,7 +30,7 @@ async fn test_changes_since_returns_mutations() {
 #[tokio::test]
 async fn test_changes_since_zero_returns_all() {
     let dir = tempfile::tempdir().unwrap();
-    let store = Arc::new(KvStore::open(dir.path().join("kv.redb")).unwrap());
+    let store = Arc::new(KvStore::open(dir.path()).unwrap());
 
     store.put(b"x", b"v1", 0).unwrap();
     store.put(b"y", b"v2", 0).unwrap();
@@ -43,7 +43,7 @@ async fn test_changes_since_zero_returns_all() {
 #[tokio::test]
 async fn test_changes_since_includes_deletes() {
     let dir = tempfile::tempdir().unwrap();
-    let store = Arc::new(KvStore::open(dir.path().join("kv.redb")).unwrap());
+    let store = Arc::new(KvStore::open(dir.path()).unwrap());
 
     store.put(b"del", b"v1", 0).unwrap(); // rev 1
     store.delete_range(b"del", b"").unwrap(); // rev 2
@@ -58,7 +58,7 @@ async fn test_changes_since_includes_deletes() {
 #[tokio::test]
 async fn test_watchhub_replays_history() {
     let dir = tempfile::tempdir().unwrap();
-    let kv_store = KvStore::open(dir.path().join("kv.redb")).unwrap();
+    let kv_store = KvStore::open(dir.path()).unwrap();
     let kv_runtime = Runtime::new(1);
     let handle = spawn_kv_store_actor(&kv_runtime, std::sync::Arc::new(kv_store)).await;
     let watch_runtime = Runtime::new(1);

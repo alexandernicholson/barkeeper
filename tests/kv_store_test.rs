@@ -4,7 +4,7 @@ use tempfile::tempdir;
 #[test]
 fn test_empty_store() {
     let dir = tempdir().unwrap();
-    let store = KvStore::open(dir.path().join("test.redb")).unwrap();
+    let store = KvStore::open(dir.path()).unwrap();
     assert_eq!(store.current_revision().unwrap(), 0);
 
     let result = store.range(b"any", b"", 0, 0).unwrap();
@@ -15,7 +15,7 @@ fn test_empty_store() {
 #[test]
 fn test_put_and_range() {
     let dir = tempdir().unwrap();
-    let store = KvStore::open(dir.path().join("test.redb")).unwrap();
+    let store = KvStore::open(dir.path()).unwrap();
 
     let put_result = store.put(b"hello", b"world", 0).unwrap();
     assert_eq!(put_result.revision, 1);
@@ -33,7 +33,7 @@ fn test_put_and_range() {
 #[test]
 fn test_put_overwrite() {
     let dir = tempdir().unwrap();
-    let store = KvStore::open(dir.path().join("test.redb")).unwrap();
+    let store = KvStore::open(dir.path()).unwrap();
 
     // First put.
     store.put(b"key1", b"val1", 0).unwrap();
@@ -59,7 +59,7 @@ fn test_put_overwrite() {
 #[test]
 fn test_delete_range_single() {
     let dir = tempdir().unwrap();
-    let store = KvStore::open(dir.path().join("test.redb")).unwrap();
+    let store = KvStore::open(dir.path()).unwrap();
 
     store.put(b"foo", b"bar", 0).unwrap();
     assert_eq!(store.current_revision().unwrap(), 1);
@@ -78,7 +78,7 @@ fn test_delete_range_single() {
 #[test]
 fn test_delete_nonexistent() {
     let dir = tempdir().unwrap();
-    let store = KvStore::open(dir.path().join("test.redb")).unwrap();
+    let store = KvStore::open(dir.path()).unwrap();
 
     let del = store.delete_range(b"nokey", b"").unwrap();
     assert_eq!(del.deleted, 0);
@@ -90,7 +90,7 @@ fn test_delete_nonexistent() {
 #[test]
 fn test_range_prefix() {
     let dir = tempdir().unwrap();
-    let store = KvStore::open(dir.path().join("test.redb")).unwrap();
+    let store = KvStore::open(dir.path()).unwrap();
 
     store.put(b"aa", b"1", 0).unwrap();
     store.put(b"ab", b"2", 0).unwrap();
@@ -109,7 +109,7 @@ fn test_range_prefix() {
 #[test]
 fn test_revision_query() {
     let dir = tempdir().unwrap();
-    let store = KvStore::open(dir.path().join("test.redb")).unwrap();
+    let store = KvStore::open(dir.path()).unwrap();
 
     store.put(b"key", b"v1", 0).unwrap(); // rev 1
     store.put(b"key", b"v2", 0).unwrap(); // rev 2
@@ -134,7 +134,7 @@ fn test_revision_query() {
 #[test]
 fn test_range_limit() {
     let dir = tempdir().unwrap();
-    let store = KvStore::open(dir.path().join("test.redb")).unwrap();
+    let store = KvStore::open(dir.path()).unwrap();
 
     store.put(b"a", b"1", 0).unwrap();
     store.put(b"b", b"2", 0).unwrap();
