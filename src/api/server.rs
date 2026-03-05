@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::sync::atomic::AtomicI64;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -127,6 +128,10 @@ impl BarkeepServer {
         let peers: Arc<Mutex<HashMap<u64, ProcessId>>> =
             Arc::new(Mutex::new(HashMap::new()));
 
+        // Seed the Raft revision counter from the KvStore's current revision.
+        let initial_rev = kv_store.current_revision().unwrap_or(0);
+        let revision = Arc::new(AtomicI64::new(initial_rev));
+
         // Spawn the Raft node as a Rebar distributed actor.
         let raft_handle = spawn_raft_node_rebar(
             config.clone(),
@@ -134,6 +139,7 @@ impl BarkeepServer {
             runtime,
             Arc::clone(&registry),
             Arc::clone(&peers),
+            revision,
         )
         .await;
         let raft_term = Arc::clone(&raft_handle.current_term);

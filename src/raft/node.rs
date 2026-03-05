@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -89,6 +89,7 @@ impl RaftHandle {
 pub async fn spawn_raft_node(
     config: RaftConfig,
     apply_tx: mpsc::Sender<Vec<LogEntry>>,
+    revision: Arc<AtomicI64>,
 ) -> RaftHandle {
     let (proposal_tx, proposal_rx) = mpsc::channel::<ClientProposal>(256);
     let (inbound_tx, inbound_rx) = mpsc::channel::<(u64, RaftMessage)>(256);
@@ -112,7 +113,7 @@ pub async fn spawn_raft_node(
     let log_store =
         LogStore::open(format!("{}/raft.redb", data_dir)).expect("failed to open LogStore");
 
-    let mut core = RaftCore::new(config.node_id);
+    let mut core = RaftCore::new(config.node_id, revision);
 
     // Initialize from persistent state
     let hard_state = log_store.load_hard_state().unwrap();
@@ -298,6 +299,7 @@ pub async fn spawn_raft_node_rebar(
     runtime: &Runtime,
     registry: Arc<Mutex<Registry>>,
     peers: Arc<Mutex<HashMap<u64, ProcessId>>>,
+    revision: Arc<AtomicI64>,
 ) -> RaftHandle {
     let (proposal_tx, proposal_rx) = mpsc::channel::<ClientProposal>(256);
     // The Rebar version receives messages via ctx.recv() from the actor
@@ -326,7 +328,7 @@ pub async fn spawn_raft_node_rebar(
     let log_store =
         LogStore::open(format!("{}/raft.redb", data_dir)).expect("failed to open LogStore");
 
-    let mut core = RaftCore::new(config.node_id);
+    let mut core = RaftCore::new(config.node_id, revision);
 
     // Initialize from persistent state
     let hard_state = log_store.load_hard_state().unwrap();

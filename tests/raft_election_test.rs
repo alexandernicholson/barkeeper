@@ -1,9 +1,13 @@
+use std::sync::atomic::AtomicI64;
+use std::sync::Arc;
+
 use barkeeper::raft::core::*;
 use barkeeper::raft::messages::*;
 use barkeeper::raft::state::*;
 
 fn init_core(node_id: u64, peers: Vec<u64>) -> RaftCore {
-    let mut core = RaftCore::new(node_id);
+    let revision = Arc::new(AtomicI64::new(0));
+    let mut core = RaftCore::new(node_id, revision);
     core.step(Event::Initialize {
         peers,
         hard_state: None,

@@ -1,3 +1,6 @@
+use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::Arc;
+
 use super::messages::*;
 use super::state::*;
 
@@ -49,16 +52,20 @@ pub struct RaftCore {
     last_log_index: u64,
     last_log_term: u64,
     /// Pending client proposals awaiting commit (leader only).
-    pending_proposals: Vec<(u64, u64)>, // (proposal_id, log_index)
+    /// (proposal_id, log_index, assigned_revision)
+    pending_proposals: Vec<(u64, u64, i64)>,
+    /// Monotonic revision counter, shared with the server layer.
+    revision: Arc<AtomicI64>,
 }
 
 impl RaftCore {
-    pub fn new(node_id: u64) -> Self {
+    pub fn new(node_id: u64, revision: Arc<AtomicI64>) -> Self {
         RaftCore {
             state: RaftState::new(node_id),
             last_log_index: 0,
             last_log_term: 0,
             pending_proposals: Vec::new(),
+            revision,
         }
     }
 
@@ -195,14 +202,15 @@ impl RaftCore {
             }];
         }
 
+        let rev = self.revision.fetch_add(1, Ordering::SeqCst) + 1;
         let entry = LogEntry {
             term: self.state.persistent.current_term,
             index: self.last_log_index + 1,
-            data: LogEntryData::Command { data, revision: 0 },
+            data: LogEntryData::Command { data, revision: rev },
         };
         self.last_log_index = entry.index;
         self.last_log_term = entry.term;
-        self.pending_proposals.push((id, entry.index));
+        self.pending_proposals.push((id, entry.index, rev));
 
         let mut actions = vec![Action::AppendToLog(vec![entry])];
 
@@ -464,19 +472,19 @@ impl RaftCore {
             }];
 
             // Respond to any pending proposals that are now committed
-            let committed: Vec<(u64, u64)> = self
+            let committed: Vec<(u64, u64, i64)> = self
                 .pending_proposals
                 .iter()
-                .filter(|(_, idx)| *idx <= new_commit)
+                .filter(|(_, idx, _)| *idx <= new_commit)
                 .cloned()
                 .collect();
-            self.pending_proposals.retain(|(_, idx)| *idx > new_commit);
-            for (id, entry_index) in committed {
+            self.pending_proposals.retain(|(_, idx, _)| *idx > new_commit);
+            for (id, entry_index, rev) in committed {
                 actions.push(Action::RespondToProposal {
                     id,
                     result: ClientProposalResult::Success {
                         index: entry_index,
-                        revision: 0,
+                        revision: rev,
                     },
                 });
             }

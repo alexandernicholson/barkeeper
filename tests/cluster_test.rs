@@ -84,12 +84,14 @@ impl TestCluster {
 
             let (apply_tx, mut apply_rx) = mpsc::channel::<Vec<LogEntry>>(64);
 
+            let revision = Arc::new(std::sync::atomic::AtomicI64::new(0));
             let handle = spawn_raft_node_rebar(
                 config,
                 apply_tx,
                 &runtime,
                 Arc::clone(&registry),
                 Arc::clone(&peers),
+                revision,
             )
             .await;
 
