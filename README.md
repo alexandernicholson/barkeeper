@@ -311,13 +311,13 @@ Single-node, native on tmpfs. Load via [oha](https://github.com/hatoo/oha) again
 
 | Scenario | Barkeeper | etcd | Ratio |
 |---|---|---|---|
-| Write c=1 | 3,599 req/s | 2,340 req/s | **1.54x** |
-| Write c=100 | 4,713 req/s | 16,210 req/s | 0.29x |
-| Read c=100 | 32,596 req/s | 16,149 req/s | **2.02x** |
-| Read P99 | 6.63ms | 14.39ms | **2.2x faster** |
-| Mixed read (c=80) | 21,774 req/s | 11,207 req/s | **1.94x** |
-| Mixed write (c=20) | 2,371 req/s | 3,538 req/s | 0.67x |
-| Conn scaling c=1000 | 26,248 req/s | 16,959 req/s | **1.55x** |
+| Write c=1 | 4,970 req/s | 2,340 req/s | **2.12x** |
+| Write c=100 | 4,623 req/s | 16,210 req/s | 0.29x |
+| Read c=100 | 32,985 req/s | 16,149 req/s | **2.04x** |
+| Read P99 | 6.59ms | 14.39ms | **2.2x faster** |
+| Mixed read (c=80) | 22,363 req/s | 11,207 req/s | **2.00x** |
+| Mixed write (c=20) | 2,389 req/s | 3,538 req/s | 0.68x |
+| Conn scaling c=1000 | 27,222 req/s | 16,959 req/s | **1.61x** |
 
 Full results: [`bench/results/RESULTS.md`](bench/results/RESULTS.md)
 
@@ -337,7 +337,7 @@ barkeeper is a from-scratch implementation, not a fork of etcd. It aims for API 
 |-|------|-----------|
 | Language | Go | Rust |
 | Concurrency | goroutines | Rebar actor runtime (BEAM-inspired) |
-| Storage | bbolt (cgo) | redb (pure Rust, no C deps) |
+| Storage | bbolt (cgo) | Append-only WAL + redb (pure Rust, no C deps) |
 
 ## Building from Source
 
