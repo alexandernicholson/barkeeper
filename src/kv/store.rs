@@ -1,4 +1,5 @@
 use std::path::Path;
+use std::sync::atomic::{AtomicI64, Ordering};
 
 use redb::{Database, ReadableTable, TableDefinition};
 use serde::{Deserialize, Serialize};
@@ -14,6 +15,9 @@ const REV_TABLE: TableDefinition<u64, &[u8]> = TableDefinition::new("revisions")
 
 // Meta table: string key → bytes value
 const META_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("kv_meta");
+
+// Latest table: key → latest revision (index for O(1) lookups)
+const LATEST_TABLE: TableDefinition<&[u8], u64> = TableDefinition::new("kv_latest");
 
 // ── Internal serde-friendly KV representation ───────────────────────────────
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -51,6 +55,29 @@ enum EventType {
 struct RevisionEntry {
     key: Vec<u8>,
     event_type: EventType,
+}
+
+// ── Deserialization helpers (bincode-first with JSON fallback for migration) ─
+
+fn deserialize_kv(data: &[u8]) -> InternalKeyValue {
+    bincode::deserialize(data)
+        .unwrap_or_else(|_| serde_json::from_slice(data).expect("deserialize kv (json fallback)"))
+}
+
+fn deserialize_rev_entries(data: &[u8]) -> Vec<RevisionEntry> {
+    bincode::deserialize(data).unwrap_or_else(|_| {
+        serde_json::from_slice(data).expect("deserialize rev entries (json fallback)")
+    })
+}
+
+fn deserialize_i64(data: &[u8]) -> i64 {
+    bincode::deserialize(data)
+        .unwrap_or_else(|_| serde_json::from_slice(data).expect("deserialize i64 (json fallback)"))
+}
+
+fn deserialize_u64(data: &[u8]) -> u64 {
+    bincode::deserialize(data)
+        .unwrap_or_else(|_| serde_json::from_slice(data).expect("deserialize u64 (json fallback)"))
 }
 
 // ── Result types ────────────────────────────────────────────────────────────
@@ -177,6 +204,7 @@ fn extract_revision(compound: &[u8]) -> u64 {
 pub struct KvStore {
     db: Database,
     db_path: std::path::PathBuf,
+    revision: AtomicI64,
 }
 
 impl KvStore {
@@ -184,15 +212,74 @@ impl KvStore {
     pub fn open(path: impl AsRef<Path>) -> Result<Self, redb::Error> {
         let db_path = path.as_ref().to_path_buf();
         let db = Database::create(path)?;
+
         // Ensure all tables exist.
         let txn = db.begin_write()?;
         {
             txn.open_table(KV_TABLE)?;
             txn.open_table(REV_TABLE)?;
             txn.open_table(META_TABLE)?;
+            txn.open_table(LATEST_TABLE)?;
         }
         txn.commit()?;
-        Ok(KvStore { db, db_path })
+
+        // Load current revision from disk.
+        let current_rev = {
+            let rtxn = db.begin_read()?;
+            let meta_table = rtxn.open_table(META_TABLE)?;
+            match meta_table.get("revision")? {
+                Some(val) => deserialize_i64(val.value()),
+                None => 0,
+            }
+        };
+
+        // Populate LATEST_TABLE if it's empty but KV_TABLE has data (migration).
+        {
+            let rtxn = db.begin_read()?;
+            let latest_table = rtxn.open_table(LATEST_TABLE)?;
+            let kv_table = rtxn.open_table(KV_TABLE)?;
+            let latest_empty = latest_table.iter()?.next().is_none();
+            let kv_has_data = kv_table.iter()?.next().is_some();
+
+            if latest_empty && kv_has_data {
+                drop(latest_table);
+                drop(kv_table);
+                drop(rtxn);
+
+                // Build the LATEST_TABLE index by scanning KV_TABLE.
+                let wtxn = db.begin_write()?;
+                {
+                    let kv_table = wtxn.open_table(KV_TABLE)?;
+                    let mut latest_table = wtxn.open_table(LATEST_TABLE)?;
+
+                    let mut latest_per_key: std::collections::HashMap<Vec<u8>, u64> =
+                        std::collections::HashMap::new();
+
+                    for entry in kv_table.iter()? {
+                        let (ck, _) = entry?;
+                        let ck_bytes = ck.value();
+                        let user_key = extract_user_key(ck_bytes).to_vec();
+                        let rev = extract_revision(ck_bytes);
+
+                        let current_latest = latest_per_key.get(&user_key).copied().unwrap_or(0);
+                        if rev > current_latest {
+                            latest_per_key.insert(user_key, rev);
+                        }
+                    }
+
+                    for (key, rev) in &latest_per_key {
+                        latest_table.insert(key.as_slice(), *rev)?;
+                    }
+                }
+                wtxn.commit()?;
+            }
+        }
+
+        Ok(KvStore {
+            db,
+            db_path,
+            revision: AtomicI64::new(current_rev),
+        })
     }
 
     /// Get the database file size in bytes.
@@ -220,15 +307,7 @@ impl KvStore {
 
     /// Get the current revision number.
     pub fn current_revision(&self) -> Result<i64, redb::Error> {
-        let txn = self.db.begin_read()?;
-        let table = txn.open_table(META_TABLE)?;
-        match table.get("revision")? {
-            Some(val) => {
-                let rev: i64 = serde_json::from_slice(val.value()).expect("deserialize revision");
-                Ok(rev)
-            }
-            None => Ok(0),
-        }
+        Ok(self.revision.load(Ordering::SeqCst))
     }
 
     /// Get the last applied Raft log index (persisted in meta table).
@@ -237,7 +316,7 @@ impl KvStore {
         let table = txn.open_table(META_TABLE)?;
         match table.get("raft_applied_index")? {
             Some(val) => {
-                let idx: u64 = serde_json::from_slice(val.value()).expect("deserialize raft index");
+                let idx: u64 = deserialize_u64(val.value());
                 Ok(idx)
             }
             None => Ok(0),
@@ -249,7 +328,7 @@ impl KvStore {
         let txn = self.db.begin_write()?;
         {
             let mut table = txn.open_table(META_TABLE)?;
-            let val = serde_json::to_vec(&index).expect("serialize raft index");
+            let val = bincode::serialize(&index).expect("serialize raft index");
             table.insert("raft_applied_index", val.as_slice())?;
         }
         txn.commit()?;
@@ -273,16 +352,14 @@ impl KvStore {
             let mut kv_table = txn.open_table(KV_TABLE)?;
             let mut rev_table = txn.open_table(REV_TABLE)?;
             let mut meta_table = txn.open_table(META_TABLE)?;
+            let mut latest_table = txn.open_table(LATEST_TABLE)?;
 
-            // Load current revision.
-            let current_rev = match meta_table.get("revision")? {
-                Some(val) => serde_json::from_slice::<i64>(val.value()).expect("deser rev"),
-                None => 0,
-            };
-            let new_rev = current_rev + 1;
+            // Increment revision atomically.
+            let new_rev = self.revision.fetch_add(1, Ordering::SeqCst) + 1;
 
             // Look up previous value for this key.
-            let prev = self.find_latest_kv_in_table(&kv_table, key, new_rev as u64)?;
+            let prev =
+                self.find_latest_kv_in_table(&kv_table, &latest_table, key, new_rev as u64)?;
 
             let (create_revision, version) = match &prev {
                 Some(prev_kv) if prev_kv.version > 0 => {
@@ -305,7 +382,7 @@ impl KvStore {
             };
 
             let compound = make_compound_key(key, new_rev as u64);
-            let serialized = serde_json::to_vec(&ikv).expect("serialize kv");
+            let serialized = bincode::serialize(&ikv).expect("serialize kv");
             kv_table.insert(compound.as_slice(), serialized.as_slice())?;
 
             // Write revision entry.
@@ -313,12 +390,15 @@ impl KvStore {
                 key: key.to_vec(),
                 event_type: EventType::Put,
             }];
-            let rev_bytes = serde_json::to_vec(&rev_entries).expect("serialize rev entry");
+            let rev_bytes = bincode::serialize(&rev_entries).expect("serialize rev entry");
             rev_table.insert(new_rev as u64, rev_bytes.as_slice())?;
 
             // Update meta revision.
-            let rev_bytes = serde_json::to_vec(&new_rev).expect("serialize rev");
+            let rev_bytes = bincode::serialize(&new_rev).expect("serialize rev");
             meta_table.insert("revision", rev_bytes.as_slice())?;
+
+            // Update LATEST_TABLE.
+            latest_table.insert(key, new_rev as u64)?;
 
             result = PutResult {
                 revision: new_rev,
@@ -342,9 +422,11 @@ impl KvStore {
         let txn = self.db.begin_read()?;
         let kv_table = txn.open_table(KV_TABLE)?;
         let meta_table = txn.open_table(META_TABLE)?;
+        let latest_table = txn.open_table(LATEST_TABLE)?;
 
+        // For read transactions, read revision from META_TABLE for snapshot consistency.
         let max_rev = match meta_table.get("revision")? {
-            Some(val) => serde_json::from_slice::<i64>(val.value()).expect("deser rev"),
+            Some(val) => deserialize_i64(val.value()),
             None => 0,
         };
 
@@ -352,7 +434,12 @@ impl KvStore {
 
         if range_end.is_empty() {
             // Single key lookup.
-            let kv = self.find_latest_kv_at_rev_readonly(&kv_table, key, query_rev as u64)?;
+            let kv = self.find_latest_kv_at_rev_readonly(
+                &kv_table,
+                &latest_table,
+                key,
+                query_rev as u64,
+            )?;
             match kv {
                 Some(ikv) if ikv.version > 0 => Ok(RangeResult {
                     kvs: vec![ikv.to_proto()],
@@ -369,11 +456,17 @@ impl KvStore {
             // Range query [key, range_end).
             // We need to find all unique user keys in the range and get their
             // latest values at or before query_rev.
-            let all_keys = self.collect_unique_keys_in_range(&kv_table, key, range_end, query_rev as u64)?;
+            let all_keys =
+                self.collect_unique_keys_in_range(&kv_table, key, range_end, query_rev as u64)?;
 
             let mut kvs = Vec::new();
             for user_key in &all_keys {
-                if let Some(ikv) = self.find_latest_kv_at_rev_readonly(&kv_table, user_key, query_rev as u64)? {
+                if let Some(ikv) = self.find_latest_kv_at_rev_readonly(
+                    &kv_table,
+                    &latest_table,
+                    user_key,
+                    query_rev as u64,
+                )? {
                     if ikv.version > 0 {
                         kvs.push(ikv.to_proto());
                     }
@@ -410,26 +503,38 @@ impl KvStore {
             let mut kv_table = txn.open_table(KV_TABLE)?;
             let mut rev_table = txn.open_table(REV_TABLE)?;
             let mut meta_table = txn.open_table(META_TABLE)?;
+            let mut latest_table = txn.open_table(LATEST_TABLE)?;
 
-            let current_rev = match meta_table.get("revision")? {
-                Some(val) => serde_json::from_slice::<i64>(val.value()).expect("deser rev"),
-                None => 0,
-            };
+            let current_rev = self.revision.load(Ordering::SeqCst);
 
             // Find keys to delete.
             let keys_to_delete = if range_end.is_empty() {
                 // Single key.
-                match self.find_latest_kv_in_table(&kv_table, key, (current_rev + 1) as u64)? {
+                match self.find_latest_kv_in_table(
+                    &kv_table,
+                    &latest_table,
+                    key,
+                    (current_rev + 1) as u64,
+                )? {
                     Some(ikv) if ikv.version > 0 => vec![ikv],
                     _ => vec![],
                 }
             } else {
                 // Range [key, range_end).
-                let user_keys =
-                    self.collect_unique_keys_in_range_rw(&kv_table, key, range_end, (current_rev + 1) as u64)?;
+                let user_keys = self.collect_unique_keys_in_range_rw(
+                    &kv_table,
+                    key,
+                    range_end,
+                    (current_rev + 1) as u64,
+                )?;
                 let mut result = Vec::new();
                 for ukey in &user_keys {
-                    if let Some(ikv) = self.find_latest_kv_in_table(&kv_table, ukey, (current_rev + 1) as u64)? {
+                    if let Some(ikv) = self.find_latest_kv_in_table(
+                        &kv_table,
+                        &latest_table,
+                        ukey,
+                        (current_rev + 1) as u64,
+                    )? {
                         if ikv.version > 0 {
                             result.push(ikv);
                         }
@@ -445,7 +550,7 @@ impl KvStore {
                     prev_kvs: vec![],
                 };
             } else {
-                let new_rev = current_rev + 1;
+                let new_rev = self.revision.fetch_add(1, Ordering::SeqCst) + 1;
                 let mut rev_entries = Vec::new();
                 let mut prev_kvs = Vec::new();
 
@@ -461,8 +566,11 @@ impl KvStore {
                     };
 
                     let compound = make_compound_key(&ikv.key, new_rev as u64);
-                    let serialized = serde_json::to_vec(&tombstone).expect("serialize tombstone");
+                    let serialized = bincode::serialize(&tombstone).expect("serialize tombstone");
                     kv_table.insert(compound.as_slice(), serialized.as_slice())?;
+
+                    // Update LATEST_TABLE to point to the tombstone revision.
+                    latest_table.insert(ikv.key.as_slice(), new_rev as u64)?;
 
                     rev_entries.push(RevisionEntry {
                         key: ikv.key.clone(),
@@ -472,10 +580,10 @@ impl KvStore {
                     prev_kvs.push(ikv.to_proto());
                 }
 
-                let rev_bytes = serde_json::to_vec(&rev_entries).expect("serialize rev entries");
+                let rev_bytes = bincode::serialize(&rev_entries).expect("serialize rev entries");
                 rev_table.insert(new_rev as u64, rev_bytes.as_slice())?;
 
-                let rev_meta = serde_json::to_vec(&new_rev).expect("serialize rev");
+                let rev_meta = bincode::serialize(&new_rev).expect("serialize rev");
                 meta_table.insert("revision", rev_meta.as_slice())?;
 
                 result = DeleteResult {
@@ -579,8 +687,7 @@ impl KvStore {
                             if rev > *existing_rev {
                                 // This is newer; the old one should be removed.
                                 keys_to_remove.push(existing_ck.clone());
-                                latest_per_key
-                                    .insert(user_key, (rev, ck_bytes));
+                                latest_per_key.insert(user_key, (rev, ck_bytes));
                             } else {
                                 // This is older; remove it.
                                 keys_to_remove.push(ck_bytes);
@@ -630,8 +737,7 @@ impl KvStore {
         for entry in range {
             let (rev_key, rev_val) = entry?;
             let revision = rev_key.value();
-            let entries: Vec<RevisionEntry> = serde_json::from_slice(rev_val.value())
-                .expect("deserialize revision entries");
+            let entries: Vec<RevisionEntry> = deserialize_rev_entries(rev_val.value());
 
             for re in entries {
                 let event_type = match re.event_type {
@@ -642,8 +748,7 @@ impl KvStore {
                 let compound = make_compound_key(&re.key, revision);
                 let kv = match kv_table.get(compound.as_slice())? {
                     Some(val) => {
-                        let ikv: InternalKeyValue = serde_json::from_slice(val.value())
-                            .expect("deserialize kv");
+                        let ikv: InternalKeyValue = deserialize_kv(val.value());
                         ikv.to_proto()
                     }
                     None => mvccpb::KeyValue {
@@ -667,14 +772,20 @@ impl KvStore {
         let txn = self.db.begin_read()?;
         let kv_table = txn.open_table(KV_TABLE)?;
         let meta_table = txn.open_table(META_TABLE)?;
+        let latest_table = txn.open_table(LATEST_TABLE)?;
 
         let current_rev = match meta_table.get("revision")? {
-            Some(val) => serde_json::from_slice::<i64>(val.value()).expect("deser rev"),
+            Some(val) => deserialize_i64(val.value()),
             None => 0,
         };
 
         for cmp in compares {
-            let kv = self.find_latest_kv_at_rev_readonly(&kv_table, &cmp.key, current_rev as u64)?;
+            let kv = self.find_latest_kv_at_rev_readonly(
+                &kv_table,
+                &latest_table,
+                &cmp.key,
+                current_rev as u64,
+            )?;
 
             let passes = match &cmp.target {
                 TxnCompareTarget::Version(target_val) => {
@@ -711,14 +822,28 @@ impl KvStore {
     }
 
     /// Find the latest value for a user key at or before the given revision.
-    /// Works with a writable table reference.
+    /// Works with a writable table reference. Uses LATEST_TABLE for O(1) lookups
+    /// when possible, falling back to range scan for historical queries.
     fn find_latest_kv_in_table(
         &self,
         table: &redb::Table<&[u8], &[u8]>,
+        latest_table: &redb::Table<&[u8], u64>,
         key: &[u8],
         before_rev: u64,
     ) -> Result<Option<InternalKeyValue>, redb::Error> {
-        // Scan compound keys with prefix = key + \x00, going backwards from before_rev.
+        // Try LATEST_TABLE first for O(1) lookup.
+        if let Some(latest_rev_guard) = latest_table.get(key)? {
+            let latest_rev = latest_rev_guard.value();
+            if latest_rev < before_rev {
+                // The latest revision is before our cutoff — direct point lookup.
+                let compound = make_compound_key(key, latest_rev);
+                if let Some(val) = table.get(compound.as_slice())? {
+                    return Ok(Some(deserialize_kv(val.value())));
+                }
+            }
+        }
+
+        // Fall back to range scan (for historical queries or if LATEST_TABLE miss).
         let start = make_compound_key(key, 0);
         let end = make_compound_key(key, before_rev);
 
@@ -727,8 +852,7 @@ impl KvStore {
             let (ck, val) = entry?;
             let ck_bytes = ck.value();
             if extract_user_key(ck_bytes) == key {
-                let ikv: InternalKeyValue =
-                    serde_json::from_slice(val.value()).expect("deserialize kv");
+                let ikv: InternalKeyValue = deserialize_kv(val.value());
                 latest = Some(ikv);
             }
         }
@@ -736,13 +860,28 @@ impl KvStore {
     }
 
     /// Find the latest value for a user key at or before the given revision.
-    /// Works with a read-only table reference.
+    /// Works with a read-only table reference. Uses LATEST_TABLE for O(1) lookups
+    /// when possible, falling back to range scan for historical queries.
     fn find_latest_kv_at_rev_readonly(
         &self,
         table: &redb::ReadOnlyTable<&[u8], &[u8]>,
+        latest_table: &redb::ReadOnlyTable<&[u8], u64>,
         key: &[u8],
         at_rev: u64,
     ) -> Result<Option<InternalKeyValue>, redb::Error> {
+        // Try LATEST_TABLE first for O(1) lookup.
+        if let Some(latest_rev_guard) = latest_table.get(key)? {
+            let latest_rev = latest_rev_guard.value();
+            if latest_rev <= at_rev {
+                // The latest revision is at or before our cutoff — direct point lookup.
+                let compound = make_compound_key(key, latest_rev);
+                if let Some(val) = table.get(compound.as_slice())? {
+                    return Ok(Some(deserialize_kv(val.value())));
+                }
+            }
+        }
+
+        // Fall back to range scan (for historical queries or if LATEST_TABLE miss).
         let start = make_compound_key(key, 0);
         let end = make_compound_key(key, at_rev);
 
@@ -751,8 +890,7 @@ impl KvStore {
             let (ck, val) = entry?;
             let ck_bytes = ck.value();
             if extract_user_key(ck_bytes) == key {
-                let ikv: InternalKeyValue =
-                    serde_json::from_slice(val.value()).expect("deserialize kv");
+                let ikv: InternalKeyValue = deserialize_kv(val.value());
                 latest = Some(ikv);
             }
         }
