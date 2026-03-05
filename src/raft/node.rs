@@ -170,24 +170,13 @@ pub async fn spawn_raft_node(
                     leader_ref.store(core.state.leader_id.unwrap_or(0), Ordering::Relaxed);
                 }
 
-                // Client proposals (batched with yield window)
+                // Client proposals (batched)
                 Some(proposal) = proposal_rx.recv() => {
                     let mut proposals = vec![proposal];
-                    // Drain anything already queued.
                     while proposals.len() < 128 {
                         match proposal_rx.try_recv() {
                             Ok(p) => proposals.push(p),
                             Err(_) => break,
-                        }
-                    }
-                    // If we didn't fill the batch, yield briefly to let more arrive.
-                    if proposals.len() < 128 {
-                        tokio::time::sleep(std::time::Duration::from_micros(500)).await;
-                        while proposals.len() < 128 {
-                            match proposal_rx.try_recv() {
-                                Ok(p) => proposals.push(p),
-                                Err(_) => break,
-                            }
                         }
                     }
 
@@ -411,22 +400,13 @@ pub async fn spawn_raft_node_rebar(
                         if reset { election_timer = random_election_timeout(&config); }
                     }
 
-                    // Client proposals (batched with yield window)
+                    // Client proposals (batched)
                     Some(proposal) = proposal_rx.recv() => {
                         let mut proposals = vec![proposal];
                         while proposals.len() < 128 {
                             match proposal_rx.try_recv() {
                                 Ok(p) => proposals.push(p),
                                 Err(_) => break,
-                            }
-                        }
-                        if proposals.len() < 128 {
-                            tokio::time::sleep(std::time::Duration::from_micros(500)).await;
-                            while proposals.len() < 128 {
-                                match proposal_rx.try_recv() {
-                                    Ok(p) => proposals.push(p),
-                                    Err(_) => break,
-                                }
                             }
                         }
 
