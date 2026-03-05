@@ -170,13 +170,24 @@ pub async fn spawn_raft_node(
                     leader_ref.store(core.state.leader_id.unwrap_or(0), Ordering::Relaxed);
                 }
 
-                // Client proposals (batched)
+                // Client proposals (batched with yield window)
                 Some(proposal) = proposal_rx.recv() => {
                     let mut proposals = vec![proposal];
-                    while proposals.len() < 64 {
+                    // Drain anything already queued.
+                    while proposals.len() < 128 {
                         match proposal_rx.try_recv() {
                             Ok(p) => proposals.push(p),
                             Err(_) => break,
+                        }
+                    }
+                    // If we didn't fill the batch, yield briefly to let more arrive.
+                    if proposals.len() < 128 {
+                        tokio::time::sleep(std::time::Duration::from_micros(500)).await;
+                        while proposals.len() < 128 {
+                            match proposal_rx.try_recv() {
+                                Ok(p) => proposals.push(p),
+                                Err(_) => break,
+                            }
                         }
                     }
 
@@ -400,13 +411,22 @@ pub async fn spawn_raft_node_rebar(
                         if reset { election_timer = random_election_timeout(&config); }
                     }
 
-                    // Client proposals (batched)
+                    // Client proposals (batched with yield window)
                     Some(proposal) = proposal_rx.recv() => {
                         let mut proposals = vec![proposal];
-                        while proposals.len() < 64 {
+                        while proposals.len() < 128 {
                             match proposal_rx.try_recv() {
                                 Ok(p) => proposals.push(p),
                                 Err(_) => break,
+                            }
+                        }
+                        if proposals.len() < 128 {
+                            tokio::time::sleep(std::time::Duration::from_micros(500)).await;
+                            while proposals.len() < 128 {
+                                match proposal_rx.try_recv() {
+                                    Ok(p) => proposals.push(p),
+                                    Err(_) => break,
+                                }
                             }
                         }
 
@@ -420,7 +440,7 @@ pub async fn spawn_raft_node_rebar(
                         let merged = merge_log_actions(all_actions);
                         let reset = execute_actions_rebar(&merged, &log_store, &apply_tx, &mut pending_responses, &mut heartbeat_timer, &config, &ctx, &peers, &applied_ref).await;
                         term_ref.store(core.state.persistent.current_term, Ordering::Relaxed);
-                    leader_ref.store(core.state.leader_id.unwrap_or(0), Ordering::Relaxed);
+                        leader_ref.store(core.state.leader_id.unwrap_or(0), Ordering::Relaxed);
                         if reset { election_timer = random_election_timeout(&config); }
                     }
 
