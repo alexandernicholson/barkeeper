@@ -10,7 +10,7 @@ fn test_raft_message_roundtrip_append_entries_req() {
         entries: vec![LogEntry {
             term: 3,
             index: 11,
-            data: LogEntryData::Command(b"hello".to_vec()),
+            data: LogEntryData::Command { data: b"hello".to_vec(), revision: 0 },
         }],
         leader_commit: 10,
     });

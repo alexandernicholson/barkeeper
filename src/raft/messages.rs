@@ -12,7 +12,7 @@ pub struct LogEntry {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum LogEntryData {
     /// A client KV operation to apply to the state machine.
-    Command(Vec<u8>),
+    Command { data: Vec<u8>, revision: i64 },
     /// A cluster membership change.
     ConfigChange(ConfigChange),
     /// No-op entry (used after leader election).

@@ -43,14 +43,15 @@ async fn test_state_machine_apply_put() {
     let entry = LogEntry {
         term: 1,
         index: 1,
-        data: LogEntryData::Command(
-            serde_json::to_vec(&KvCommand::Put {
+        data: LogEntryData::Command {
+            data: serde_json::to_vec(&KvCommand::Put {
                 key: b"hello".to_vec(),
                 value: b"world".to_vec(),
                 lease_id: 0,
             })
             .unwrap(),
-        ),
+            revision: 0,
+        },
     };
 
     apply_tx.send(vec![entry]).await.unwrap();
@@ -71,25 +72,27 @@ async fn test_state_machine_apply_delete() {
         LogEntry {
             term: 1,
             index: 1,
-            data: LogEntryData::Command(
-                serde_json::to_vec(&KvCommand::Put {
+            data: LogEntryData::Command {
+                data: serde_json::to_vec(&KvCommand::Put {
                     key: b"key".to_vec(),
                     value: b"val".to_vec(),
                     lease_id: 0,
                 })
                 .unwrap(),
-            ),
+                revision: 0,
+            },
         },
         LogEntry {
             term: 1,
             index: 2,
-            data: LogEntryData::Command(
-                serde_json::to_vec(&KvCommand::DeleteRange {
+            data: LogEntryData::Command {
+                data: serde_json::to_vec(&KvCommand::DeleteRange {
                     key: b"key".to_vec(),
                     range_end: b"".to_vec(),
                 })
                 .unwrap(),
-            ),
+                revision: 0,
+            },
         },
     ];
 
@@ -150,14 +153,15 @@ async fn test_state_machine_multiple_puts() {
         .map(|i| LogEntry {
             term: 1,
             index: i,
-            data: LogEntryData::Command(
-                serde_json::to_vec(&KvCommand::Put {
+            data: LogEntryData::Command {
+                data: serde_json::to_vec(&KvCommand::Put {
                     key: format!("key{}", i).into_bytes(),
                     value: format!("val{}", i).into_bytes(),
                     lease_id: 0,
                 })
                 .unwrap(),
-            ),
+                revision: 0,
+            },
         })
         .collect();
 

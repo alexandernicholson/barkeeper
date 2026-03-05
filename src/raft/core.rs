@@ -198,7 +198,7 @@ impl RaftCore {
         let entry = LogEntry {
             term: self.state.persistent.current_term,
             index: self.last_log_index + 1,
-            data: LogEntryData::Command(data),
+            data: LogEntryData::Command { data, revision: 0 },
         };
         self.last_log_index = entry.index;
         self.last_log_term = entry.term;

@@ -247,7 +247,7 @@ fn spawn_apply_loop(store: Arc<KvStore>, mut apply_rx: mpsc::Receiver<Vec<LogEnt
     tokio::spawn(async move {
         while let Some(entries) = apply_rx.recv().await {
             for entry in entries {
-                if let LogEntryData::Command(data) = entry.data {
+                if let LogEntryData::Command { data, .. } = entry.data {
                     if let Ok(cmd) = serde_json::from_slice::<KvCommand>(&data) {
                         match cmd {
                             KvCommand::Put { key, value, lease_id } => {

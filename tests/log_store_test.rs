@@ -7,7 +7,7 @@ fn make_entry(term: u64, index: u64, data: &str) -> LogEntry {
     LogEntry {
         term,
         index,
-        data: LogEntryData::Command(data.as_bytes().to_vec()),
+        data: LogEntryData::Command { data: data.as_bytes().to_vec(), revision: 0 },
     }
 }
 

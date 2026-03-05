@@ -56,7 +56,7 @@ fn test_log_entry_variants() {
     let cmd = LogEntry {
         term: 1,
         index: 1,
-        data: LogEntryData::Command(b"put key value".to_vec()),
+        data: LogEntryData::Command { data: b"put key value".to_vec(), revision: 0 },
     };
     assert_eq!(cmd.term, 1);
 
@@ -66,6 +66,25 @@ fn test_log_entry_variants() {
         data: LogEntryData::Noop,
     };
     assert_eq!(noop.index, 2);
+}
+
+#[test]
+fn test_log_entry_command_with_revision() {
+    let entry = LogEntry {
+        term: 1,
+        index: 1,
+        data: LogEntryData::Command {
+            data: vec![1, 2, 3],
+            revision: 42,
+        },
+    };
+    match &entry.data {
+        LogEntryData::Command { data, revision } => {
+            assert_eq!(data, &vec![1, 2, 3]);
+            assert_eq!(*revision, 42);
+        }
+        _ => panic!("expected Command"),
+    }
 }
 
 #[test]

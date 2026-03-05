@@ -63,7 +63,7 @@ impl StateMachine {
             }
 
             match &entry.data {
-                LogEntryData::Command(data) => {
+                LogEntryData::Command { data, .. } => {
                     // Try bincode first, fall back to JSON for old entries.
                     let cmd_result = bincode::deserialize::<KvCommand>(data)
                         .or_else(|_| {
