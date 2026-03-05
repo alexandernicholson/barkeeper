@@ -109,9 +109,12 @@ impl BarkeepServer {
 
         tracing::info!("started Rebar supervisor");
 
+        // Wrap KvStore in Arc for shared access (state machine + actor).
+        let kv_store = Arc::new(kv_store);
+
         // Spawn the KvStore actor on a standalone Rebar runtime.
         let kv_runtime = rebar_core::runtime::Runtime::new(config.node_id);
-        let store = spawn_kv_store_actor(&kv_runtime, kv_store).await;
+        let store = spawn_kv_store_actor(&kv_runtime, Arc::clone(&kv_store)).await;
 
         // Create the apply channel between Raft and the state machine.
         let (apply_tx, apply_rx) = mpsc::channel(256);
@@ -277,10 +280,10 @@ impl BarkeepServer {
         // Create the Lease manager and gRPC service.
         let lease_manager = Arc::new(LeaseManager::new());
 
-        // Spawn the state machine apply loop (needs store, watch_hub, lease_manager, broker).
+        // Spawn the state machine apply loop (needs Arc<KvStore>, watch_hub, lease_manager, broker).
         spawn_state_machine(
             apply_rx,
-            store.clone(),
+            Arc::clone(&kv_store),
             watch_hub.clone(),
             Arc::clone(&lease_manager),
             Arc::clone(&broker),

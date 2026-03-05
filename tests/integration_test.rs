@@ -1,30 +1,44 @@
+use std::sync::Arc;
+
 use barkeeper::kv::actor::spawn_kv_store_actor;
+use barkeeper::kv::apply_broker::ApplyResultBroker;
 use barkeeper::kv::state_machine::{spawn_state_machine, KvCommand};
 use barkeeper::kv::store::KvStore;
+use barkeeper::lease::manager::LeaseManager;
 use barkeeper::raft::messages::{LogEntry, LogEntryData};
+use barkeeper::watch::actor::spawn_watch_hub_actor;
 use rebar_core::runtime::Runtime;
 use tempfile::tempdir;
 use tokio::sync::mpsc;
 
-/// Helper: open a KvStore and spawn the actor, returning the handle.
-async fn make_store_handle(
+/// Helper: open a KvStore and spawn the actor + state machine, returning the
+/// actor handle and the apply channel sender.
+async fn make_store_and_sm(
     dir: &tempfile::TempDir,
-) -> barkeeper::kv::actor::KvStoreActorHandle {
-    let store = KvStore::open(dir.path().join("test.redb")).unwrap();
+) -> (
+    barkeeper::kv::actor::KvStoreActorHandle,
+    mpsc::Sender<Vec<LogEntry>>,
+) {
+    let store = Arc::new(KvStore::open(dir.path().join("test.redb")).unwrap());
     let runtime = Runtime::new(1);
-    spawn_kv_store_actor(&runtime, store).await
+    let handle = spawn_kv_store_actor(&runtime, Arc::clone(&store)).await;
+
+    let watch_runtime = Runtime::new(1);
+    let watch_hub = spawn_watch_hub_actor(&watch_runtime, Some(handle.clone())).await;
+    let lease_manager = Arc::new(LeaseManager::new());
+    let broker = Arc::new(ApplyResultBroker::new());
+
+    let (apply_tx, apply_rx) = mpsc::channel(256);
+    spawn_state_machine(apply_rx, store, watch_hub, lease_manager, broker).await;
+
+    (handle, apply_tx)
 }
 
-/// State machine accepts committed entries without panicking.
-/// The state machine only logs entries; actual application happens at the
-/// service layer after Raft commit.
+/// State machine applies a put entry to the store.
 #[tokio::test]
 async fn test_state_machine_apply_put() {
-    let (apply_tx, apply_rx) = mpsc::channel(256);
-    spawn_state_machine(apply_rx).await;
-
     let dir = tempdir().unwrap();
-    let handle = make_store_handle(&dir).await;
+    let (handle, apply_tx) = make_store_and_sm(&dir).await;
 
     let entry = LogEntry {
         term: 1,
@@ -39,19 +53,19 @@ async fn test_state_machine_apply_put() {
         ),
     };
 
-    // Send entry to state machine — should not panic.
     apply_tx.send(vec![entry]).await.unwrap();
-    tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
-    // Store remains empty: the service layer applies after Raft commit.
+    // State machine now applies to the store.
     let result = handle.range(b"hello".to_vec(), vec![], 0, 0).await.unwrap();
-    assert_eq!(result.kvs.len(), 0);
+    assert_eq!(result.kvs.len(), 1);
+    assert_eq!(result.kvs[0].value, b"world");
 }
 
 #[tokio::test]
 async fn test_state_machine_apply_delete() {
-    let (apply_tx, apply_rx) = mpsc::channel(256);
-    spawn_state_machine(apply_rx).await;
+    let dir = tempdir().unwrap();
+    let (handle, apply_tx) = make_store_and_sm(&dir).await;
 
     let entries = vec![
         LogEntry {
@@ -80,10 +94,9 @@ async fn test_state_machine_apply_delete() {
     ];
 
     apply_tx.send(entries).await.unwrap();
-    tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
-    let dir = tempdir().unwrap();
-    let handle = make_store_handle(&dir).await;
+    // Key should be deleted.
     let result = handle.range(b"key".to_vec(), vec![], 0, 0).await.unwrap();
     assert_eq!(result.kvs.len(), 0);
 }
@@ -92,19 +105,27 @@ async fn test_state_machine_apply_delete() {
 #[tokio::test]
 async fn test_kv_store_actor_write_read() {
     let dir = tempdir().unwrap();
-    let handle = make_store_handle(&dir).await;
+    let store = KvStore::open(dir.path().join("test.redb")).unwrap();
+    let runtime = Runtime::new(1);
+    let handle = spawn_kv_store_actor(&runtime, Arc::new(store)).await;
 
-    handle.put(b"shared".to_vec(), b"data".to_vec(), 0).await.unwrap();
+    handle
+        .put(b"shared".to_vec(), b"data".to_vec(), 0)
+        .await
+        .unwrap();
 
-    let result = handle.range(b"shared".to_vec(), vec![], 0, 0).await.unwrap();
+    let result = handle
+        .range(b"shared".to_vec(), vec![], 0, 0)
+        .await
+        .unwrap();
     assert_eq!(result.kvs.len(), 1);
     assert_eq!(result.kvs[0].value, b"data");
 }
 
 #[tokio::test]
 async fn test_state_machine_noop_ignored() {
-    let (apply_tx, apply_rx) = mpsc::channel(256);
-    spawn_state_machine(apply_rx).await;
+    let dir = tempdir().unwrap();
+    let (handle, apply_tx) = make_store_and_sm(&dir).await;
 
     let noop_entry = LogEntry {
         term: 1,
@@ -114,18 +135,16 @@ async fn test_state_machine_noop_ignored() {
 
     // Should not panic on noop.
     apply_tx.send(vec![noop_entry]).await.unwrap();
-    tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
-    let dir = tempdir().unwrap();
-    let handle = make_store_handle(&dir).await;
     assert_eq!(handle.current_revision().await.unwrap(), 0);
 }
 
-/// State machine accepts multiple entries without panicking.
+/// State machine applies multiple puts correctly.
 #[tokio::test]
 async fn test_state_machine_multiple_puts() {
-    let (apply_tx, apply_rx) = mpsc::channel(256);
-    spawn_state_machine(apply_rx).await;
+    let dir = tempdir().unwrap();
+    let (handle, apply_tx) = make_store_and_sm(&dir).await;
 
     let entries: Vec<LogEntry> = (1..=5)
         .map(|i| LogEntry {
@@ -143,9 +162,8 @@ async fn test_state_machine_multiple_puts() {
         .collect();
 
     apply_tx.send(entries).await.unwrap();
-    tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
-    let dir = tempdir().unwrap();
-    let handle = make_store_handle(&dir).await;
-    assert_eq!(handle.current_revision().await.unwrap(), 0);
+    // All 5 keys should exist.
+    assert_eq!(handle.current_revision().await.unwrap(), 5);
 }

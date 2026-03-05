@@ -5,6 +5,7 @@ use redb::{Database, ReadableTable, TableDefinition};
 use serde::{Deserialize, Serialize};
 
 use crate::proto::mvccpb;
+use super::state_machine::KvCommand;
 
 // ── redb table definitions ──────────────────────────────────────────────────
 // KV table: compound_key (key_bytes + \x00 + 8-byte BE revision) → serialized InternalKeyValue
@@ -169,6 +170,29 @@ pub struct TxnResult {
     pub succeeded: bool,
     pub responses: Vec<TxnOpResponse>,
     pub revision: i64,
+}
+
+// ── Batch apply types ──────────────────────────────────────────────────────
+
+/// Result of a single operation within a batch apply.
+pub struct BatchOpResult {
+    pub apply_result: ApplyResultData,
+    pub watch_events: Vec<WatchEvent>,
+}
+
+pub enum ApplyResultData {
+    Put(PutResult),
+    DeleteRange(DeleteResult),
+    Txn(TxnResult),
+    Compact { revision: i64 },
+    Noop,
+}
+
+pub struct WatchEvent {
+    pub key: Vec<u8>,
+    pub event_type: i32, // 0=put, 1=delete
+    pub kv: crate::proto::mvccpb::KeyValue,
+    pub prev_kv: Option<crate::proto::mvccpb::KeyValue>,
 }
 
 // ── Compound key helpers ────────────────────────────────────────────────────
@@ -923,6 +947,415 @@ impl KvStore {
             }
         }
         Ok(seen.into_iter().collect())
+    }
+
+    // ── Batch apply (single transaction for N operations) ─────────────────
+
+    /// Apply multiple KvCommands in a single redb write transaction, persisting
+    /// `last_applied_index` at the end. Returns one `BatchOpResult` per command.
+    pub fn batch_apply_with_index(
+        &self,
+        commands: &[KvCommand],
+        last_applied_index: u64,
+    ) -> Result<Vec<BatchOpResult>, redb::Error> {
+        let txn = self.db.begin_write()?;
+        let mut results = Vec::with_capacity(commands.len());
+        {
+            let mut kv_table = txn.open_table(KV_TABLE)?;
+            let mut rev_table = txn.open_table(REV_TABLE)?;
+            let mut meta_table = txn.open_table(META_TABLE)?;
+            let mut latest_table = txn.open_table(LATEST_TABLE)?;
+
+            for cmd in commands {
+                let batch_result = match cmd {
+                    KvCommand::Put { key, value, lease_id } => {
+                        self.batch_put(
+                            &mut kv_table, &mut rev_table, &mut meta_table, &mut latest_table,
+                            key, value, *lease_id,
+                        )?
+                    }
+                    KvCommand::DeleteRange { key, range_end } => {
+                        self.batch_delete_range(
+                            &mut kv_table, &mut rev_table, &mut meta_table, &mut latest_table,
+                            key, range_end,
+                        )?
+                    }
+                    KvCommand::Txn { compares, success, failure } => {
+                        self.batch_txn(
+                            &mut kv_table, &mut rev_table, &mut meta_table, &mut latest_table,
+                            compares, success, failure,
+                        )?
+                    }
+                    KvCommand::Compact { revision } => {
+                        // Compact within the same transaction.
+                        self.batch_compact(&mut kv_table, &mut rev_table, *revision)?;
+                        let rev = self.revision.load(Ordering::SeqCst);
+                        BatchOpResult {
+                            apply_result: ApplyResultData::Compact { revision: rev },
+                            watch_events: vec![],
+                        }
+                    }
+                };
+                results.push(batch_result);
+            }
+
+            // Persist final revision to META_TABLE once.
+            let final_rev = self.revision.load(Ordering::SeqCst);
+            let rev_bytes = bincode::serialize(&final_rev).expect("serialize rev");
+            meta_table.insert("revision", rev_bytes.as_slice())?;
+
+            // Persist last_applied_index once.
+            let idx_bytes = bincode::serialize(&last_applied_index).expect("serialize raft index");
+            meta_table.insert("raft_applied_index", idx_bytes.as_slice())?;
+        }
+        txn.commit()?;
+        Ok(results)
+    }
+
+    /// Put within an open write transaction. Returns BatchOpResult.
+    fn batch_put(
+        &self,
+        kv_table: &mut redb::Table<&[u8], &[u8]>,
+        rev_table: &mut redb::Table<u64, &[u8]>,
+        _meta_table: &mut redb::Table<&str, &[u8]>,
+        latest_table: &mut redb::Table<&[u8], u64>,
+        key: &[u8],
+        value: &[u8],
+        lease_id: i64,
+    ) -> Result<BatchOpResult, redb::Error> {
+        let new_rev = self.revision.fetch_add(1, Ordering::SeqCst) + 1;
+
+        let prev = self.find_latest_kv_in_table(kv_table, latest_table, key, new_rev as u64)?;
+
+        let (create_revision, version) = match &prev {
+            Some(prev_kv) if prev_kv.version > 0 => (prev_kv.create_revision, prev_kv.version + 1),
+            _ => (new_rev, 1),
+        };
+
+        let ikv = InternalKeyValue {
+            key: key.to_vec(),
+            create_revision,
+            mod_revision: new_rev,
+            version,
+            value: value.to_vec(),
+            lease: lease_id,
+        };
+
+        let compound = make_compound_key(key, new_rev as u64);
+        let serialized = bincode::serialize(&ikv).expect("serialize kv");
+        kv_table.insert(compound.as_slice(), serialized.as_slice())?;
+
+        let rev_entries = vec![RevisionEntry {
+            key: key.to_vec(),
+            event_type: EventType::Put,
+        }];
+        let rev_bytes = bincode::serialize(&rev_entries).expect("serialize rev entry");
+        rev_table.insert(new_rev as u64, rev_bytes.as_slice())?;
+
+        latest_table.insert(key, new_rev as u64)?;
+
+        let notify_kv = mvccpb::KeyValue {
+            key: key.to_vec(),
+            create_revision,
+            mod_revision: new_rev,
+            version,
+            value: value.to_vec(),
+            lease: lease_id,
+        };
+
+        let watch_event = WatchEvent {
+            key: key.to_vec(),
+            event_type: 0, // PUT
+            kv: notify_kv,
+            prev_kv: prev.as_ref().map(|p| p.to_proto()),
+        };
+
+        Ok(BatchOpResult {
+            apply_result: ApplyResultData::Put(PutResult {
+                revision: new_rev,
+                prev_kv: prev.map(|p| p.to_proto()),
+            }),
+            watch_events: vec![watch_event],
+        })
+    }
+
+    /// Delete range within an open write transaction. Returns BatchOpResult.
+    fn batch_delete_range(
+        &self,
+        kv_table: &mut redb::Table<&[u8], &[u8]>,
+        rev_table: &mut redb::Table<u64, &[u8]>,
+        _meta_table: &mut redb::Table<&str, &[u8]>,
+        latest_table: &mut redb::Table<&[u8], u64>,
+        key: &[u8],
+        range_end: &[u8],
+    ) -> Result<BatchOpResult, redb::Error> {
+        let current_rev = self.revision.load(Ordering::SeqCst);
+
+        let keys_to_delete = if range_end.is_empty() {
+            match self.find_latest_kv_in_table(kv_table, latest_table, key, (current_rev + 1) as u64)? {
+                Some(ikv) if ikv.version > 0 => vec![ikv],
+                _ => vec![],
+            }
+        } else {
+            let user_keys = self.collect_unique_keys_in_range_rw(kv_table, key, range_end, (current_rev + 1) as u64)?;
+            let mut result = Vec::new();
+            for ukey in &user_keys {
+                if let Some(ikv) = self.find_latest_kv_in_table(kv_table, latest_table, ukey, (current_rev + 1) as u64)? {
+                    if ikv.version > 0 {
+                        result.push(ikv);
+                    }
+                }
+            }
+            result
+        };
+
+        if keys_to_delete.is_empty() {
+            return Ok(BatchOpResult {
+                apply_result: ApplyResultData::DeleteRange(DeleteResult {
+                    revision: current_rev,
+                    deleted: 0,
+                    prev_kvs: vec![],
+                }),
+                watch_events: vec![],
+            });
+        }
+
+        let new_rev = self.revision.fetch_add(1, Ordering::SeqCst) + 1;
+        let mut rev_entries = Vec::new();
+        let mut prev_kvs = Vec::new();
+        let mut watch_events = Vec::new();
+
+        for ikv in &keys_to_delete {
+            let tombstone = InternalKeyValue {
+                key: ikv.key.clone(),
+                create_revision: 0,
+                mod_revision: new_rev,
+                version: 0,
+                value: vec![],
+                lease: 0,
+            };
+            let compound = make_compound_key(&ikv.key, new_rev as u64);
+            let serialized = bincode::serialize(&tombstone).expect("serialize tombstone");
+            kv_table.insert(compound.as_slice(), serialized.as_slice())?;
+            latest_table.insert(ikv.key.as_slice(), new_rev as u64)?;
+
+            rev_entries.push(RevisionEntry {
+                key: ikv.key.clone(),
+                event_type: EventType::Delete,
+            });
+
+            let prev_proto = ikv.to_proto();
+            let tombstone_kv = mvccpb::KeyValue {
+                key: ikv.key.clone(),
+                create_revision: 0,
+                mod_revision: new_rev,
+                version: 0,
+                value: vec![],
+                lease: 0,
+            };
+            watch_events.push(WatchEvent {
+                key: ikv.key.clone(),
+                event_type: 1, // DELETE
+                kv: tombstone_kv,
+                prev_kv: Some(prev_proto.clone()),
+            });
+            prev_kvs.push(prev_proto);
+        }
+
+        let rev_bytes = bincode::serialize(&rev_entries).expect("serialize rev entries");
+        rev_table.insert(new_rev as u64, rev_bytes.as_slice())?;
+
+        Ok(BatchOpResult {
+            apply_result: ApplyResultData::DeleteRange(DeleteResult {
+                revision: new_rev,
+                deleted: keys_to_delete.len() as i64,
+                prev_kvs,
+            }),
+            watch_events,
+        })
+    }
+
+    /// Txn within an open write transaction. Returns BatchOpResult.
+    fn batch_txn(
+        &self,
+        kv_table: &mut redb::Table<&[u8], &[u8]>,
+        rev_table: &mut redb::Table<u64, &[u8]>,
+        meta_table: &mut redb::Table<&str, &[u8]>,
+        latest_table: &mut redb::Table<&[u8], u64>,
+        compares: &[TxnCompare],
+        success: &[TxnOp],
+        failure: &[TxnOp],
+    ) -> Result<BatchOpResult, redb::Error> {
+        // Evaluate compares against current in-transaction state.
+        let current_rev = self.revision.load(Ordering::SeqCst);
+        let succeeded = self.evaluate_compares_in_txn(kv_table, latest_table, compares, current_rev as u64)?;
+
+        let ops = if succeeded { success } else { failure };
+        let mut responses = Vec::new();
+        let mut final_revision = current_rev;
+        let mut all_watch_events = Vec::new();
+
+        for op in ops {
+            match op {
+                TxnOp::Range { key, range_end, limit, revision } => {
+                    // Read from the in-transaction tables.
+                    let query_rev = if *revision > 0 { *revision } else { self.revision.load(Ordering::SeqCst) };
+                    let result = if range_end.is_empty() {
+                        let kv = self.find_latest_kv_in_table(kv_table, latest_table, key, query_rev as u64)?;
+                        match kv {
+                            Some(ikv) if ikv.version > 0 => RangeResult {
+                                kvs: vec![ikv.to_proto()],
+                                count: 1,
+                                more: false,
+                            },
+                            _ => RangeResult { kvs: vec![], count: 0, more: false },
+                        }
+                    } else {
+                        let all_keys = self.collect_unique_keys_in_range_rw(kv_table, key, range_end, query_rev as u64)?;
+                        let mut kvs = Vec::new();
+                        for user_key in &all_keys {
+                            if let Some(ikv) = self.find_latest_kv_in_table(kv_table, latest_table, user_key, query_rev as u64)? {
+                                if ikv.version > 0 {
+                                    kvs.push(ikv.to_proto());
+                                }
+                            }
+                        }
+                        let total_count = kvs.len() as i64;
+                        let more = if *limit > 0 && total_count > *limit {
+                            kvs.truncate(*limit as usize);
+                            true
+                        } else {
+                            false
+                        };
+                        RangeResult { count: total_count, kvs, more }
+                    };
+                    responses.push(TxnOpResponse::Range(result));
+                }
+                TxnOp::Put { key, value, lease_id } => {
+                    let batch = self.batch_put(kv_table, rev_table, meta_table, latest_table, key, value, *lease_id)?;
+                    if let ApplyResultData::Put(ref r) = batch.apply_result {
+                        final_revision = r.revision;
+                        responses.push(TxnOpResponse::Put(PutResult {
+                            revision: r.revision,
+                            prev_kv: r.prev_kv.clone(),
+                        }));
+                    }
+                    all_watch_events.extend(batch.watch_events);
+                }
+                TxnOp::DeleteRange { key, range_end } => {
+                    let batch = self.batch_delete_range(kv_table, rev_table, meta_table, latest_table, key, range_end)?;
+                    if let ApplyResultData::DeleteRange(ref r) = batch.apply_result {
+                        final_revision = r.revision;
+                        responses.push(TxnOpResponse::DeleteRange(DeleteResult {
+                            revision: r.revision,
+                            deleted: r.deleted,
+                            prev_kvs: r.prev_kvs.clone(),
+                        }));
+                    }
+                    all_watch_events.extend(batch.watch_events);
+                }
+            }
+        }
+
+        Ok(BatchOpResult {
+            apply_result: ApplyResultData::Txn(TxnResult {
+                succeeded,
+                responses,
+                revision: final_revision,
+            }),
+            watch_events: all_watch_events,
+        })
+    }
+
+    /// Compact within an open write transaction.
+    fn batch_compact(
+        &self,
+        kv_table: &mut redb::Table<&[u8], &[u8]>,
+        rev_table: &mut redb::Table<u64, &[u8]>,
+        revision: i64,
+    ) -> Result<(), redb::Error> {
+        let mut keys_to_remove: Vec<Vec<u8>> = Vec::new();
+        let mut latest_per_key: std::collections::HashMap<Vec<u8>, (u64, Vec<u8>)> =
+            std::collections::HashMap::new();
+
+        for entry in kv_table.iter()? {
+            let (ck, _) = entry?;
+            let ck_bytes = ck.value().to_vec();
+            let rev = extract_revision(&ck_bytes);
+            let user_key = extract_user_key(&ck_bytes).to_vec();
+
+            if rev <= revision as u64 {
+                match latest_per_key.get(&user_key) {
+                    Some((existing_rev, existing_ck)) => {
+                        if rev > *existing_rev {
+                            keys_to_remove.push(existing_ck.clone());
+                            latest_per_key.insert(user_key, (rev, ck_bytes));
+                        } else {
+                            keys_to_remove.push(ck_bytes);
+                        }
+                    }
+                    None => {
+                        latest_per_key.insert(user_key, (rev, ck_bytes));
+                    }
+                }
+            }
+        }
+
+        for ck in &keys_to_remove {
+            kv_table.remove(ck.as_slice())?;
+        }
+
+        let mut revs_to_remove: Vec<u64> = Vec::new();
+        for entry in rev_table.range(0..revision as u64)? {
+            let (rev, _) = entry?;
+            revs_to_remove.push(rev.value());
+        }
+        for rev in revs_to_remove {
+            rev_table.remove(rev)?;
+        }
+
+        Ok(())
+    }
+
+    /// Evaluate compares against writable tables (within an open transaction).
+    fn evaluate_compares_in_txn(
+        &self,
+        kv_table: &redb::Table<&[u8], &[u8]>,
+        latest_table: &redb::Table<&[u8], u64>,
+        compares: &[TxnCompare],
+        current_rev: u64,
+    ) -> Result<bool, redb::Error> {
+        for cmp in compares {
+            let kv = self.find_latest_kv_in_table(kv_table, latest_table, &cmp.key, current_rev)?;
+
+            let passes = match &cmp.target {
+                TxnCompareTarget::Version(target_val) => {
+                    let actual = kv.as_ref().map(|k| k.version).unwrap_or(0);
+                    compare_i64(actual, *target_val, &cmp.result)
+                }
+                TxnCompareTarget::CreateRevision(target_val) => {
+                    let actual = kv.as_ref().map(|k| k.create_revision).unwrap_or(0);
+                    compare_i64(actual, *target_val, &cmp.result)
+                }
+                TxnCompareTarget::ModRevision(target_val) => {
+                    let actual = kv.as_ref().map(|k| k.mod_revision).unwrap_or(0);
+                    compare_i64(actual, *target_val, &cmp.result)
+                }
+                TxnCompareTarget::Value(target_val) => {
+                    let actual = kv.as_ref().map(|k| k.value.as_slice()).unwrap_or(&[]);
+                    compare_bytes(actual, target_val, &cmp.result)
+                }
+                TxnCompareTarget::Lease(target_val) => {
+                    let actual = kv.as_ref().map(|k| k.lease).unwrap_or(0);
+                    compare_i64(actual, *target_val, &cmp.result)
+                }
+            };
+
+            if !passes {
+                return Ok(false);
+            }
+        }
+        Ok(true)
     }
 
     /// Collect unique user keys in [key, range_end) from read-only table, up to max_rev.

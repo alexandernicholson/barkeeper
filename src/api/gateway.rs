@@ -608,7 +608,7 @@ async fn handle_put(
         value: value.clone(),
         lease_id,
     };
-    let data = match serde_json::to_vec(&cmd) {
+    let data = match bincode::serialize(&cmd) {
         Ok(d) => d,
         Err(e) => return json_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     };
@@ -661,7 +661,7 @@ async fn handle_delete_range(
         key: key.clone(),
         range_end: range_end.clone(),
     };
-    let data = match serde_json::to_vec(&cmd) {
+    let data = match bincode::serialize(&cmd) {
         Ok(d) => d,
         Err(e) => return json_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     };
@@ -785,7 +785,7 @@ async fn handle_txn(
         success: success.clone(),
         failure: failure.clone(),
     };
-    let data = match serde_json::to_vec(&cmd) {
+    let data = match bincode::serialize(&cmd) {
         Ok(d) => d,
         Err(e) => return json_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     };
@@ -869,7 +869,7 @@ async fn handle_compaction(
 
     // Serialize command and propose through Raft.
     let cmd = KvCommand::Compact { revision };
-    let data = match serde_json::to_vec(&cmd) {
+    let data = match bincode::serialize(&cmd) {
         Ok(d) => d,
         Err(e) => return json_error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     };

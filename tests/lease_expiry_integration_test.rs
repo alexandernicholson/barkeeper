@@ -15,6 +15,7 @@ use barkeeper::api::gateway;
 use barkeeper::auth::actor::spawn_auth_actor;
 use barkeeper::cluster::actor::spawn_cluster_actor;
 use barkeeper::kv::actor::{spawn_kv_store_actor, KvStoreActorHandle};
+use barkeeper::kv::apply_broker::ApplyResultBroker;
 use barkeeper::kv::state_machine::spawn_state_machine;
 use barkeeper::kv::store::KvStore;
 use barkeeper::lease::manager::LeaseManager;
@@ -34,12 +35,11 @@ async fn start_instance_with_lease_expiry() -> (SocketAddr, KvStoreActorHandle, 
         ..Default::default()
     };
 
-    let kv_store = KvStore::open(dir.path().join("kv.redb")).unwrap();
+    let kv_store = Arc::new(KvStore::open(dir.path().join("kv.redb")).unwrap());
     let kv_runtime = Runtime::new(1);
-    let store = spawn_kv_store_actor(&kv_runtime, kv_store).await;
+    let store = spawn_kv_store_actor(&kv_runtime, Arc::clone(&kv_store)).await;
 
     let (apply_tx, apply_rx) = mpsc::channel(256);
-    spawn_state_machine(apply_rx).await;
     let raft_handle = spawn_raft_node(config, apply_tx).await;
 
     let lease_manager = Arc::new(LeaseManager::new());
@@ -48,6 +48,16 @@ async fn start_instance_with_lease_expiry() -> (SocketAddr, KvStoreActorHandle, 
     let cluster_runtime = Runtime::new(1);
     let cluster_manager = spawn_cluster_actor(&cluster_runtime, 1).await;
     cluster_manager.add_initial_member(1, "test".to_string(), vec![], vec![]).await;
+
+    let broker = Arc::new(ApplyResultBroker::new());
+
+    spawn_state_machine(
+        apply_rx,
+        kv_store,
+        watch_hub.clone(),
+        Arc::clone(&lease_manager),
+        Arc::clone(&broker),
+    ).await;
 
     // Spawn a lease expiry timer that checks every 500ms.
     let lm_clone = Arc::clone(&lease_manager);
@@ -88,6 +98,7 @@ async fn start_instance_with_lease_expiry() -> (SocketAddr, KvStoreActorHandle, 
         Arc::clone(&raft_handle.current_term),
         auth_manager,
         Arc::new(std::sync::Mutex::new(vec![])),
+        broker,
     );
 
     let port = portpicker::pick_unused_port().unwrap();

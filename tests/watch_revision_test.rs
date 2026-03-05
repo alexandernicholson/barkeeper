@@ -60,7 +60,7 @@ async fn test_watchhub_replays_history() {
     let dir = tempfile::tempdir().unwrap();
     let kv_store = KvStore::open(dir.path().join("kv.redb")).unwrap();
     let kv_runtime = Runtime::new(1);
-    let handle = spawn_kv_store_actor(&kv_runtime, kv_store).await;
+    let handle = spawn_kv_store_actor(&kv_runtime, std::sync::Arc::new(kv_store)).await;
     let watch_runtime = Runtime::new(1);
     let hub = spawn_watch_hub_actor(&watch_runtime, Some(handle.clone())).await;
 

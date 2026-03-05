@@ -18,6 +18,7 @@ use barkeeper::api::gateway;
 use barkeeper::auth::actor::spawn_auth_actor;
 use barkeeper::cluster::actor::spawn_cluster_actor;
 use barkeeper::kv::actor::spawn_kv_store_actor;
+use barkeeper::kv::apply_broker::ApplyResultBroker;
 use barkeeper::kv::state_machine::spawn_state_machine;
 use barkeeper::kv::store::KvStore;
 use barkeeper::lease::manager::LeaseManager;
@@ -35,12 +36,11 @@ async fn start_test_instance() -> (SocketAddr, tempfile::TempDir) {
         ..Default::default()
     };
 
-    let kv_store = KvStore::open(dir.path().join("kv.redb")).expect("open KvStore");
+    let kv_store = Arc::new(KvStore::open(dir.path().join("kv.redb")).expect("open KvStore"));
     let kv_runtime = Runtime::new(1);
-    let store = spawn_kv_store_actor(&kv_runtime, kv_store).await;
+    let store = spawn_kv_store_actor(&kv_runtime, Arc::clone(&kv_store)).await;
 
     let (apply_tx, apply_rx) = mpsc::channel(256);
-    spawn_state_machine(apply_rx).await;
 
     let raft_handle = spawn_raft_node(config, apply_tx).await;
 
@@ -55,6 +55,17 @@ async fn start_test_instance() -> (SocketAddr, tempfile::TempDir) {
     let watch_hub = spawn_watch_hub_actor(&watch_runtime, Some(store.clone())).await;
     let auth_runtime = Runtime::new(1);
     let auth_manager = spawn_auth_actor(&auth_runtime).await;
+
+    let broker = Arc::new(ApplyResultBroker::new());
+
+    // Spawn the state machine with all dependencies.
+    spawn_state_machine(
+        apply_rx,
+        kv_store,
+        watch_hub.clone(),
+        Arc::clone(&lease_manager),
+        Arc::clone(&broker),
+    ).await;
 
     // Spawn lease expiry timer — checks every 500ms for expired leases.
     {
@@ -97,6 +108,7 @@ async fn start_test_instance() -> (SocketAddr, tempfile::TempDir) {
         Arc::clone(&raft_handle.current_term),
         auth_manager,
         Arc::new(std::sync::Mutex::new(vec![])),
+        broker,
     );
 
     let http_port = portpicker::pick_unused_port().expect("no free port");

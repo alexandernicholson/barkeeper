@@ -17,7 +17,7 @@ async fn make_handle() -> (KvStoreActorHandle, TempDir) {
     let store = KvStore::open(&db_path).expect("open kv store");
 
     let runtime = rebar_core::runtime::Runtime::new(1);
-    let handle = spawn_kv_store_actor(&runtime, store).await;
+    let handle = spawn_kv_store_actor(&runtime, std::sync::Arc::new(store)).await;
     (handle, dir)
 }
 

@@ -22,9 +22,8 @@ use crate::proto::mvccpb;
 /// The actor takes ownership of the `KvStore` (wrapping it in `Arc` internally
 /// for `spawn_blocking`), and processes commands sequentially from the `cmd_rx`
 /// channel. Returns a lightweight handle for sending commands.
-pub async fn spawn_kv_store_actor(runtime: &Runtime, store: KvStore) -> KvStoreActorHandle {
+pub async fn spawn_kv_store_actor(runtime: &Runtime, store: Arc<KvStore>) -> KvStoreActorHandle {
     let (cmd_tx, mut cmd_rx) = mpsc::channel::<KvStoreCmd>(256);
-    let store = Arc::new(store);
 
     runtime.spawn(move |mut ctx| async move {
         loop {

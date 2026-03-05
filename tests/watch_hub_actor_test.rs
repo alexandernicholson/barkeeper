@@ -205,7 +205,7 @@ async fn test_historical_replay_with_kv_store() {
     let dir = tempfile::tempdir().unwrap();
     let kv_store = KvStore::open(dir.path().join("kv.redb")).unwrap();
     let kv_runtime = Runtime::new(1);
-    let store_handle = spawn_kv_store_actor(&kv_runtime, kv_store).await;
+    let store_handle = spawn_kv_store_actor(&kv_runtime, std::sync::Arc::new(kv_store)).await;
 
     let rt = make_runtime();
     let hub = spawn_watch_hub_actor(&rt, Some(store_handle.clone())).await;

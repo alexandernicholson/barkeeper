@@ -170,12 +170,25 @@ pub async fn spawn_raft_node(
                     leader_ref.store(core.state.leader_id.unwrap_or(0), Ordering::Relaxed);
                 }
 
-                // Client proposals
+                // Client proposals (batched)
                 Some(proposal) = proposal_rx.recv() => {
-                    let id = proposal.id;
-                    pending_responses.insert(id, proposal.response_tx);
-                    let actions = core.step(Event::Proposal { id, data: proposal.data });
-                    execute_actions(&actions, &log_store, &apply_tx, &mut pending_responses, &mut heartbeat_timer, &config, &applied_ref).await;
+                    let mut proposals = vec![proposal];
+                    while proposals.len() < 64 {
+                        match proposal_rx.try_recv() {
+                            Ok(p) => proposals.push(p),
+                            Err(_) => break,
+                        }
+                    }
+
+                    let mut all_actions = Vec::new();
+                    for p in proposals {
+                        pending_responses.insert(p.id, p.response_tx);
+                        let actions = core.step(Event::Proposal { id: p.id, data: p.data });
+                        all_actions.extend(actions);
+                    }
+
+                    let merged = merge_log_actions(all_actions);
+                    execute_actions(&merged, &log_store, &apply_tx, &mut pending_responses, &mut heartbeat_timer, &config, &applied_ref).await;
                     term_ref.store(core.state.persistent.current_term, Ordering::Relaxed);
                     leader_ref.store(core.state.leader_id.unwrap_or(0), Ordering::Relaxed);
                 }
@@ -387,12 +400,25 @@ pub async fn spawn_raft_node_rebar(
                         if reset { election_timer = random_election_timeout(&config); }
                     }
 
-                    // Client proposals
+                    // Client proposals (batched)
                     Some(proposal) = proposal_rx.recv() => {
-                        let id = proposal.id;
-                        pending_responses.insert(id, proposal.response_tx);
-                        let actions = core.step(Event::Proposal { id, data: proposal.data });
-                        let reset = execute_actions_rebar(&actions, &log_store, &apply_tx, &mut pending_responses, &mut heartbeat_timer, &config, &ctx, &peers, &applied_ref).await;
+                        let mut proposals = vec![proposal];
+                        while proposals.len() < 64 {
+                            match proposal_rx.try_recv() {
+                                Ok(p) => proposals.push(p),
+                                Err(_) => break,
+                            }
+                        }
+
+                        let mut all_actions = Vec::new();
+                        for p in proposals {
+                            pending_responses.insert(p.id, p.response_tx);
+                            let actions = core.step(Event::Proposal { id: p.id, data: p.data });
+                            all_actions.extend(actions);
+                        }
+
+                        let merged = merge_log_actions(all_actions);
+                        let reset = execute_actions_rebar(&merged, &log_store, &apply_tx, &mut pending_responses, &mut heartbeat_timer, &config, &ctx, &peers, &applied_ref).await;
                         term_ref.store(core.state.persistent.current_term, Ordering::Relaxed);
                     leader_ref.store(core.state.leader_id.unwrap_or(0), Ordering::Relaxed);
                         if reset { election_timer = random_election_timeout(&config); }
@@ -516,4 +542,22 @@ async fn execute_actions_rebar(
         }
     }
     should_reset_election_timer
+}
+
+/// Merge multiple `AppendToLog` actions into a single action for batching.
+fn merge_log_actions(actions: Vec<Action>) -> Vec<Action> {
+    let mut merged_entries = Vec::new();
+    let mut other_actions = Vec::new();
+    for action in actions {
+        match action {
+            Action::AppendToLog(entries) => merged_entries.extend(entries),
+            other => other_actions.push(other),
+        }
+    }
+    let mut result = Vec::new();
+    if !merged_entries.is_empty() {
+        result.push(Action::AppendToLog(merged_entries));
+    }
+    result.extend(other_actions);
+    result
 }

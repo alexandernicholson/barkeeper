@@ -2,9 +2,8 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 
-use super::actor::KvStoreActorHandle;
 use super::apply_broker::{ApplyResult, ApplyResultBroker};
-use super::store::{TxnCompare, TxnOp};
+use super::store::{ApplyResultData, KvStore, TxnCompare, TxnOp};
 use crate::lease::manager::LeaseManager;
 use crate::raft::messages::{LogEntry, LogEntryData};
 use crate::watch::actor::WatchHubActorHandle;
@@ -35,8 +34,12 @@ pub enum KvCommand {
 ///
 /// This is the single source of truth for KV mutations. Both leaders and
 /// followers apply entries here, ensuring all nodes have consistent state.
+///
+/// The state machine holds `Arc<KvStore>` directly and uses
+/// `batch_apply_with_index` to apply entire batches in a single redb
+/// write transaction (1 fsync per batch).
 struct StateMachine {
-    store: KvStoreActorHandle,
+    store: Arc<KvStore>,
     watch_hub: WatchHubActorHandle,
     lease_manager: Arc<LeaseManager>,
     broker: Arc<ApplyResultBroker>,
@@ -46,152 +49,98 @@ impl StateMachine {
     async fn apply(&self, entries: Vec<LogEntry>) {
         // Get the last applied index to skip entries that were already applied
         // (e.g. after restart when Raft replays committed entries).
-        let last_applied = self.store.last_applied_raft_index().await.unwrap_or(0);
+        let last_applied = self.store.last_applied_raft_index().unwrap_or(0);
 
-        for entry in entries {
-            let index = entry.index;
+        // Collect applicable commands.
+        let mut commands = Vec::new();
+        let mut entry_indices = Vec::new();
 
-            if index <= last_applied {
-                tracing::debug!(index, last_applied, "skipping already-applied entry");
-                // Still send a Noop result so any waiting service handler doesn't hang.
-                self.broker.send_result(index, ApplyResult::Noop).await;
+        for entry in &entries {
+            if entry.index <= last_applied {
+                tracing::debug!(index = entry.index, last_applied, "skipping already-applied entry");
+                self.broker.send_result(entry.index, ApplyResult::Noop).await;
                 continue;
             }
 
-            let result = match entry.data {
+            match &entry.data {
                 LogEntryData::Command(data) => {
-                    if let Ok(cmd) = serde_json::from_slice::<KvCommand>(&data) {
-                        self.apply_command(cmd).await
-                    } else {
-                        tracing::warn!(index, "failed to deserialize KvCommand");
-                        ApplyResult::Noop
+                    // Try bincode first, fall back to JSON for old entries.
+                    let cmd_result = bincode::deserialize::<KvCommand>(data)
+                        .or_else(|_| {
+                            serde_json::from_slice::<KvCommand>(data)
+                                .map_err(|e| Box::new(bincode::ErrorKind::Custom(e.to_string())) as Box<bincode::ErrorKind>)
+                        });
+                    match cmd_result {
+                        Ok(cmd) => {
+                            commands.push(cmd);
+                            entry_indices.push(entry.index);
+                        }
+                        Err(_) => {
+                            tracing::warn!(index = entry.index, "failed to deserialize KvCommand");
+                            self.broker.send_result(entry.index, ApplyResult::Noop).await;
+                        }
                     }
                 }
-                LogEntryData::Noop => ApplyResult::Noop,
-                LogEntryData::ConfigChange(_) => ApplyResult::Noop,
-            };
-
-            // Persist the applied index so we can skip on restart.
-            if let Err(e) = self.store.set_last_applied_raft_index(index).await {
-                tracing::error!(index, error = %e, "failed to persist applied raft index");
+                _ => {
+                    self.broker.send_result(entry.index, ApplyResult::Noop).await;
+                }
             }
-
-            self.broker.send_result(index, result).await;
         }
-    }
 
-    async fn apply_command(&self, cmd: KvCommand) -> ApplyResult {
-        match cmd {
-            KvCommand::Put { key, value, lease_id } => {
-                match self.store.put(key.clone(), value.clone(), lease_id).await {
-                    Ok(result) => {
-                        // Notify watchers.
-                        let (create_rev, ver) = match &result.prev_kv {
-                            Some(prev) => (prev.create_revision, prev.version + 1),
-                            None => (result.revision, 1),
-                        };
-                        let notify_kv = crate::proto::mvccpb::KeyValue {
-                            key: key.clone(),
-                            create_revision: create_rev,
-                            mod_revision: result.revision,
-                            version: ver,
-                            value: value.clone(),
-                            lease: lease_id,
-                        };
-                        self.watch_hub.notify(key.clone(), 0, notify_kv, result.prev_kv.clone()).await;
+        if commands.is_empty() {
+            return;
+        }
 
-                        // Attach key to lease.
+        let last_index = *entry_indices.last().unwrap();
+
+        // Single blocking call for entire batch.
+        let results = tokio::task::spawn_blocking({
+            let store = Arc::clone(&self.store);
+            let cmds = commands.clone();
+            move || store.batch_apply_with_index(&cmds, last_index)
+        })
+        .await
+        .expect("batch apply panicked");
+
+        match results {
+            Ok(batch_results) => {
+                for (i, batch_op) in batch_results.into_iter().enumerate() {
+                    let index = entry_indices[i];
+
+                    // Fire watch notifications.
+                    for event in &batch_op.watch_events {
+                        self.watch_hub
+                            .notify(
+                                event.key.clone(),
+                                event.event_type,
+                                event.kv.clone(),
+                                event.prev_kv.clone(),
+                            )
+                            .await;
+                    }
+
+                    // Attach keys to leases.
+                    if let KvCommand::Put { ref key, lease_id, .. } = commands[i] {
                         if lease_id != 0 {
-                            self.lease_manager.attach_key(lease_id, key).await;
+                            self.lease_manager.attach_key(lease_id, key.clone()).await;
                         }
+                    }
 
-                        ApplyResult::Put(result)
-                    }
-                    Err(e) => {
-                        tracing::error!(error = %e, "state machine: put failed");
-                        ApplyResult::Noop
-                    }
+                    // Convert to ApplyResult and send to broker.
+                    let apply_result = match batch_op.apply_result {
+                        ApplyResultData::Put(r) => ApplyResult::Put(r),
+                        ApplyResultData::DeleteRange(r) => ApplyResult::DeleteRange(r),
+                        ApplyResultData::Txn(r) => ApplyResult::Txn(r),
+                        ApplyResultData::Compact { revision } => ApplyResult::Compact { revision },
+                        ApplyResultData::Noop => ApplyResult::Noop,
+                    };
+                    self.broker.send_result(index, apply_result).await;
                 }
             }
-            KvCommand::DeleteRange { key, range_end } => {
-                match self.store.delete_range(key.clone(), range_end.clone()).await {
-                    Ok(result) => {
-                        // Notify watchers for each deleted key.
-                        for prev in &result.prev_kvs {
-                            let tombstone = crate::proto::mvccpb::KeyValue {
-                                key: prev.key.clone(),
-                                create_revision: 0,
-                                mod_revision: result.revision,
-                                version: 0,
-                                value: vec![],
-                                lease: 0,
-                            };
-                            self.watch_hub.notify(prev.key.clone(), 1, tombstone, Some(prev.clone())).await;
-                        }
-                        ApplyResult::DeleteRange(result)
-                    }
-                    Err(e) => {
-                        tracing::error!(error = %e, "state machine: delete_range failed");
-                        ApplyResult::Noop
-                    }
-                }
-            }
-            KvCommand::Txn { compares, success, failure } => {
-                match self.store.txn(compares, success.clone(), failure.clone()).await {
-                    Ok(result) => {
-                        // Notify watchers for txn mutations.
-                        let executed_ops = if result.succeeded { &success } else { &failure };
-                        for (op, resp) in executed_ops.iter().zip(result.responses.iter()) {
-                            match (op, resp) {
-                                (TxnOp::Put { key, value, lease_id }, crate::kv::store::TxnOpResponse::Put(r)) => {
-                                    let (create_rev, ver) = match &r.prev_kv {
-                                        Some(prev) => (prev.create_revision, prev.version + 1),
-                                        None => (r.revision, 1),
-                                    };
-                                    let notify_kv = crate::proto::mvccpb::KeyValue {
-                                        key: key.clone(),
-                                        create_revision: create_rev,
-                                        mod_revision: r.revision,
-                                        version: ver,
-                                        value: value.clone(),
-                                        lease: *lease_id,
-                                    };
-                                    self.watch_hub.notify(key.clone(), 0, notify_kv, r.prev_kv.clone()).await;
-                                }
-                                (TxnOp::DeleteRange { .. }, crate::kv::store::TxnOpResponse::DeleteRange(r)) => {
-                                    for prev in &r.prev_kvs {
-                                        let tombstone = crate::proto::mvccpb::KeyValue {
-                                            key: prev.key.clone(),
-                                            create_revision: 0,
-                                            mod_revision: r.revision,
-                                            version: 0,
-                                            value: vec![],
-                                            lease: 0,
-                                        };
-                                        self.watch_hub.notify(prev.key.clone(), 1, tombstone, Some(prev.clone())).await;
-                                    }
-                                }
-                                _ => {} // Range ops don't need notifications
-                            }
-                        }
-                        ApplyResult::Txn(result)
-                    }
-                    Err(e) => {
-                        tracing::error!(error = %e, "state machine: txn failed");
-                        ApplyResult::Noop
-                    }
-                }
-            }
-            KvCommand::Compact { revision } => {
-                match self.store.compact(revision).await {
-                    Ok(_) => {
-                        let rev = self.store.current_revision().await.unwrap_or(0);
-                        ApplyResult::Compact { revision: rev }
-                    }
-                    Err(e) => {
-                        tracing::error!(error = %e, "state machine: compact failed");
-                        ApplyResult::Noop
-                    }
+            Err(e) => {
+                tracing::error!(error = %e, "batch apply failed");
+                for index in &entry_indices {
+                    self.broker.send_result(*index, ApplyResult::Noop).await;
                 }
             }
         }
@@ -201,12 +150,17 @@ impl StateMachine {
 /// Spawn the state machine apply loop.
 pub async fn spawn_state_machine(
     mut apply_rx: mpsc::Receiver<Vec<LogEntry>>,
-    store: KvStoreActorHandle,
+    store: Arc<KvStore>,
     watch_hub: WatchHubActorHandle,
     lease_manager: Arc<LeaseManager>,
     broker: Arc<ApplyResultBroker>,
 ) {
-    let sm = StateMachine { store, watch_hub, lease_manager, broker };
+    let sm = StateMachine {
+        store,
+        watch_hub,
+        lease_manager,
+        broker,
+    };
     tokio::spawn(async move {
         while let Some(entries) = apply_rx.recv().await {
             sm.apply(entries).await;

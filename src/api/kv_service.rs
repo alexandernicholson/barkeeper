@@ -100,7 +100,7 @@ impl Kv for KvService {
             value: req.value.clone(),
             lease_id: req.lease,
         };
-        let data = serde_json::to_vec(&cmd).map_err(|e| Status::internal(e.to_string()))?;
+        let data = bincode::serialize(&cmd).map_err(|e| Status::internal(e.to_string()))?;
 
         let proposal_result = self.raft_handle.propose(data).await
             .map_err(|e| Status::unavailable(format!("raft: {}", e)))?;
@@ -145,7 +145,7 @@ impl Kv for KvService {
             key: req.key.clone(),
             range_end: req.range_end.clone(),
         };
-        let data = serde_json::to_vec(&cmd).map_err(|e| Status::internal(e.to_string()))?;
+        let data = bincode::serialize(&cmd).map_err(|e| Status::internal(e.to_string()))?;
 
         let proposal_result = self.raft_handle.propose(data).await
             .map_err(|e| Status::unavailable(format!("raft: {}", e)))?;
@@ -209,7 +209,7 @@ impl Kv for KvService {
             success,
             failure,
         };
-        let data = serde_json::to_vec(&cmd).map_err(|e| Status::internal(e.to_string()))?;
+        let data = bincode::serialize(&cmd).map_err(|e| Status::internal(e.to_string()))?;
 
         let proposal_result = self.raft_handle.propose(data).await
             .map_err(|e| Status::unavailable(format!("raft: {}", e)))?;
@@ -255,7 +255,7 @@ impl Kv for KvService {
         let cmd = KvCommand::Compact {
             revision: req.revision,
         };
-        let data = serde_json::to_vec(&cmd).map_err(|e| Status::internal(e.to_string()))?;
+        let data = bincode::serialize(&cmd).map_err(|e| Status::internal(e.to_string()))?;
 
         let proposal_result = self.raft_handle.propose(data).await
             .map_err(|e| Status::unavailable(format!("raft: {}", e)))?;
