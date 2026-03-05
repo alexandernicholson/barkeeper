@@ -549,6 +549,105 @@ async fn execute_actions_buffered_rebar(
     should_reset_election_timer
 }
 
+async fn execute_non_wal_action(
+    action: &Action,
+    apply_tx: &mpsc::Sender<Vec<LogEntry>>,
+    pending_responses: &mut std::collections::HashMap<u64, oneshot::Sender<ClientProposalResult>>,
+    heartbeat_timer: &mut Option<tokio::time::Interval>,
+    config: &RaftConfig,
+    applied_index: &Arc<AtomicU64>,
+    commit_index: &Arc<AtomicU64>,
+    recent_entries: &mut Vec<LogEntry>,
+    write_buffer: &Arc<WriteBuffer>,
+    log_store: &LogStore,
+) {
+    match action {
+        Action::ApplyEntries { from, to } => {
+            // Try in-memory first
+            let expected_count = (*to - *from + 1) as usize;
+            let mem_entries: Vec<LogEntry> = recent_entries
+                .iter()
+                .filter(|e| e.index >= *from && e.index <= *to)
+                .cloned()
+                .collect();
+
+            let entries = if mem_entries.len() == expected_count {
+                mem_entries
+            } else {
+                let ls = log_store.clone();
+                let (f, t) = (*from, *to);
+                tokio::task::spawn_blocking(move || ls.get_range(f, t).unwrap())
+                    .await
+                    .unwrap()
+            };
+
+            // Populate write buffer for immediate read visibility
+            for entry in &entries {
+                if let LogEntryData::Command { data, revision } = &entry.data {
+                    if let Ok(cmd) = bincode::deserialize::<KvCommand>(data) {
+                        match cmd {
+                            KvCommand::Put { key, value, lease_id } => {
+                                let kv = KeyValue {
+                                    key: key.clone(),
+                                    value,
+                                    create_revision: *revision,
+                                    mod_revision: *revision,
+                                    version: 1,
+                                    lease: lease_id,
+                                };
+                                write_buffer.put(kv);
+                            }
+                            KvCommand::DeleteRange { key, range_end: _ } => {
+                                write_buffer.delete(&key, *revision);
+                            }
+                            _ => {} // Txn/Compact handled by broker path
+                        }
+                    }
+                }
+            }
+
+            // Trim applied entries from buffer
+            recent_entries.retain(|e| e.index > *to);
+
+            apply_tx.send(entries).await.ok();
+            applied_index.store(*to, Ordering::Relaxed);
+            commit_index.store(*to, Ordering::Release);
+        }
+        Action::RespondToProposal { id, result } => {
+            if let Some(tx) = pending_responses.remove(id) {
+                let _ = tx.send(match result {
+                    ClientProposalResult::Success { index, revision } => {
+                        ClientProposalResult::Success {
+                            index: *index,
+                            revision: *revision,
+                        }
+                    }
+                    ClientProposalResult::NotLeader { leader_id } => {
+                        ClientProposalResult::NotLeader {
+                            leader_id: *leader_id,
+                        }
+                    }
+                    ClientProposalResult::Error(e) => ClientProposalResult::Error(e.clone()),
+                });
+            }
+        }
+        Action::ResetElectionTimer => {
+            // Timer reset handled by the select loop
+        }
+        Action::StartHeartbeatTimer => {
+            *heartbeat_timer = Some(tokio::time::interval(config.heartbeat_interval));
+        }
+        Action::StopHeartbeatTimer => {
+            *heartbeat_timer = None;
+        }
+        Action::SendMessage { .. } => {
+            // No-op: single-node mode has no peers to send to.
+            // Multi-node clusters use spawn_raft_node_rebar with Rebar transport.
+        }
+        _ => {} // WAL actions handled by caller
+    }
+}
+
 async fn execute_actions(
     actions: &[Action],
     log_store: &LogStore,
@@ -561,112 +660,80 @@ async fn execute_actions(
     recent_entries: &mut Vec<LogEntry>,
     write_buffer: &Arc<WriteBuffer>,
 ) {
+    // First pass: collect WAL operations
+    let mut wal_entries: Vec<LogEntry> = Vec::new();
+    let mut hard_state: Option<PersistentState> = None;
+    let mut has_truncate = false;
+
     for action in actions {
         match action {
             Action::PersistHardState(state) => {
-                let ls = log_store.clone();
-                let s = state.clone();
-                tokio::task::spawn_blocking(move || ls.save_hard_state(&s).unwrap())
-                    .await
-                    .unwrap();
+                hard_state = Some(state.clone());
             }
             Action::AppendToLog(entries) => {
-                let ls = log_store.clone();
-                let e = entries.clone();
-                tokio::task::spawn_blocking(move || ls.append(&e).unwrap())
-                    .await
-                    .unwrap();
-                recent_entries.extend(entries.iter().cloned());
+                wal_entries.extend(entries.iter().cloned());
             }
-            Action::TruncateLogAfter(index) => {
-                let ls = log_store.clone();
-                let idx = *index;
-                tokio::task::spawn_blocking(move || ls.truncate_after(idx).unwrap())
-                    .await
-                    .unwrap();
-                recent_entries.retain(|e| e.index <= idx);
+            Action::TruncateLogAfter(_) => {
+                has_truncate = true;
+                break;
             }
-            Action::ApplyEntries { from, to } => {
-                // Try in-memory first
-                let expected_count = (*to - *from + 1) as usize;
-                let mem_entries: Vec<LogEntry> = recent_entries
-                    .iter()
-                    .filter(|e| e.index >= *from && e.index <= *to)
-                    .cloned()
-                    .collect();
+            _ => {}
+        }
+    }
 
-                let entries = if mem_entries.len() == expected_count {
-                    mem_entries
-                } else {
+    // If there's a truncate, fall back to sequential processing
+    if has_truncate {
+        for action in actions {
+            match action {
+                Action::PersistHardState(state) => {
                     let ls = log_store.clone();
-                    let (f, t) = (*from, *to);
-                    tokio::task::spawn_blocking(move || ls.get_range(f, t).unwrap())
+                    let s = state.clone();
+                    tokio::task::spawn_blocking(move || ls.save_hard_state(&s).unwrap())
                         .await
-                        .unwrap()
-                };
-
-                // Populate write buffer for immediate read visibility
-                for entry in &entries {
-                    if let LogEntryData::Command { data, revision } = &entry.data {
-                        if let Ok(cmd) = bincode::deserialize::<KvCommand>(data) {
-                            match cmd {
-                                KvCommand::Put { key, value, lease_id } => {
-                                    let kv = KeyValue {
-                                        key: key.clone(),
-                                        value,
-                                        create_revision: *revision,
-                                        mod_revision: *revision,
-                                        version: 1,
-                                        lease: lease_id,
-                                    };
-                                    write_buffer.put(kv);
-                                }
-                                KvCommand::DeleteRange { key, range_end: _ } => {
-                                    write_buffer.delete(&key, *revision);
-                                }
-                                _ => {} // Txn/Compact handled by broker path
-                            }
-                        }
-                    }
+                        .unwrap();
                 }
-
-                // Trim applied entries from buffer
-                recent_entries.retain(|e| e.index > *to);
-
-                apply_tx.send(entries).await.ok();
-                applied_index.store(*to, Ordering::Relaxed);
-                commit_index.store(*to, Ordering::Release);
-            }
-            Action::RespondToProposal { id, result } => {
-                if let Some(tx) = pending_responses.remove(id) {
-                    let _ = tx.send(match result {
-                        ClientProposalResult::Success { index, revision } => {
-                            ClientProposalResult::Success {
-                                index: *index,
-                                revision: *revision,
-                            }
-                        }
-                        ClientProposalResult::NotLeader { leader_id } => {
-                            ClientProposalResult::NotLeader {
-                                leader_id: *leader_id,
-                            }
-                        }
-                        ClientProposalResult::Error(e) => ClientProposalResult::Error(e.clone()),
-                    });
+                Action::AppendToLog(entries) => {
+                    let ls = log_store.clone();
+                    let e = entries.clone();
+                    tokio::task::spawn_blocking(move || ls.append(&e).unwrap())
+                        .await
+                        .unwrap();
+                    recent_entries.extend(entries.iter().cloned());
+                }
+                Action::TruncateLogAfter(index) => {
+                    let ls = log_store.clone();
+                    let idx = *index;
+                    tokio::task::spawn_blocking(move || ls.truncate_after(idx).unwrap())
+                        .await
+                        .unwrap();
+                    recent_entries.retain(|e| e.index <= idx);
+                }
+                other => {
+                    execute_non_wal_action(other, apply_tx, pending_responses, heartbeat_timer, config, applied_index, commit_index, recent_entries, write_buffer, log_store).await;
                 }
             }
-            Action::ResetElectionTimer => {
-                // Timer reset handled by the select loop
-            }
-            Action::StartHeartbeatTimer => {
-                *heartbeat_timer = Some(tokio::time::interval(config.heartbeat_interval));
-            }
-            Action::StopHeartbeatTimer => {
-                *heartbeat_timer = None;
-            }
-            Action::SendMessage { .. } => {
-                // No-op: single-node mode has no peers to send to.
-                // Multi-node clusters use spawn_raft_node_rebar with Rebar transport.
+        }
+        return;
+    }
+
+    // No truncate: flush entries + hard state in one transaction
+    if !wal_entries.is_empty() || hard_state.is_some() {
+        let ls = log_store.clone();
+        let e = wal_entries.clone();
+        let hs = hard_state;
+        tokio::task::spawn_blocking(move || ls.flush(&e, hs.as_ref()).unwrap())
+            .await
+            .unwrap();
+        recent_entries.extend(wal_entries);
+    }
+
+    // Second pass: process non-WAL actions
+    for action in actions {
+        match action {
+            Action::PersistHardState(_) | Action::AppendToLog(_) => {} // Already flushed
+            Action::TruncateLogAfter(_) => unreachable!(),
+            other => {
+                execute_non_wal_action(other, apply_tx, pending_responses, heartbeat_timer, config, applied_index, commit_index, recent_entries, write_buffer, log_store).await;
             }
         }
     }
@@ -855,6 +922,146 @@ pub async fn spawn_raft_node_rebar(
     handle
 }
 
+/// Execute a non-WAL Raft action using the Rebar process context for message delivery.
+///
+/// Returns `true` if the election timer should be reset.
+async fn execute_non_wal_action_rebar(
+    action: &Action,
+    apply_tx: &mpsc::Sender<Vec<LogEntry>>,
+    pending_responses: &mut std::collections::HashMap<u64, oneshot::Sender<ClientProposalResult>>,
+    heartbeat_timer: &mut Option<tokio::time::Interval>,
+    config: &RaftConfig,
+    ctx: &ProcessContext,
+    peers: &Arc<Mutex<HashMap<u64, ProcessId>>>,
+    applied_index: &Arc<AtomicU64>,
+    commit_index: &Arc<AtomicU64>,
+    recent_entries: &mut Vec<LogEntry>,
+    write_buffer: &Arc<WriteBuffer>,
+    log_store: &LogStore,
+) -> bool {
+    match action {
+        Action::ApplyEntries { from, to } => {
+            // Try in-memory first
+            let expected_count = (*to - *from + 1) as usize;
+            let mem_entries: Vec<LogEntry> = recent_entries
+                .iter()
+                .filter(|e| e.index >= *from && e.index <= *to)
+                .cloned()
+                .collect();
+
+            let entries = if mem_entries.len() == expected_count {
+                mem_entries
+            } else {
+                let ls = log_store.clone();
+                let (f, t) = (*from, *to);
+                tokio::task::spawn_blocking(move || ls.get_range(f, t).unwrap())
+                    .await
+                    .unwrap()
+            };
+
+            // Populate write buffer for immediate read visibility
+            for entry in &entries {
+                if let LogEntryData::Command { data, revision } = &entry.data {
+                    if let Ok(cmd) = bincode::deserialize::<KvCommand>(data) {
+                        match cmd {
+                            KvCommand::Put { key, value, lease_id } => {
+                                let kv = KeyValue {
+                                    key: key.clone(),
+                                    value,
+                                    create_revision: *revision,
+                                    mod_revision: *revision,
+                                    version: 1,
+                                    lease: lease_id,
+                                };
+                                write_buffer.put(kv);
+                            }
+                            KvCommand::DeleteRange { key, range_end: _ } => {
+                                write_buffer.delete(&key, *revision);
+                            }
+                            _ => {} // Txn/Compact handled by broker path
+                        }
+                    }
+                }
+            }
+
+            // Trim applied entries from buffer
+            recent_entries.retain(|e| e.index > *to);
+
+            apply_tx.send(entries).await.ok();
+            applied_index.store(*to, Ordering::Relaxed);
+            commit_index.store(*to, Ordering::Release);
+            false
+        }
+        Action::RespondToProposal { id, result } => {
+            if let Some(tx) = pending_responses.remove(id) {
+                let _ = tx.send(match result {
+                    ClientProposalResult::Success { index, revision } => {
+                        ClientProposalResult::Success {
+                            index: *index,
+                            revision: *revision,
+                        }
+                    }
+                    ClientProposalResult::NotLeader { leader_id } => {
+                        ClientProposalResult::NotLeader {
+                            leader_id: *leader_id,
+                        }
+                    }
+                    ClientProposalResult::Error(e) => ClientProposalResult::Error(e.clone()),
+                });
+            }
+            false
+        }
+        Action::ResetElectionTimer => {
+            true
+        }
+        Action::StartHeartbeatTimer => {
+            *heartbeat_timer = Some(tokio::time::interval(config.heartbeat_interval));
+            false
+        }
+        Action::StopHeartbeatTimer => {
+            *heartbeat_timer = None;
+            false
+        }
+        Action::SendMessage { to, message } => {
+            // Look up peer PID from the shared peers map
+            let peer_pid = {
+                let peers = peers.lock().unwrap();
+                peers.get(to).copied()
+            };
+            if let Some(pid) = peer_pid {
+                // For AppendEntries, fill in entries and prev_log_term
+                // from the LogStore (the core leaves them as placeholders).
+                let message = match message {
+                    RaftMessage::AppendEntriesReq(req) => {
+                        let mut req = req.clone();
+                        if req.prev_log_index > 0 {
+                            req.prev_log_term = log_store
+                                .term_at(req.prev_log_index)
+                                .unwrap()
+                                .unwrap_or(0);
+                        }
+                        let last = log_store.last_index().unwrap_or(0);
+                        let start = req.prev_log_index + 1;
+                        if start <= last {
+                            req.entries = log_store.get_range(start, last).unwrap_or_default();
+                        }
+                        RaftMessage::AppendEntriesReq(req)
+                    }
+                    other => other.clone(),
+                };
+                let payload = raft_message_to_value(&message);
+                if let Err(e) = ctx.send(pid, payload).await {
+                    tracing::warn!(to = to, error = %e, "failed to send raft message via rebar");
+                }
+            } else {
+                tracing::debug!(to = to, "no peer PID found for node (peer not yet discovered)");
+            }
+            false
+        }
+        _ => false, // WAL actions handled by caller
+    }
+}
+
 /// Execute Raft actions using the Rebar process context for message delivery.
 ///
 /// This mirrors `execute_actions` but uses Rebar's `ProcessContext::send()`
@@ -875,147 +1082,86 @@ async fn execute_actions_rebar(
     recent_entries: &mut Vec<LogEntry>,
     write_buffer: &Arc<WriteBuffer>,
 ) -> bool {
-    let mut should_reset_election_timer = false;
+    // First pass: collect WAL operations
+    let mut wal_entries: Vec<LogEntry> = Vec::new();
+    let mut hard_state: Option<PersistentState> = None;
+    let mut has_truncate = false;
+
     for action in actions {
         match action {
             Action::PersistHardState(state) => {
-                let ls = log_store.clone();
-                let s = state.clone();
-                tokio::task::spawn_blocking(move || ls.save_hard_state(&s).unwrap())
-                    .await
-                    .unwrap();
+                hard_state = Some(state.clone());
             }
             Action::AppendToLog(entries) => {
-                let ls = log_store.clone();
-                let e = entries.clone();
-                tokio::task::spawn_blocking(move || ls.append(&e).unwrap())
-                    .await
-                    .unwrap();
-                recent_entries.extend(entries.iter().cloned());
+                wal_entries.extend(entries.iter().cloned());
             }
-            Action::TruncateLogAfter(index) => {
-                let ls = log_store.clone();
-                let idx = *index;
-                tokio::task::spawn_blocking(move || ls.truncate_after(idx).unwrap())
-                    .await
-                    .unwrap();
-                recent_entries.retain(|e| e.index <= idx);
+            Action::TruncateLogAfter(_) => {
+                has_truncate = true;
+                break;
             }
-            Action::ApplyEntries { from, to } => {
-                // Try in-memory first
-                let expected_count = (*to - *from + 1) as usize;
-                let mem_entries: Vec<LogEntry> = recent_entries
-                    .iter()
-                    .filter(|e| e.index >= *from && e.index <= *to)
-                    .cloned()
-                    .collect();
+            _ => {}
+        }
+    }
 
-                let entries = if mem_entries.len() == expected_count {
-                    mem_entries
-                } else {
+    let mut should_reset_election_timer = false;
+
+    // If there's a truncate, fall back to sequential processing
+    if has_truncate {
+        for action in actions {
+            match action {
+                Action::PersistHardState(state) => {
                     let ls = log_store.clone();
-                    let (f, t) = (*from, *to);
-                    tokio::task::spawn_blocking(move || ls.get_range(f, t).unwrap())
+                    let s = state.clone();
+                    tokio::task::spawn_blocking(move || ls.save_hard_state(&s).unwrap())
                         .await
-                        .unwrap()
-                };
-
-                // Populate write buffer for immediate read visibility
-                for entry in &entries {
-                    if let LogEntryData::Command { data, revision } = &entry.data {
-                        if let Ok(cmd) = bincode::deserialize::<KvCommand>(data) {
-                            match cmd {
-                                KvCommand::Put { key, value, lease_id } => {
-                                    let kv = KeyValue {
-                                        key: key.clone(),
-                                        value,
-                                        create_revision: *revision,
-                                        mod_revision: *revision,
-                                        version: 1,
-                                        lease: lease_id,
-                                    };
-                                    write_buffer.put(kv);
-                                }
-                                KvCommand::DeleteRange { key, range_end: _ } => {
-                                    write_buffer.delete(&key, *revision);
-                                }
-                                _ => {} // Txn/Compact handled by broker path
-                            }
-                        }
-                    }
+                        .unwrap();
                 }
-
-                // Trim applied entries from buffer
-                recent_entries.retain(|e| e.index > *to);
-
-                apply_tx.send(entries).await.ok();
-                applied_index.store(*to, Ordering::Relaxed);
-                commit_index.store(*to, Ordering::Release);
-            }
-            Action::RespondToProposal { id, result } => {
-                if let Some(tx) = pending_responses.remove(id) {
-                    let _ = tx.send(match result {
-                        ClientProposalResult::Success { index, revision } => {
-                            ClientProposalResult::Success {
-                                index: *index,
-                                revision: *revision,
-                            }
-                        }
-                        ClientProposalResult::NotLeader { leader_id } => {
-                            ClientProposalResult::NotLeader {
-                                leader_id: *leader_id,
-                            }
-                        }
-                        ClientProposalResult::Error(e) => ClientProposalResult::Error(e.clone()),
-                    });
+                Action::AppendToLog(entries) => {
+                    let ls = log_store.clone();
+                    let e = entries.clone();
+                    tokio::task::spawn_blocking(move || ls.append(&e).unwrap())
+                        .await
+                        .unwrap();
+                    recent_entries.extend(entries.iter().cloned());
                 }
-            }
-            Action::ResetElectionTimer => {
-                should_reset_election_timer = true;
-            }
-            Action::StartHeartbeatTimer => {
-                *heartbeat_timer = Some(tokio::time::interval(config.heartbeat_interval));
-            }
-            Action::StopHeartbeatTimer => {
-                *heartbeat_timer = None;
-            }
-            Action::SendMessage { to, message } => {
-                // Look up peer PID from the shared peers map
-                let peer_pid = {
-                    let peers = peers.lock().unwrap();
-                    peers.get(to).copied()
-                };
-                if let Some(pid) = peer_pid {
-                    // For AppendEntries, fill in entries and prev_log_term
-                    // from the LogStore (the core leaves them as placeholders).
-                    let message = match message {
-                        RaftMessage::AppendEntriesReq(req) => {
-                            let mut req = req.clone();
-                            if req.prev_log_index > 0 {
-                                req.prev_log_term = log_store
-                                    .term_at(req.prev_log_index)
-                                    .unwrap()
-                                    .unwrap_or(0);
-                            }
-                            let last = log_store.last_index().unwrap_or(0);
-                            let start = req.prev_log_index + 1;
-                            if start <= last {
-                                req.entries = log_store.get_range(start, last).unwrap_or_default();
-                            }
-                            RaftMessage::AppendEntriesReq(req)
-                        }
-                        other => other.clone(),
-                    };
-                    let payload = raft_message_to_value(&message);
-                    if let Err(e) = ctx.send(pid, payload).await {
-                        tracing::warn!(to = to, error = %e, "failed to send raft message via rebar");
-                    }
-                } else {
-                    tracing::debug!(to = to, "no peer PID found for node (peer not yet discovered)");
+                Action::TruncateLogAfter(index) => {
+                    let ls = log_store.clone();
+                    let idx = *index;
+                    tokio::task::spawn_blocking(move || ls.truncate_after(idx).unwrap())
+                        .await
+                        .unwrap();
+                    recent_entries.retain(|e| e.index <= idx);
+                }
+                other => {
+                    should_reset_election_timer |= execute_non_wal_action_rebar(other, apply_tx, pending_responses, heartbeat_timer, config, ctx, peers, applied_index, commit_index, recent_entries, write_buffer, log_store).await;
                 }
             }
         }
+        return should_reset_election_timer;
     }
+
+    // No truncate: flush entries + hard state in one transaction
+    if !wal_entries.is_empty() || hard_state.is_some() {
+        let ls = log_store.clone();
+        let e = wal_entries.clone();
+        let hs = hard_state;
+        tokio::task::spawn_blocking(move || ls.flush(&e, hs.as_ref()).unwrap())
+            .await
+            .unwrap();
+        recent_entries.extend(wal_entries);
+    }
+
+    // Second pass: process non-WAL actions
+    for action in actions {
+        match action {
+            Action::PersistHardState(_) | Action::AppendToLog(_) => {} // Already flushed
+            Action::TruncateLogAfter(_) => unreachable!(),
+            other => {
+                should_reset_election_timer |= execute_non_wal_action_rebar(other, apply_tx, pending_responses, heartbeat_timer, config, ctx, peers, applied_index, commit_index, recent_entries, write_buffer, log_store).await;
+            }
+        }
+    }
+
     should_reset_election_timer
 }
 
