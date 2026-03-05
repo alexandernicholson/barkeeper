@@ -14,7 +14,7 @@ fn make_entry(term: u64, index: u64, data: &str) -> LogEntry {
 #[test]
 fn test_open_and_empty() {
     let dir = tempdir().unwrap();
-    let store = LogStore::open(dir.path().join("test.redb")).unwrap();
+    let store = LogStore::open(dir.path()).unwrap();
     assert!(store.is_empty().unwrap());
     assert_eq!(store.last_index().unwrap(), 0);
     assert_eq!(store.last_term().unwrap(), 0);
@@ -23,7 +23,7 @@ fn test_open_and_empty() {
 #[test]
 fn test_append_and_get() {
     let dir = tempdir().unwrap();
-    let store = LogStore::open(dir.path().join("test.redb")).unwrap();
+    let store = LogStore::open(dir.path()).unwrap();
 
     let entries = vec![
         make_entry(1, 1, "put a 1"),
@@ -44,7 +44,7 @@ fn test_append_and_get() {
 #[test]
 fn test_get_range() {
     let dir = tempdir().unwrap();
-    let store = LogStore::open(dir.path().join("test.redb")).unwrap();
+    let store = LogStore::open(dir.path()).unwrap();
 
     let entries = vec![
         make_entry(1, 1, "a"),
@@ -63,7 +63,7 @@ fn test_get_range() {
 #[test]
 fn test_truncate_after() {
     let dir = tempdir().unwrap();
-    let store = LogStore::open(dir.path().join("test.redb")).unwrap();
+    let store = LogStore::open(dir.path()).unwrap();
 
     let entries = vec![
         make_entry(1, 1, "a"),
@@ -82,7 +82,7 @@ fn test_truncate_after() {
 #[test]
 fn test_term_at() {
     let dir = tempdir().unwrap();
-    let store = LogStore::open(dir.path().join("test.redb")).unwrap();
+    let store = LogStore::open(dir.path()).unwrap();
 
     store.append(&[make_entry(5, 1, "x")]).unwrap();
     assert_eq!(store.term_at(1).unwrap(), Some(5));
@@ -92,10 +92,9 @@ fn test_term_at() {
 #[test]
 fn test_hard_state_persistence() {
     let dir = tempdir().unwrap();
-    let path = dir.path().join("test.redb");
 
     {
-        let store = LogStore::open(&path).unwrap();
+        let store = LogStore::open(dir.path()).unwrap();
         assert!(store.load_hard_state().unwrap().is_none());
 
         let state = PersistentState {
@@ -107,7 +106,7 @@ fn test_hard_state_persistence() {
 
     // Reopen and verify persistence
     {
-        let store = LogStore::open(&path).unwrap();
+        let store = LogStore::open(dir.path()).unwrap();
         let state = store.load_hard_state().unwrap().unwrap();
         assert_eq!(state.current_term, 5);
         assert_eq!(state.voted_for, Some(3));
@@ -117,7 +116,7 @@ fn test_hard_state_persistence() {
 #[test]
 fn test_overwrite_entries() {
     let dir = tempdir().unwrap();
-    let store = LogStore::open(dir.path().join("test.redb")).unwrap();
+    let store = LogStore::open(dir.path()).unwrap();
 
     store.append(&[make_entry(1, 1, "original")]).unwrap();
     store.append(&[make_entry(2, 1, "overwritten")]).unwrap();
@@ -129,7 +128,7 @@ fn test_overwrite_entries() {
 #[test]
 fn test_flush_entries_and_hard_state() {
     let dir = tempdir().unwrap();
-    let store = LogStore::open(dir.path().join("test.redb")).unwrap();
+    let store = LogStore::open(dir.path()).unwrap();
 
     let entries = vec![
         make_entry(1, 1, "a"),
@@ -142,13 +141,11 @@ fn test_flush_entries_and_hard_state() {
 
     store.flush(&entries, Some(&state)).unwrap();
 
-    // Verify entries were written
     assert_eq!(store.len().unwrap(), 2);
     assert_eq!(store.last_index().unwrap(), 2);
     let entry = store.get(1).unwrap().unwrap();
     assert_eq!(entry.term, 1);
 
-    // Verify hard state was written
     let loaded = store.load_hard_state().unwrap().unwrap();
     assert_eq!(loaded.current_term, 3);
     assert_eq!(loaded.voted_for, Some(1));
@@ -157,7 +154,7 @@ fn test_flush_entries_and_hard_state() {
 #[test]
 fn test_flush_entries_only() {
     let dir = tempdir().unwrap();
-    let store = LogStore::open(dir.path().join("test.redb")).unwrap();
+    let store = LogStore::open(dir.path()).unwrap();
 
     let entries = vec![make_entry(1, 1, "x")];
     store.flush(&entries, None).unwrap();
@@ -169,7 +166,7 @@ fn test_flush_entries_only() {
 #[test]
 fn test_flush_hard_state_only() {
     let dir = tempdir().unwrap();
-    let store = LogStore::open(dir.path().join("test.redb")).unwrap();
+    let store = LogStore::open(dir.path()).unwrap();
 
     let state = PersistentState {
         current_term: 7,
@@ -180,4 +177,53 @@ fn test_flush_hard_state_only() {
     assert_eq!(store.len().unwrap(), 0);
     let loaded = store.load_hard_state().unwrap().unwrap();
     assert_eq!(loaded.current_term, 7);
+}
+
+#[test]
+fn test_wal_persistence_across_reopen() {
+    let dir = tempdir().unwrap();
+
+    {
+        let store = LogStore::open(dir.path()).unwrap();
+        store.append(&[
+            make_entry(1, 1, "a"),
+            make_entry(1, 2, "b"),
+            make_entry(2, 3, "c"),
+        ]).unwrap();
+    }
+
+    // Reopen and verify WAL entries survived
+    {
+        let store = LogStore::open(dir.path()).unwrap();
+        assert_eq!(store.len().unwrap(), 3);
+        assert_eq!(store.last_index().unwrap(), 3);
+        assert_eq!(store.last_term().unwrap(), 2);
+        let entry = store.get(2).unwrap().unwrap();
+        assert_eq!(entry.index, 2);
+        assert_eq!(entry.term, 1);
+    }
+}
+
+#[test]
+fn test_truncate_then_append() {
+    let dir = tempdir().unwrap();
+    let store = LogStore::open(dir.path()).unwrap();
+
+    store.append(&[
+        make_entry(1, 1, "a"),
+        make_entry(1, 2, "b"),
+        make_entry(1, 3, "c"),
+    ]).unwrap();
+
+    // Simulate follower log conflict: truncate and append new entries
+    store.truncate_after(1).unwrap();
+    store.append(&[
+        make_entry(2, 2, "new-b"),
+        make_entry(2, 3, "new-c"),
+    ]).unwrap();
+
+    assert_eq!(store.len().unwrap(), 3);
+    assert_eq!(store.last_term().unwrap(), 2);
+    let entry = store.get(2).unwrap().unwrap();
+    assert_eq!(entry.term, 2);
 }
