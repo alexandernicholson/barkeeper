@@ -6,57 +6,71 @@ BENCH_DIR="$(dirname "$SCRIPT_DIR")"
 REPO_DIR="$(dirname "$BENCH_DIR")"
 RESULTS_BASE="$BENCH_DIR/results"
 
-STACK="${1:?Usage: run.sh <barkeeper|etcd|all>}"
+STACK="${1:?Usage: run.sh <barkeeper|etcd|all> [--native]}"
+NATIVE=false
+if [[ "${2:-}" == "--native" ]]; then
+    NATIVE=true
+fi
 
 # Barkeeper HTTP gateway port (gRPC port + 1)
 BARKEEPER_PORT=2380
 # etcd client port (grpc-gateway is built-in on the same port)
 ETCD_PORT=2379
 
-run_stack() {
-    local stack="$1"
-    local compose_file="$BENCH_DIR/docker-compose.${stack}.yml"
-    local results_dir="$RESULTS_BASE/$stack"
+TMPFS_DIR=""
+NATIVE_PID=""
 
-    if [ ! -f "$compose_file" ]; then
-        echo "ERROR: $compose_file not found"
+cleanup_native() {
+    if [ -n "$NATIVE_PID" ] && kill -0 "$NATIVE_PID" 2>/dev/null; then
+        echo "Stopping native process (PID $NATIVE_PID)..."
+        kill "$NATIVE_PID" 2>/dev/null || true
+        wait "$NATIVE_PID" 2>/dev/null || true
+    fi
+    if [ -n "$TMPFS_DIR" ] && mountpoint -q "$TMPFS_DIR" 2>/dev/null; then
+        echo "Unmounting tmpfs at $TMPFS_DIR..."
+        sudo umount "$TMPFS_DIR" 2>/dev/null || true
+        rmdir "$TMPFS_DIR" 2>/dev/null || true
+    fi
+}
+
+start_native_barkeeper() {
+    echo "Building barkeeper (release)..."
+    (cd "$REPO_DIR" && cargo build --release 2>&1 | tail -3)
+
+    TMPFS_DIR=$(mktemp -d)
+    sudo mount -t tmpfs -o size=2G tmpfs "$TMPFS_DIR"
+    echo "tmpfs mounted at $TMPFS_DIR"
+
+    "$REPO_DIR/target/release/barkeeper" \
+        --listen-client-urls=0.0.0.0:2379 \
+        --data-dir="$TMPFS_DIR/data" &
+    NATIVE_PID=$!
+    echo "barkeeper started (PID $NATIVE_PID)"
+}
+
+start_native_etcd() {
+    if ! command -v etcd &> /dev/null; then
+        echo "ERROR: etcd not found in PATH. Install etcd or use Docker mode."
         return 1
     fi
 
-    echo "======================================"
-    echo "  Running benchmark: $stack"
-    echo "======================================"
+    TMPFS_DIR=$(mktemp -d)
+    sudo mount -t tmpfs -o size=2G tmpfs "$TMPFS_DIR"
+    echo "tmpfs mounted at $TMPFS_DIR"
+
+    etcd \
+        --listen-client-urls=http://0.0.0.0:2379 \
+        --advertise-client-urls=http://localhost:2379 \
+        --data-dir="$TMPFS_DIR/data" &
+    NATIVE_PID=$!
+    echo "etcd started (PID $NATIVE_PID)"
+}
+
+run_scenarios() {
+    local url="$1"
+    local results_dir="$2"
 
     mkdir -p "$results_dir"
-
-    echo "Starting $stack..."
-    docker compose -f "$compose_file" up -d --build
-
-    # Determine the health check URL.
-    local port
-    if [ "$stack" = "barkeeper" ]; then
-        port="$BARKEEPER_PORT"
-    else
-        port="$ETCD_PORT"
-    fi
-
-    echo "Waiting for $stack health on port $port..."
-    local retries=60
-    while [ $retries -gt 0 ]; do
-        if curl -sf -X POST "http://localhost:${port}/v3/maintenance/status" -d '{}' > /dev/null 2>&1; then
-            echo "$stack is healthy"
-            break
-        fi
-        retries=$((retries - 1))
-        sleep 2
-    done
-
-    if [ $retries -eq 0 ]; then
-        echo "WARNING: Health check timed out"
-        docker compose -f "$compose_file" logs
-    fi
-
-    local url="http://localhost:${port}"
 
     echo "Running scenarios against $url ..."
 
@@ -112,10 +126,10 @@ run_stack() {
     wait "$write_pid" || true
 
     # ── Scenario 4: Large Values (64KB) ───────────────────────────────
-    echo "  Large values 64KB (c=50, 15s)"
+    echo "  Large values 64KB (c=10, 5s)"
     lkey=$(echo -n "bench/large" | base64 -w0)
     lval=$(head -c 65536 /dev/urandom | base64 -w0)
-    oha -c 50 -z 15s --output-format json \
+    oha -c 10 -z 5s --output-format json \
         -m POST -d "{\"key\":\"${lkey}\",\"value\":\"${lval}\"}" \
         -T application/json \
         "${url}/v3/kv/put" > "$results_dir/large_values.json" 2>/dev/null || true
@@ -129,9 +143,82 @@ run_stack() {
             -T application/json \
             "${url}/v3/kv/range" > "$results_dir/conn_c${C}.json" 2>/dev/null || true
     done
+}
 
-    echo "Stopping $stack..."
-    docker compose -f "$compose_file" down
+run_stack() {
+    local stack="$1"
+    local results_dir="$RESULTS_BASE/$stack"
+
+    echo "======================================"
+    echo "  Running benchmark: $stack ($( $NATIVE && echo native || echo docker ))"
+    echo "======================================"
+
+    local port
+    if [ "$stack" = "barkeeper" ]; then
+        port="$BARKEEPER_PORT"
+    else
+        port="$ETCD_PORT"
+    fi
+
+    if $NATIVE; then
+        trap cleanup_native EXIT
+
+        if [ "$stack" = "barkeeper" ]; then
+            start_native_barkeeper
+        else
+            start_native_etcd
+        fi
+
+        echo "Waiting for $stack health on port $port..."
+        local retries=30
+        while [ $retries -gt 0 ]; do
+            if curl -sf -X POST "http://localhost:${port}/v3/maintenance/status" -d '{}' > /dev/null 2>&1; then
+                echo "$stack is healthy"
+                break
+            fi
+            retries=$((retries - 1))
+            sleep 1
+        done
+
+        if [ $retries -eq 0 ]; then
+            echo "WARNING: Health check timed out, proceeding anyway..."
+        fi
+
+        run_scenarios "http://localhost:${port}" "$results_dir"
+
+        cleanup_native
+        trap - EXIT
+    else
+        local compose_file="$BENCH_DIR/docker-compose.${stack}.yml"
+        if [ ! -f "$compose_file" ]; then
+            echo "ERROR: $compose_file not found"
+            return 1
+        fi
+
+        echo "Starting $stack..."
+        docker compose -f "$compose_file" up -d --build
+
+        echo "Waiting for $stack health on port $port..."
+        local retries=60
+        while [ $retries -gt 0 ]; do
+            if curl -sf -X POST "http://localhost:${port}/v3/maintenance/status" -d '{}' > /dev/null 2>&1; then
+                echo "$stack is healthy"
+                break
+            fi
+            retries=$((retries - 1))
+            sleep 2
+        done
+
+        if [ $retries -eq 0 ]; then
+            echo "WARNING: Health check timed out"
+            docker compose -f "$compose_file" logs
+        fi
+
+        run_scenarios "http://localhost:${port}" "$results_dir"
+
+        echo "Stopping $stack..."
+        docker compose -f "$compose_file" down
+    fi
 
     echo "Results saved to $results_dir/"
     echo ""

@@ -7,49 +7,49 @@ Load generated with [oha](https://github.com/hatoo/oha).
 
 | Concurrency | Barkeeper | etcd | Ratio |
 |---|---|---|---|
-| c=1 | 1,964 req/s | 1,874 req/s | 1.05x |
-| c=10 | 4,455 req/s | 6,697 req/s | 0.67x |
-| c=50 | 4,274 req/s | 8,841 req/s | 0.48x |
-| c=100 | 4,250 req/s | 9,611 req/s | 0.44x |
-| c=500 | 4,349 req/s | 9,480 req/s | 0.46x |
+| c=1 | 2,319 req/s | 2,340 req/s | 0.99x |
+| c=10 | 4,605 req/s | 10,132 req/s | 0.45x |
+| c=50 | 4,398 req/s | 14,785 req/s | 0.30x |
+| c=100 | 4,351 req/s | 16,210 req/s | 0.27x |
+| c=500 | 4,654 req/s | 16,592 req/s | 0.28x |
 
 ## Read Throughput (POST /v3/kv/range, c=100, 30s)
 
 | Metric | Barkeeper | etcd |
 |---|---|---|
-| req/s | 19,138 | 10,015 |
-| P50 | 5.00ms | 7.75ms |
-| P95 | 9.02ms | 29.34ms |
-| P99 | 11.69ms | 36.27ms |
-| P99.9 | 16.68ms | 43.31ms |
+| req/s | 32,583 | 16,149 |
+| P50 | 2.94ms | 5.80ms |
+| P95 | 5.27ms | 10.94ms |
+| P99 | 6.77ms | 14.39ms |
+| P99.9 | 9.90ms | 19.71ms |
 
 ## Mixed Workload (80% read / 20% write, 30s)
 
 | Component | Metric | Barkeeper | etcd |
 |---|---|---|---|
-| Reads (c=80) | req/s | 10,679 | 7,006 |
-| | P50 | 7.30ms | 8.97ms |
-| | P99 | 15.21ms | 37.39ms |
-| Writes (c=20) | req/s | 1,951 | 2,039 |
-| | P50 | 9.92ms | 7.57ms |
-| | P99 | 19.34ms | 35.01ms |
+| Reads (c=80) | req/s | 19,913 | 11,207 |
+| | P50 | 3.83ms | 6.67ms |
+| | P99 | 8.80ms | 16.11ms |
+| Writes (c=20) | req/s | 2,377 | 3,538 |
+| | P50 | 8.14ms | 5.32ms |
+| | P99 | 15.58ms | 13.16ms |
 
-## Large Values (64KB PUT, c=50, 15s)
+## Large Values (64KB PUT, c=10, 5s)
 
 | Metric | Barkeeper | etcd |
 |---|---|---|
-| req/s | 61,119 | 15,546 |
-| P50 | 159ms | 88.19ms |
-| P99 | 386ms | 305ms |
-| Success | 0.1% | 1.2% |
+| req/s | 392 | 1,280 |
+| P50 | 23.31ms | 7.13ms |
+| P99 | 37.29ms | 18.67ms |
+| Success | 100.0% | 100.0% |
 
 ## Connection Scaling (GET /v3/kv/range)
 
 | Concurrency | Barkeeper | etcd | Ratio |
 |---|---|---|---|
-| c=1 | 23,831 req/s | 23,791 req/s | 1.00x |
-| c=10 | 80,966 req/s | 80,156 req/s | 1.01x |
-| c=50 | 82,163 req/s | 81,528 req/s | 1.01x |
-| c=100 | 80,656 req/s | 80,348 req/s | 1.00x |
-| c=500 | 78,795 req/s | 78,729 req/s | 1.00x |
-| c=1000 | 77,804 req/s | 78,419 req/s | 0.99x |
+| c=1 | 6,617 req/s | 2,427 req/s | 2.73x |
+| c=10 | 28,507 req/s | 10,871 req/s | 2.62x |
+| c=50 | 33,279 req/s | 15,942 req/s | 2.09x |
+| c=100 | 32,865 req/s | 16,781 req/s | 1.96x |
+| c=500 | 29,827 req/s | 17,648 req/s | 1.69x |
+| c=1000 | 27,181 req/s | 16,959 req/s | 1.60x |

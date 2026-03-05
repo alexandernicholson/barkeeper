@@ -101,7 +101,7 @@ def generate_report(results_dir):
         lines.append(f"| | P99 | {bk_m['p99']} | {et_m['p99']} |")
 
     # ── Large Values ───────────────────────────────────────────────────
-    lines.append("\n## Large Values (64KB PUT, c=50, 15s)\n")
+    lines.append("\n## Large Values (64KB PUT, c=10, 5s)\n")
     lines.append("| Metric | Barkeeper | etcd |")
     lines.append("|---|---|---|")
 
