@@ -5,6 +5,7 @@ use barkeeper::kv::apply_broker::{ApplyResult, ApplyResultBroker};
 use barkeeper::kv::apply_notifier::ApplyNotifier;
 use barkeeper::kv::state_machine::{spawn_state_machine, KvCommand};
 use barkeeper::kv::store::KvStore;
+use barkeeper::kv::write_buffer::WriteBuffer;
 use barkeeper::lease::manager::LeaseManager;
 use barkeeper::raft::messages::{LogEntry, LogEntryData};
 use barkeeper::watch::actor::spawn_watch_hub_actor;
@@ -30,8 +31,9 @@ async fn make_store_and_sm(
     let broker = Arc::new(ApplyResultBroker::new());
 
     let notifier = ApplyNotifier::new(0);
+    let write_buffer = Arc::new(WriteBuffer::new());
     let (apply_tx, apply_rx) = mpsc::channel(256);
-    spawn_state_machine(apply_rx, store, watch_hub, lease_manager, broker, notifier).await;
+    spawn_state_machine(apply_rx, store, watch_hub, lease_manager, broker, notifier, write_buffer).await;
 
     (handle, apply_tx)
 }
@@ -189,6 +191,7 @@ async fn test_state_machine_uses_preassigned_revision() {
     let notifier = ApplyNotifier::new(0);
 
     let (apply_tx, apply_rx) = mpsc::channel(256);
+    let write_buffer = Arc::new(WriteBuffer::new());
     spawn_state_machine(
         apply_rx,
         Arc::clone(&store),
@@ -196,6 +199,7 @@ async fn test_state_machine_uses_preassigned_revision() {
         lease_manager,
         Arc::clone(&broker),
         notifier.clone(),
+        write_buffer,
     )
     .await;
 

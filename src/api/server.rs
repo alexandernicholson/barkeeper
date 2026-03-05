@@ -36,6 +36,7 @@ use crate::kv::apply_broker::ApplyResultBroker;
 use crate::kv::apply_notifier::ApplyNotifier;
 use crate::kv::state_machine::spawn_state_machine;
 use crate::kv::store::KvStore;
+use crate::kv::write_buffer::WriteBuffer;
 use crate::lease::manager::LeaseManager;
 use crate::proto::etcdserverpb::auth_server::AuthServer;
 use crate::proto::etcdserverpb::cluster_server::ClusterServer;
@@ -129,6 +130,9 @@ impl BarkeepServer {
         let peers: Arc<Mutex<HashMap<u64, ProcessId>>> =
             Arc::new(Mutex::new(HashMap::new()));
 
+        // Create the write buffer for decoupling KV fsync from write response path.
+        let write_buffer = Arc::new(WriteBuffer::new());
+
         // Seed the Raft revision counter from the KvStore's current revision.
         let initial_rev = kv_store.current_revision().unwrap_or(0);
         let revision = Arc::new(AtomicI64::new(initial_rev));
@@ -141,6 +145,7 @@ impl BarkeepServer {
             Arc::clone(&registry),
             Arc::clone(&peers),
             revision,
+            Arc::clone(&write_buffer),
         )
         .await;
         let raft_term = Arc::clone(&raft_handle.current_term);
@@ -296,6 +301,7 @@ impl BarkeepServer {
             Arc::clone(&lease_manager),
             Arc::clone(&broker),
             notifier.clone(),
+            Arc::clone(&write_buffer),
         ).await;
 
         // Create the KV gRPC service.
@@ -423,6 +429,7 @@ impl BarkeepServer {
             alarms,
             Arc::clone(&broker),
             notifier,
+            write_buffer,
         );
 
         tracing::info!(%http_addr, %scheme, "starting HTTP gateway");

@@ -18,6 +18,7 @@ use rebar_cluster::router::{deliver_inbound_frame, DistributedRouter, RouterComm
 
 use barkeeper::kv::state_machine::KvCommand;
 use barkeeper::kv::store::KvStore;
+use barkeeper::kv::write_buffer::WriteBuffer;
 use barkeeper::raft::messages::{ClientProposalResult, LogEntry, LogEntryData};
 use barkeeper::raft::node::{spawn_raft_node_rebar, RaftConfig, RaftHandle};
 
@@ -99,6 +100,7 @@ impl ReplicationCluster {
             spawn_apply_loop(Arc::clone(&store), apply_rx);
 
             let revision = Arc::new(std::sync::atomic::AtomicI64::new(0));
+            let write_buffer = Arc::new(WriteBuffer::new());
             let handle = spawn_raft_node_rebar(
                 config,
                 apply_tx,
@@ -106,6 +108,7 @@ impl ReplicationCluster {
                 Arc::clone(&registry),
                 Arc::clone(&peers),
                 revision,
+                write_buffer,
             )
             .await;
 

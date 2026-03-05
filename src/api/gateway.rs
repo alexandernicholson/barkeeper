@@ -28,6 +28,7 @@ use crate::kv::apply_broker::{ApplyResult, ApplyResultBroker};
 use crate::kv::apply_notifier::ApplyNotifier;
 use crate::kv::state_machine::KvCommand;
 use crate::kv::store::{KvStore, TxnCompare, TxnCompareResult, TxnCompareTarget, TxnOp, TxnOpResponse};
+use crate::kv::write_buffer::WriteBuffer;
 use crate::lease::manager::LeaseManager;
 use crate::raft::messages::ClientProposalResult;
 use crate::raft::node::RaftHandle;
@@ -80,6 +81,7 @@ pub struct GatewayState {
     pub alarms: Arc<Mutex<Vec<AlarmMember>>>,
     pub broker: Arc<ApplyResultBroker>,
     pub apply_notifier: ApplyNotifier,
+    pub write_buffer: Arc<WriteBuffer>,
 }
 
 // ── JSON request / response types ───────────────────────────────────────────
@@ -512,6 +514,7 @@ pub fn create_router(
     alarms: Arc<Mutex<Vec<AlarmMember>>>,
     broker: Arc<ApplyResultBroker>,
     apply_notifier: ApplyNotifier,
+    write_buffer: Arc<WriteBuffer>,
 ) -> Router {
     let state = GatewayState {
         store,
@@ -527,6 +530,7 @@ pub fn create_router(
         alarms,
         broker,
         apply_notifier,
+        write_buffer,
     };
 
     Router::new()
@@ -585,30 +589,107 @@ async fn handle_range(
     let limit = req.limit.unwrap_or(0);
     let revision = req.revision.unwrap_or(0);
 
-    // Since PUT waits for apply before responding, the store is always
-    // consistent for reads without needing ReadIndex.  Serializable field
-    // is accepted but ignored in single-node mode.
+    // If requesting a specific historical revision, skip the buffer
+    // (buffer only has latest writes).
+    if revision > 0 {
+        let store = Arc::clone(&state.store_direct);
+        let result = tokio::task::spawn_blocking(move || {
+            store.range(&key, &range_end, limit, revision)
+        })
+        .await
+        .expect("range spawn_blocking");
 
-    // Bypass the actor channel — run the range query directly on the
-    // blocking thread pool.  redb supports concurrent read transactions
-    // so multiple reads execute in parallel without serialising through
-    // the single-threaded actor.
+        return match result {
+            Ok(result) => {
+                let rev = state.store_direct.current_revision().unwrap_or(0);
+                let kvs: Vec<JsonKeyValue> = result.kvs.iter().map(proto_kv_to_json).collect();
+                axum::Json(RangeResponse {
+                    header: state.make_header(rev),
+                    kvs,
+                    more: result.more,
+                    count: result.count,
+                })
+                .into_response()
+            }
+            Err(e) => json_error(StatusCode::INTERNAL_SERVER_ERROR, format!("range: {}", e))
+                .into_response(),
+        };
+    }
+
+    // Current revision read — merge redb with buffer.
     let store = Arc::clone(&state.store_direct);
+    let k = key.clone();
+    let re = range_end.clone();
     let result = tokio::task::spawn_blocking(move || {
-        store.range(&key, &range_end, limit, revision)
+        store.range(&k, &re, 0, 0) // No limit yet — apply after merge
     })
     .await
     .expect("range spawn_blocking");
 
     match result {
         Ok(result) => {
+            // Get buffer entries for this range
+            let buf_entries = state.write_buffer.range(&key, &range_end);
+            let deleted_keys = state.write_buffer.deleted_keys_in_range(&key, &range_end);
+
+            // Build lookup maps for merge logic
+            let buf_map: std::collections::HashMap<Vec<u8>, &crate::proto::mvccpb::KeyValue> =
+                buf_entries.iter().map(|kv| (kv.key.clone(), kv)).collect();
+            let deleted_set: std::collections::HashSet<Vec<u8>> = deleted_keys.into_iter().collect();
+            let redb_map: std::collections::HashMap<Vec<u8>, crate::proto::mvccpb::KeyValue> =
+                result.kvs.iter().map(|kv| (kv.key.clone(), kv.clone())).collect();
+
+            // For keys in both buffer and redb, prefer whichever has higher mod_revision.
+            // redb entries are authoritative (correct version, create_revision), so if redb
+            // has already applied the write (mod_revision >= buffer), use redb's entry.
+            let mut handled_keys: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
+            let mut merged: Vec<_> = result.kvs.into_iter()
+                .filter(|kv| !deleted_set.contains(&kv.key)) // Remove tombstoned
+                .filter(|kv| {
+                    if let Some(buf_kv) = buf_map.get(&kv.key) {
+                        // redb has this key too — keep redb if its mod_revision >= buffer
+                        if kv.mod_revision >= buf_kv.mod_revision {
+                            handled_keys.insert(kv.key.clone());
+                            true // keep redb entry (authoritative)
+                        } else {
+                            false // buffer is newer, will be added below with enrichment
+                        }
+                    } else {
+                        true // not in buffer, keep redb
+                    }
+                })
+                .collect();
+
+            // Add buffer entries only for keys not already covered by redb.
+            // For overwrites where buffer is newer but redb has an older version,
+            // enrich the buffer entry with redb's create_revision and version+1.
+            merged.extend(buf_entries.into_iter()
+                .filter(|kv| !handled_keys.contains(&kv.key))
+                .map(|mut kv| {
+                    if let Some(redb_kv) = redb_map.get(&kv.key) {
+                        // This is an overwrite — buffer has newer value, redb has metadata.
+                        kv.create_revision = redb_kv.create_revision;
+                        kv.version = redb_kv.version + 1;
+                    }
+                    kv
+                }));
+
+            // Sort by key
+            merged.sort_by(|a, b| a.key.cmp(&b.key));
+
+            let total_count = merged.len() as i64;
+            let more = limit > 0 && total_count > limit;
+            if limit > 0 {
+                merged.truncate(limit as usize);
+            }
+
             let rev = state.store_direct.current_revision().unwrap_or(0);
-            let kvs: Vec<JsonKeyValue> = result.kvs.iter().map(proto_kv_to_json).collect();
+            let kvs: Vec<JsonKeyValue> = merged.iter().map(proto_kv_to_json).collect();
             axum::Json(RangeResponse {
                 header: state.make_header(rev),
                 kvs,
-                more: result.more,
-                count: result.count,
+                more,
+                count: if limit > 0 { total_count } else { merged.len() as i64 },
             })
             .into_response()
         }
@@ -627,18 +708,22 @@ async fn handle_put(
     let lease_id = req.lease.unwrap_or(0);
 
     // If prev_kv requested, read it BEFORE proposing the new write.
-    // Since PUT waits for apply, all previous writes are already applied.
+    // Check buffer first (may have pending writes), then fall back to redb.
     let prev_kv = if req.prev_kv.unwrap_or(false) {
-        let store = Arc::clone(&state.store_direct);
-        let k = key.clone();
-        tokio::task::spawn_blocking(move || {
-            store.range(&k, &[], 0, 0).ok()
-                .and_then(|r| r.kvs.into_iter().next())
-        })
-        .await
-        .ok()
-        .flatten()
-        .map(|kv| proto_kv_to_json(&kv))
+        if let Some(buf_kv) = state.write_buffer.get(&key) {
+            Some(proto_kv_to_json(&buf_kv))
+        } else {
+            let store = Arc::clone(&state.store_direct);
+            let k = key.clone();
+            tokio::task::spawn_blocking(move || {
+                store.range(&k, &[], 0, 0).ok()
+                    .and_then(|r| r.kvs.into_iter().next())
+            })
+            .await
+            .ok()
+            .flatten()
+            .map(|kv| proto_kv_to_json(&kv))
+        }
     } else {
         None
     };
@@ -660,11 +745,8 @@ async fn handle_put(
     };
 
     match proposal_result {
-        ClientProposalResult::Success { index, revision, .. } => {
-            // Wait for the state machine to apply this entry so that
-            // subsequent reads see the written data without ReadIndex.
-            let _ = state.broker.wait_for_result(index).await;
-
+        ClientProposalResult::Success { revision, .. } => {
+            // No broker wait needed — WriteBuffer populated before this response.
             axum::Json(PutResponse {
                 header: state.make_header(revision),
                 prev_kv,

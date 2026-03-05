@@ -22,6 +22,7 @@ use barkeeper::kv::apply_broker::ApplyResultBroker;
 use barkeeper::kv::apply_notifier::ApplyNotifier;
 use barkeeper::kv::state_machine::spawn_state_machine;
 use barkeeper::kv::store::KvStore;
+use barkeeper::kv::write_buffer::WriteBuffer;
 use barkeeper::lease::manager::LeaseManager;
 use barkeeper::raft::node::{spawn_raft_node, RaftConfig};
 use barkeeper::watch::actor::spawn_watch_hub_actor;
@@ -43,8 +44,10 @@ async fn start_test_instance() -> (SocketAddr, tempfile::TempDir) {
 
     let (apply_tx, apply_rx) = mpsc::channel(256);
 
+    let write_buffer = Arc::new(WriteBuffer::new());
+
     let revision = std::sync::Arc::new(std::sync::atomic::AtomicI64::new(0));
-    let raft_handle = spawn_raft_node(config, apply_tx, revision).await;
+    let raft_handle = spawn_raft_node(config, apply_tx, revision, Arc::clone(&write_buffer)).await;
 
     let lease_manager = Arc::new(LeaseManager::new());
     let cluster_runtime = Runtime::new(1);
@@ -69,6 +72,7 @@ async fn start_test_instance() -> (SocketAddr, tempfile::TempDir) {
         Arc::clone(&lease_manager),
         Arc::clone(&broker),
         notifier.clone(),
+        Arc::clone(&write_buffer),
     ).await;
 
     // Spawn lease expiry timer — checks every 500ms for expired leases.
@@ -115,6 +119,7 @@ async fn start_test_instance() -> (SocketAddr, tempfile::TempDir) {
         Arc::new(std::sync::Mutex::new(vec![])),
         broker,
         notifier,
+        write_buffer,
     );
 
     let http_port = portpicker::pick_unused_port().expect("no free port");

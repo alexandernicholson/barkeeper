@@ -5,6 +5,7 @@ use tokio::sync::mpsc;
 use super::apply_broker::{ApplyResult, ApplyResultBroker};
 use super::apply_notifier::ApplyNotifier;
 use super::store::{ApplyResultData, KvStore, TxnCompare, TxnOp};
+use crate::kv::write_buffer::WriteBuffer;
 use crate::lease::manager::LeaseManager;
 use crate::raft::messages::{LogEntry, LogEntryData};
 use crate::watch::actor::WatchHubActorHandle;
@@ -45,6 +46,7 @@ struct StateMachine {
     lease_manager: Arc<LeaseManager>,
     broker: Arc<ApplyResultBroker>,
     notifier: ApplyNotifier,
+    write_buffer: Arc<WriteBuffer>,
 }
 
 impl StateMachine {
@@ -128,6 +130,18 @@ impl StateMachine {
                         }
                     }
 
+                    // Clean up write buffer entries now that redb has authoritative data.
+                    let applied_revision = commands[i].1;
+                    match &commands[i].0 {
+                        KvCommand::Put { ref key, .. } => {
+                            self.write_buffer.remove_if_revision_le(key, applied_revision);
+                        }
+                        KvCommand::DeleteRange { ref key, .. } => {
+                            self.write_buffer.remove_if_revision_le(key, applied_revision);
+                        }
+                        _ => {}
+                    }
+
                     // Convert to ApplyResult and send to broker.
                     let apply_result = match batch_op.apply_result {
                         ApplyResultData::Put(r) => ApplyResult::Put(r),
@@ -160,6 +174,7 @@ pub async fn spawn_state_machine(
     lease_manager: Arc<LeaseManager>,
     broker: Arc<ApplyResultBroker>,
     notifier: ApplyNotifier,
+    write_buffer: Arc<WriteBuffer>,
 ) {
     let sm = StateMachine {
         store,
@@ -167,6 +182,7 @@ pub async fn spawn_state_machine(
         lease_manager,
         broker,
         notifier,
+        write_buffer,
     };
     tokio::spawn(async move {
         while let Some(entries) = apply_rx.recv().await {

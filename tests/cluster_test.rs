@@ -16,6 +16,7 @@ use rebar_core::runtime::Runtime;
 use rebar_cluster::registry::orset::Registry;
 use rebar_cluster::router::{deliver_inbound_frame, DistributedRouter, RouterCommand};
 
+use barkeeper::kv::write_buffer::WriteBuffer;
 use barkeeper::raft::messages::{ClientProposalResult, LogEntry};
 use barkeeper::raft::node::{spawn_raft_node_rebar, RaftConfig, RaftHandle};
 
@@ -85,6 +86,7 @@ impl TestCluster {
             let (apply_tx, mut apply_rx) = mpsc::channel::<Vec<LogEntry>>(64);
 
             let revision = Arc::new(std::sync::atomic::AtomicI64::new(0));
+            let write_buffer = Arc::new(WriteBuffer::new());
             let handle = spawn_raft_node_rebar(
                 config,
                 apply_tx,
@@ -92,6 +94,7 @@ impl TestCluster {
                 Arc::clone(&registry),
                 Arc::clone(&peers),
                 revision,
+                write_buffer,
             )
             .await;
 

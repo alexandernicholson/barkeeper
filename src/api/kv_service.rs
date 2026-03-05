@@ -132,11 +132,8 @@ impl Kv for KvService {
             .map_err(|e| Status::unavailable(format!("raft: {}", e)))?;
 
         match proposal_result {
-            ClientProposalResult::Success { index, revision, .. } => {
-                // Wait for the state machine to apply this entry so that
-                // subsequent reads see the written data without ReadIndex.
-                let _ = self.broker.wait_for_result(index).await;
-
+            ClientProposalResult::Success { revision, .. } => {
+                // No broker wait needed — WriteBuffer populated before this response.
                 Ok(Response::new(PutResponse {
                     header: self.make_header(revision),
                     prev_kv,

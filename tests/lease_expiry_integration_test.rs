@@ -19,6 +19,7 @@ use barkeeper::kv::apply_broker::ApplyResultBroker;
 use barkeeper::kv::apply_notifier::ApplyNotifier;
 use barkeeper::kv::state_machine::spawn_state_machine;
 use barkeeper::kv::store::KvStore;
+use barkeeper::kv::write_buffer::WriteBuffer;
 use barkeeper::lease::manager::LeaseManager;
 use barkeeper::raft::node::{spawn_raft_node, RaftConfig};
 use barkeeper::watch::actor::spawn_watch_hub_actor;
@@ -41,8 +42,10 @@ async fn start_instance_with_lease_expiry() -> (SocketAddr, KvStoreActorHandle, 
     let store = spawn_kv_store_actor(&kv_runtime, Arc::clone(&kv_store)).await;
 
     let (apply_tx, apply_rx) = mpsc::channel(256);
+    let write_buffer = Arc::new(WriteBuffer::new());
+
     let revision = Arc::new(std::sync::atomic::AtomicI64::new(0));
-    let raft_handle = spawn_raft_node(config, apply_tx, revision).await;
+    let raft_handle = spawn_raft_node(config, apply_tx, revision, Arc::clone(&write_buffer)).await;
 
     let lease_manager = Arc::new(LeaseManager::new());
     let watch_runtime = Runtime::new(1);
@@ -61,6 +64,7 @@ async fn start_instance_with_lease_expiry() -> (SocketAddr, KvStoreActorHandle, 
         Arc::clone(&lease_manager),
         Arc::clone(&broker),
         notifier.clone(),
+        Arc::clone(&write_buffer),
     ).await;
 
     // Spawn a lease expiry timer that checks every 500ms.
@@ -105,6 +109,7 @@ async fn start_instance_with_lease_expiry() -> (SocketAddr, KvStoreActorHandle, 
         Arc::new(std::sync::Mutex::new(vec![])),
         broker,
         notifier,
+        write_buffer,
     );
 
     let port = portpicker::pick_unused_port().unwrap();
