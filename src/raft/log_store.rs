@@ -35,7 +35,7 @@ impl LogStore {
         {
             let mut table = txn.open_table(LOG_TABLE)?;
             for entry in entries {
-                let bytes = serde_json::to_vec(entry).expect("serialize log entry");
+                let bytes = bincode::serialize(entry).expect("serialize log entry");
                 table.insert(entry.index, bytes.as_slice())?;
             }
         }
@@ -50,7 +50,7 @@ impl LogStore {
         match table.get(index)? {
             Some(val) => {
                 let entry: LogEntry =
-                    serde_json::from_slice(val.value()).expect("deserialize");
+                    bincode::deserialize(val.value()).expect("deserialize");
                 Ok(Some(entry))
             }
             None => Ok(None),
@@ -65,7 +65,7 @@ impl LogStore {
         for result in table.range(start..=end)? {
             let (_, val) = result?;
             let entry: LogEntry =
-                serde_json::from_slice(val.value()).expect("deserialize");
+                bincode::deserialize(val.value()).expect("deserialize");
             entries.push(entry);
         }
         Ok(entries)
@@ -108,7 +108,7 @@ impl LogStore {
         let result = match table.last()? {
             Some((_, v)) => {
                 let entry: LogEntry =
-                    serde_json::from_slice(v.value()).expect("deserialize");
+                    bincode::deserialize(v.value()).expect("deserialize");
                 entry.term
             }
             None => 0,
@@ -126,7 +126,7 @@ impl LogStore {
         let txn = self.db.begin_write()?;
         {
             let mut table = txn.open_table(META_TABLE)?;
-            let bytes = serde_json::to_vec(state).expect("serialize hard state");
+            let bytes = bincode::serialize(state).expect("serialize hard state");
             table.insert("hard_state", bytes.as_slice())?;
         }
         txn.commit()?;
@@ -140,7 +140,7 @@ impl LogStore {
         match table.get("hard_state")? {
             Some(val) => {
                 let state: PersistentState =
-                    serde_json::from_slice(val.value()).expect("deserialize");
+                    bincode::deserialize(val.value()).expect("deserialize");
                 Ok(Some(state))
             }
             None => Ok(None),
