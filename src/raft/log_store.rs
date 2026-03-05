@@ -1,5 +1,6 @@
 use redb::{Database, ReadableTable, ReadableTableMetadata, TableDefinition};
 use std::path::Path;
+use std::sync::Arc;
 
 use super::messages::LogEntry;
 use super::state::PersistentState;
@@ -11,8 +12,9 @@ const LOG_TABLE: TableDefinition<u64, &[u8]> = TableDefinition::new("raft_log");
 const META_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("raft_meta");
 
 /// Durable storage for Raft log entries and hard state.
+#[derive(Clone)]
 pub struct LogStore {
-    db: Database,
+    db: Arc<Database>,
 }
 
 impl LogStore {
@@ -26,7 +28,7 @@ impl LogStore {
             txn.open_table(META_TABLE)?;
         }
         txn.commit()?;
-        Ok(LogStore { db })
+        Ok(LogStore { db: Arc::new(db) })
     }
 
     /// Append entries to the log. Overwrites any existing entries at the same indices.

@@ -252,16 +252,32 @@ async fn execute_actions(
     for action in actions {
         match action {
             Action::PersistHardState(state) => {
-                log_store.save_hard_state(state).unwrap();
+                let ls = log_store.clone();
+                let s = state.clone();
+                tokio::task::spawn_blocking(move || ls.save_hard_state(&s).unwrap())
+                    .await
+                    .unwrap();
             }
             Action::AppendToLog(entries) => {
-                log_store.append(entries).unwrap();
+                let ls = log_store.clone();
+                let e = entries.clone();
+                tokio::task::spawn_blocking(move || ls.append(&e).unwrap())
+                    .await
+                    .unwrap();
             }
             Action::TruncateLogAfter(index) => {
-                log_store.truncate_after(*index).unwrap();
+                let ls = log_store.clone();
+                let idx = *index;
+                tokio::task::spawn_blocking(move || ls.truncate_after(idx).unwrap())
+                    .await
+                    .unwrap();
             }
             Action::ApplyEntries { from, to } => {
-                let entries = log_store.get_range(*from, *to).unwrap();
+                let ls = log_store.clone();
+                let (f, t) = (*from, *to);
+                let entries = tokio::task::spawn_blocking(move || ls.get_range(f, t).unwrap())
+                    .await
+                    .unwrap();
                 apply_tx.send(entries).await.ok();
                 applied_index.store(*to, Ordering::Relaxed);
                 commit_index.store(*to, Ordering::Release);
@@ -485,16 +501,32 @@ async fn execute_actions_rebar(
     for action in actions {
         match action {
             Action::PersistHardState(state) => {
-                log_store.save_hard_state(state).unwrap();
+                let ls = log_store.clone();
+                let s = state.clone();
+                tokio::task::spawn_blocking(move || ls.save_hard_state(&s).unwrap())
+                    .await
+                    .unwrap();
             }
             Action::AppendToLog(entries) => {
-                log_store.append(entries).unwrap();
+                let ls = log_store.clone();
+                let e = entries.clone();
+                tokio::task::spawn_blocking(move || ls.append(&e).unwrap())
+                    .await
+                    .unwrap();
             }
             Action::TruncateLogAfter(index) => {
-                log_store.truncate_after(*index).unwrap();
+                let ls = log_store.clone();
+                let idx = *index;
+                tokio::task::spawn_blocking(move || ls.truncate_after(idx).unwrap())
+                    .await
+                    .unwrap();
             }
             Action::ApplyEntries { from, to } => {
-                let entries = log_store.get_range(*from, *to).unwrap();
+                let ls = log_store.clone();
+                let (f, t) = (*from, *to);
+                let entries = tokio::task::spawn_blocking(move || ls.get_range(f, t).unwrap())
+                    .await
+                    .unwrap();
                 apply_tx.send(entries).await.ok();
                 applied_index.store(*to, Ordering::Relaxed);
                 commit_index.store(*to, Ordering::Release);
