@@ -128,7 +128,7 @@ pub async fn spawn_raft_node(
     std::fs::create_dir_all(&data_dir).expect("create data dir");
 
     let log_store =
-        LogStore::open(format!("{}/raft.redb", data_dir)).expect("failed to open LogStore");
+        LogStore::open(&data_dir).expect("failed to open LogStore");
 
     let mut core = RaftCore::new(config.node_id, revision);
 
@@ -782,7 +782,7 @@ pub async fn spawn_raft_node_rebar(
     std::fs::create_dir_all(&data_dir).expect("create data dir");
 
     let log_store =
-        LogStore::open(format!("{}/raft.redb", data_dir)).expect("failed to open LogStore");
+        LogStore::open(&data_dir).expect("failed to open LogStore");
 
     let mut core = RaftCore::new(config.node_id, revision);
 
