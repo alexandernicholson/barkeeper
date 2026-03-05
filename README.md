@@ -146,7 +146,7 @@ graph TD
 
 **Lease manager** handles TTL-based key lifecycle. When a lease expires, all keys attached to it are automatically cleaned up. Supports grant, revoke, keepalive, and time-to-live queries.
 
-**Storage** uses [redb](https://github.com/cberner/redb), a pure-Rust embedded database with ACID transactions. No C dependencies (unlike boltdb/bbolt used by etcd).
+**Storage** uses an in-memory BTreeMap state machine backed by an append-only WAL for durability. The KV store is a materialized view that can be reconstructed from WAL replay. No C dependencies (unlike boltdb/bbolt used by etcd).
 
 ## Kubernetes Deployment
 
@@ -311,13 +311,13 @@ Single-node, native on tmpfs. Load via [oha](https://github.com/hatoo/oha) again
 
 | Scenario | Barkeeper | etcd | Ratio |
 |---|---|---|---|
-| Write c=1 | 4,970 req/s | 2,340 req/s | **2.12x** |
-| Write c=100 | 4,623 req/s | 16,210 req/s | 0.29x |
-| Read c=100 | 32,985 req/s | 16,149 req/s | **2.04x** |
-| Read P99 | 6.59ms | 14.39ms | **2.2x faster** |
-| Mixed read (c=80) | 22,363 req/s | 11,207 req/s | **2.00x** |
-| Mixed write (c=20) | 2,389 req/s | 3,538 req/s | 0.68x |
-| Conn scaling c=1000 | 27,222 req/s | 16,959 req/s | **1.61x** |
+| Write c=1 | 5,618 req/s | 2,340 req/s | **2.40x** |
+| Write c=100 | 33,741 req/s | 16,210 req/s | **2.08x** |
+| Read c=100 | 34,765 req/s | 16,149 req/s | **2.15x** |
+| Read P99 | 6.43ms | 14.39ms | **2.2x faster** |
+| Mixed read (c=80) | 24,281 req/s | 11,207 req/s | **2.17x** |
+| Mixed write (c=20) | 5,456 req/s | 3,538 req/s | **1.54x** |
+| Conn scaling c=1000 | 29,090 req/s | 16,959 req/s | **1.72x** |
 
 Full results: [`bench/results/RESULTS.md`](bench/results/RESULTS.md)
 
@@ -337,7 +337,7 @@ barkeeper is a from-scratch implementation, not a fork of etcd. It aims for API 
 |-|------|-----------|
 | Language | Go | Rust |
 | Concurrency | goroutines | Rebar actor runtime (BEAM-inspired) |
-| Storage | bbolt (cgo) | Append-only WAL + redb (pure Rust, no C deps) |
+| Storage | bbolt (cgo) | Append-only WAL + in-memory BTreeMap (pure Rust, no C deps) |
 
 ## Building from Source
 
