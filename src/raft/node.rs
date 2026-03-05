@@ -149,6 +149,9 @@ pub async fn spawn_raft_node(
             oneshot::Sender<ClientProposalResult>,
         > = Default::default();
 
+        // In-memory buffer for recently appended entries to avoid disk round-trips
+        let mut recent_entries: Vec<LogEntry> = Vec::new();
+
         // Process init actions
         execute_actions(
             &init_actions,
@@ -159,6 +162,7 @@ pub async fn spawn_raft_node(
             &config,
             &applied_ref,
             &commit_ref,
+            &mut recent_entries,
         )
         .await;
         term_ref.store(core.state.persistent.current_term, Ordering::Relaxed);
@@ -169,7 +173,7 @@ pub async fn spawn_raft_node(
                 // Election timeout
                 _ = &mut election_timer => {
                     let actions = core.step(Event::ElectionTimeout);
-                    execute_actions(&actions, &log_store, &apply_tx, &mut pending_responses, &mut heartbeat_timer, &config, &applied_ref, &commit_ref).await;
+                    execute_actions(&actions, &log_store, &apply_tx, &mut pending_responses, &mut heartbeat_timer, &config, &applied_ref, &commit_ref, &mut recent_entries).await;
                     term_ref.store(core.state.persistent.current_term, Ordering::Relaxed);
                     leader_ref.store(core.state.leader_id.unwrap_or(0), Ordering::Relaxed);
                     election_timer = random_election_timeout(&config);
@@ -178,7 +182,7 @@ pub async fn spawn_raft_node(
                 // Heartbeat (leader only)
                 _ = heartbeat_tick(&mut heartbeat_timer) => {
                     let actions = core.step(Event::HeartbeatTimeout);
-                    execute_actions(&actions, &log_store, &apply_tx, &mut pending_responses, &mut heartbeat_timer, &config, &applied_ref, &commit_ref).await;
+                    execute_actions(&actions, &log_store, &apply_tx, &mut pending_responses, &mut heartbeat_timer, &config, &applied_ref, &commit_ref, &mut recent_entries).await;
                     term_ref.store(core.state.persistent.current_term, Ordering::Relaxed);
                     leader_ref.store(core.state.leader_id.unwrap_or(0), Ordering::Relaxed);
                 }
@@ -201,7 +205,7 @@ pub async fn spawn_raft_node(
                     }
 
                     let merged = merge_log_actions(all_actions);
-                    execute_actions(&merged, &log_store, &apply_tx, &mut pending_responses, &mut heartbeat_timer, &config, &applied_ref, &commit_ref).await;
+                    execute_actions(&merged, &log_store, &apply_tx, &mut pending_responses, &mut heartbeat_timer, &config, &applied_ref, &commit_ref, &mut recent_entries).await;
                     term_ref.store(core.state.persistent.current_term, Ordering::Relaxed);
                     leader_ref.store(core.state.leader_id.unwrap_or(0), Ordering::Relaxed);
                 }
@@ -209,7 +213,7 @@ pub async fn spawn_raft_node(
                 // Inbound Raft messages from peers (via transport)
                 Some((from, message)) = inbound_rx.recv() => {
                     let actions = core.step(Event::Message { from, message });
-                    execute_actions(&actions, &log_store, &apply_tx, &mut pending_responses, &mut heartbeat_timer, &config, &applied_ref, &commit_ref).await;
+                    execute_actions(&actions, &log_store, &apply_tx, &mut pending_responses, &mut heartbeat_timer, &config, &applied_ref, &commit_ref, &mut recent_entries).await;
                     term_ref.store(core.state.persistent.current_term, Ordering::Relaxed);
                     leader_ref.store(core.state.leader_id.unwrap_or(0), Ordering::Relaxed);
                 }
@@ -248,6 +252,7 @@ async fn execute_actions(
     config: &RaftConfig,
     applied_index: &Arc<AtomicU64>,
     commit_index: &Arc<AtomicU64>,
+    recent_entries: &mut Vec<LogEntry>,
 ) {
     for action in actions {
         match action {
@@ -264,6 +269,7 @@ async fn execute_actions(
                 tokio::task::spawn_blocking(move || ls.append(&e).unwrap())
                     .await
                     .unwrap();
+                recent_entries.extend(entries.iter().cloned());
             }
             Action::TruncateLogAfter(index) => {
                 let ls = log_store.clone();
@@ -271,13 +277,30 @@ async fn execute_actions(
                 tokio::task::spawn_blocking(move || ls.truncate_after(idx).unwrap())
                     .await
                     .unwrap();
+                recent_entries.retain(|e| e.index <= idx);
             }
             Action::ApplyEntries { from, to } => {
-                let ls = log_store.clone();
-                let (f, t) = (*from, *to);
-                let entries = tokio::task::spawn_blocking(move || ls.get_range(f, t).unwrap())
-                    .await
-                    .unwrap();
+                // Try in-memory first
+                let expected_count = (*to - *from + 1) as usize;
+                let mem_entries: Vec<LogEntry> = recent_entries
+                    .iter()
+                    .filter(|e| e.index >= *from && e.index <= *to)
+                    .cloned()
+                    .collect();
+
+                let entries = if mem_entries.len() == expected_count {
+                    mem_entries
+                } else {
+                    let ls = log_store.clone();
+                    let (f, t) = (*from, *to);
+                    tokio::task::spawn_blocking(move || ls.get_range(f, t).unwrap())
+                        .await
+                        .unwrap()
+                };
+
+                // Trim applied entries from buffer
+                recent_entries.retain(|e| e.index > *to);
+
                 apply_tx.send(entries).await.ok();
                 applied_index.store(*to, Ordering::Relaxed);
                 commit_index.store(*to, Ordering::Release);
@@ -398,6 +421,9 @@ pub async fn spawn_raft_node_rebar(
                 oneshot::Sender<ClientProposalResult>,
             > = Default::default();
 
+            // In-memory buffer for recently appended entries to avoid disk round-trips
+            let mut recent_entries: Vec<LogEntry> = Vec::new();
+
             // Process init actions
             execute_actions_rebar(
                 &init_actions,
@@ -410,6 +436,7 @@ pub async fn spawn_raft_node_rebar(
                 &peers,
                 &applied_ref,
                 &commit_ref,
+                &mut recent_entries,
             )
             .await;
             term_ref.store(core.state.persistent.current_term, Ordering::Relaxed);
@@ -420,7 +447,7 @@ pub async fn spawn_raft_node_rebar(
                     // Election timeout
                     _ = &mut election_timer => {
                         let actions = core.step(Event::ElectionTimeout);
-                        let _reset = execute_actions_rebar(&actions, &log_store, &apply_tx, &mut pending_responses, &mut heartbeat_timer, &config, &ctx, &peers, &applied_ref, &commit_ref).await;
+                        let _reset = execute_actions_rebar(&actions, &log_store, &apply_tx, &mut pending_responses, &mut heartbeat_timer, &config, &ctx, &peers, &applied_ref, &commit_ref, &mut recent_entries).await;
                         term_ref.store(core.state.persistent.current_term, Ordering::Relaxed);
                     leader_ref.store(core.state.leader_id.unwrap_or(0), Ordering::Relaxed);
                         // Always reset after election timeout fires (start_election returns ResetElectionTimer)
@@ -430,7 +457,7 @@ pub async fn spawn_raft_node_rebar(
                     // Heartbeat (leader only)
                     _ = heartbeat_tick(&mut heartbeat_timer) => {
                         let actions = core.step(Event::HeartbeatTimeout);
-                        let reset = execute_actions_rebar(&actions, &log_store, &apply_tx, &mut pending_responses, &mut heartbeat_timer, &config, &ctx, &peers, &applied_ref, &commit_ref).await;
+                        let reset = execute_actions_rebar(&actions, &log_store, &apply_tx, &mut pending_responses, &mut heartbeat_timer, &config, &ctx, &peers, &applied_ref, &commit_ref, &mut recent_entries).await;
                         term_ref.store(core.state.persistent.current_term, Ordering::Relaxed);
                     leader_ref.store(core.state.leader_id.unwrap_or(0), Ordering::Relaxed);
                         if reset { election_timer = random_election_timeout(&config); }
@@ -454,7 +481,7 @@ pub async fn spawn_raft_node_rebar(
                         }
 
                         let merged = merge_log_actions(all_actions);
-                        let reset = execute_actions_rebar(&merged, &log_store, &apply_tx, &mut pending_responses, &mut heartbeat_timer, &config, &ctx, &peers, &applied_ref, &commit_ref).await;
+                        let reset = execute_actions_rebar(&merged, &log_store, &apply_tx, &mut pending_responses, &mut heartbeat_timer, &config, &ctx, &peers, &applied_ref, &commit_ref, &mut recent_entries).await;
                         term_ref.store(core.state.persistent.current_term, Ordering::Relaxed);
                         leader_ref.store(core.state.leader_id.unwrap_or(0), Ordering::Relaxed);
                         if reset { election_timer = random_election_timeout(&config); }
@@ -465,7 +492,7 @@ pub async fn spawn_raft_node_rebar(
                         if let Ok(raft_msg) = raft_message_from_value(msg.payload()) {
                             let from = msg.from().node_id();
                             let actions = core.step(Event::Message { from, message: raft_msg });
-                            let reset = execute_actions_rebar(&actions, &log_store, &apply_tx, &mut pending_responses, &mut heartbeat_timer, &config, &ctx, &peers, &applied_ref, &commit_ref).await;
+                            let reset = execute_actions_rebar(&actions, &log_store, &apply_tx, &mut pending_responses, &mut heartbeat_timer, &config, &ctx, &peers, &applied_ref, &commit_ref, &mut recent_entries).await;
                             term_ref.store(core.state.persistent.current_term, Ordering::Relaxed);
                     leader_ref.store(core.state.leader_id.unwrap_or(0), Ordering::Relaxed);
                             if reset { election_timer = random_election_timeout(&config); }
@@ -496,6 +523,7 @@ async fn execute_actions_rebar(
     peers: &Arc<Mutex<HashMap<u64, ProcessId>>>,
     applied_index: &Arc<AtomicU64>,
     commit_index: &Arc<AtomicU64>,
+    recent_entries: &mut Vec<LogEntry>,
 ) -> bool {
     let mut should_reset_election_timer = false;
     for action in actions {
@@ -513,6 +541,7 @@ async fn execute_actions_rebar(
                 tokio::task::spawn_blocking(move || ls.append(&e).unwrap())
                     .await
                     .unwrap();
+                recent_entries.extend(entries.iter().cloned());
             }
             Action::TruncateLogAfter(index) => {
                 let ls = log_store.clone();
@@ -520,13 +549,30 @@ async fn execute_actions_rebar(
                 tokio::task::spawn_blocking(move || ls.truncate_after(idx).unwrap())
                     .await
                     .unwrap();
+                recent_entries.retain(|e| e.index <= idx);
             }
             Action::ApplyEntries { from, to } => {
-                let ls = log_store.clone();
-                let (f, t) = (*from, *to);
-                let entries = tokio::task::spawn_blocking(move || ls.get_range(f, t).unwrap())
-                    .await
-                    .unwrap();
+                // Try in-memory first
+                let expected_count = (*to - *from + 1) as usize;
+                let mem_entries: Vec<LogEntry> = recent_entries
+                    .iter()
+                    .filter(|e| e.index >= *from && e.index <= *to)
+                    .cloned()
+                    .collect();
+
+                let entries = if mem_entries.len() == expected_count {
+                    mem_entries
+                } else {
+                    let ls = log_store.clone();
+                    let (f, t) = (*from, *to);
+                    tokio::task::spawn_blocking(move || ls.get_range(f, t).unwrap())
+                        .await
+                        .unwrap()
+                };
+
+                // Trim applied entries from buffer
+                recent_entries.retain(|e| e.index > *to);
+
                 apply_tx.send(entries).await.ok();
                 applied_index.store(*to, Ordering::Relaxed);
                 commit_index.store(*to, Ordering::Release);
