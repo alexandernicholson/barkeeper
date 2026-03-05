@@ -54,7 +54,7 @@ pub async fn spawn_kv_store_actor(runtime: &Runtime, store: Arc<KvStore>) -> KvS
                         KvStoreCmd::Txn { compares, success, failure, reply } => {
                             let s = Arc::clone(&store);
                             let result = tokio::task::spawn_blocking(move || {
-                                s.txn(compares, success, failure).map_err(|e| e.to_string())
+                                s.txn(&compares, &success, &failure).map_err(|e| e.to_string())
                             }).await.expect("kv store spawn_blocking panicked");
                             let _ = reply.send(result);
                         }

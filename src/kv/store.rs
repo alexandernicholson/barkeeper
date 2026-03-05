@@ -1,26 +1,48 @@
-use std::path::Path;
+use std::collections::{BTreeMap, HashMap};
+use std::io;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::{Arc, RwLock};
 
-use redb::{Database, ReadableTable, TableDefinition};
 use serde::{Deserialize, Serialize};
 
 use crate::proto::mvccpb;
 use super::state_machine::KvCommand;
 
-// ── redb table definitions ──────────────────────────────────────────────────
-// KV table: compound_key (key_bytes + \x00 + 8-byte BE revision) → serialized InternalKeyValue
-const KV_TABLE: TableDefinition<&[u8], &[u8]> = TableDefinition::new("kv");
+// ── Error type ──────────────────────────────────────────────────────────────
 
-// Revision table: revision (u64) → serialized list of (key, event_type) pairs
-const REV_TABLE: TableDefinition<u64, &[u8]> = TableDefinition::new("revisions");
+/// Error type for KvStore operations.
+#[derive(Debug)]
+pub enum StoreError {
+    Io(io::Error),
+    Serialization(String),
+}
 
-// Meta table: string key → bytes value
-const META_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("kv_meta");
+impl std::fmt::Display for StoreError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            StoreError::Io(e) => write!(f, "io error: {}", e),
+            StoreError::Serialization(e) => write!(f, "serialization error: {}", e),
+        }
+    }
+}
 
-// Latest table: key → latest revision (index for O(1) lookups)
-const LATEST_TABLE: TableDefinition<&[u8], u64> = TableDefinition::new("kv_latest");
+impl std::error::Error for StoreError {}
+
+impl From<io::Error> for StoreError {
+    fn from(e: io::Error) -> Self {
+        StoreError::Io(e)
+    }
+}
+
+impl From<Box<bincode::ErrorKind>> for StoreError {
+    fn from(e: Box<bincode::ErrorKind>) -> Self {
+        StoreError::Serialization(e.to_string())
+    }
+}
 
 // ── Internal serde-friendly KV representation ───────────────────────────────
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct InternalKeyValue {
     key: Vec<u8>,
@@ -51,46 +73,22 @@ enum EventType {
     Delete,
 }
 
-/// One entry in the revision table: which key was affected and how.
+// ── Revision entry ──────────────────────────────────────────────────────────
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct RevisionEntry {
     key: Vec<u8>,
     event_type: EventType,
 }
 
-// ── Deserialization helpers (bincode-first with JSON fallback for migration) ─
+// ── Public result types ─────────────────────────────────────────────────────
 
-fn deserialize_kv(data: &[u8]) -> InternalKeyValue {
-    bincode::deserialize(data)
-        .unwrap_or_else(|_| serde_json::from_slice(data).expect("deserialize kv (json fallback)"))
-}
-
-fn deserialize_rev_entries(data: &[u8]) -> Vec<RevisionEntry> {
-    bincode::deserialize(data).unwrap_or_else(|_| {
-        serde_json::from_slice(data).expect("deserialize rev entries (json fallback)")
-    })
-}
-
-fn deserialize_i64(data: &[u8]) -> i64 {
-    bincode::deserialize(data)
-        .unwrap_or_else(|_| serde_json::from_slice(data).expect("deserialize i64 (json fallback)"))
-}
-
-fn deserialize_u64(data: &[u8]) -> u64 {
-    bincode::deserialize(data)
-        .unwrap_or_else(|_| serde_json::from_slice(data).expect("deserialize u64 (json fallback)"))
-}
-
-// ── Result types ────────────────────────────────────────────────────────────
-
-/// Result of a put operation.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct PutResult {
     pub revision: i64,
     pub prev_kv: Option<mvccpb::KeyValue>,
 }
 
-/// Result of a range query.
 #[derive(Debug)]
 pub struct RangeResult {
     pub kvs: Vec<mvccpb::KeyValue>,
@@ -98,17 +96,15 @@ pub struct RangeResult {
     pub more: bool,
 }
 
-/// Result of a delete operation.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct DeleteResult {
     pub revision: i64,
     pub deleted: i64,
     pub prev_kvs: Vec<mvccpb::KeyValue>,
 }
 
-// ── Txn types ────────────────────────────────────────────────────────────
+// ── Txn types ───────────────────────────────────────────────────────────────
 
-/// Compare target for Txn conditions.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum TxnCompareTarget {
     Version(i64),
@@ -197,7 +193,6 @@ pub struct WatchEvent {
 
 // ── Compound key helpers ────────────────────────────────────────────────────
 
-/// Build a compound key: key_bytes + \x00 + 8-byte big-endian revision.
 fn make_compound_key(key: &[u8], revision: u64) -> Vec<u8> {
     let mut compound = Vec::with_capacity(key.len() + 1 + 8);
     compound.extend_from_slice(key);
@@ -206,12 +201,10 @@ fn make_compound_key(key: &[u8], revision: u64) -> Vec<u8> {
     compound
 }
 
-/// Extract the user key from a compound key (everything before the last 9 bytes).
 fn extract_user_key(compound: &[u8]) -> &[u8] {
     &compound[..compound.len() - 9]
 }
 
-/// Extract the revision from a compound key (last 8 bytes).
 fn extract_revision(compound: &[u8]) -> u64 {
     let start = compound.len() - 8;
     let mut buf = [0u8; 8];
@@ -219,143 +212,126 @@ fn extract_revision(compound: &[u8]) -> u64 {
     u64::from_be_bytes(buf)
 }
 
+// ── Snapshot format ─────────────────────────────────────────────────────────
+
+#[derive(Serialize, Deserialize)]
+struct Snapshot {
+    kv: Vec<(Vec<u8>, InternalKeyValue)>,
+    revisions: Vec<(u64, Vec<RevisionEntry>)>,
+    latest: Vec<(Vec<u8>, u64)>,
+    revision: i64,
+    raft_applied_index: u64,
+}
+
+// ── KvInner ─────────────────────────────────────────────────────────────────
+
+struct KvInner {
+    /// Compound key (user_key + 0x00 + 8-byte BE revision) → InternalKeyValue
+    kv: BTreeMap<Vec<u8>, InternalKeyValue>,
+    /// Revision → list of (key, event_type) pairs
+    revisions: BTreeMap<u64, Vec<RevisionEntry>>,
+    /// User key → latest revision number
+    latest: HashMap<Vec<u8>, u64>,
+    /// Current global revision
+    revision: i64,
+    /// Last applied Raft log index
+    raft_applied_index: u64,
+}
+
 // ── KvStore ─────────────────────────────────────────────────────────────────
 
-/// MVCC key-value store backed by redb.
+/// MVCC key-value store backed by in-memory BTreeMaps.
 ///
 /// Every mutation creates a new revision. Keys are stored with compound keys
 /// that encode the user key and revision for lexicographic ordering.
+/// Durability is provided by the WAL — this store is a materialized view.
+#[derive(Clone)]
 pub struct KvStore {
-    db: Database,
-    db_path: std::path::PathBuf,
-    revision: AtomicI64,
+    inner: Arc<RwLock<KvInner>>,
+    revision_atomic: Arc<AtomicI64>,
+    db_path: PathBuf,
 }
 
 impl KvStore {
-    /// Open or create a KvStore at the given path.
-    pub fn open(path: impl AsRef<Path>) -> Result<Self, redb::Error> {
+    /// Open or create a KvStore at the given directory path.
+    /// Loads from snapshot if available, otherwise starts empty.
+    pub fn open(path: impl AsRef<Path>) -> Result<Self, StoreError> {
         let db_path = path.as_ref().to_path_buf();
-        let db = Database::create(path)?;
+        std::fs::create_dir_all(&db_path).ok();
 
-        // Ensure all tables exist.
-        let txn = db.begin_write()?;
-        {
-            txn.open_table(KV_TABLE)?;
-            txn.open_table(REV_TABLE)?;
-            txn.open_table(META_TABLE)?;
-            txn.open_table(LATEST_TABLE)?;
-        }
-        txn.commit()?;
-
-        // Load current revision from disk.
-        let current_rev = {
-            let rtxn = db.begin_read()?;
-            let meta_table = rtxn.open_table(META_TABLE)?;
-            match meta_table.get("revision")? {
-                Some(val) => deserialize_i64(val.value()),
-                None => 0,
+        let snapshot_path = db_path.join("kv.snapshot");
+        let inner = if snapshot_path.exists() {
+            let bytes = std::fs::read(&snapshot_path)?;
+            let snap: Snapshot = bincode::deserialize(&bytes)?;
+            KvInner {
+                kv: snap.kv.into_iter().collect(),
+                revisions: snap.revisions.into_iter().collect(),
+                latest: snap.latest.into_iter().collect(),
+                revision: snap.revision,
+                raft_applied_index: snap.raft_applied_index,
+            }
+        } else {
+            KvInner {
+                kv: BTreeMap::new(),
+                revisions: BTreeMap::new(),
+                latest: HashMap::new(),
+                revision: 0,
+                raft_applied_index: 0,
             }
         };
 
-        // Populate LATEST_TABLE if it's empty but KV_TABLE has data (migration).
-        {
-            let rtxn = db.begin_read()?;
-            let latest_table = rtxn.open_table(LATEST_TABLE)?;
-            let kv_table = rtxn.open_table(KV_TABLE)?;
-            let latest_empty = latest_table.iter()?.next().is_none();
-            let kv_has_data = kv_table.iter()?.next().is_some();
-
-            if latest_empty && kv_has_data {
-                drop(latest_table);
-                drop(kv_table);
-                drop(rtxn);
-
-                // Build the LATEST_TABLE index by scanning KV_TABLE.
-                let wtxn = db.begin_write()?;
-                {
-                    let kv_table = wtxn.open_table(KV_TABLE)?;
-                    let mut latest_table = wtxn.open_table(LATEST_TABLE)?;
-
-                    let mut latest_per_key: std::collections::HashMap<Vec<u8>, u64> =
-                        std::collections::HashMap::new();
-
-                    for entry in kv_table.iter()? {
-                        let (ck, _) = entry?;
-                        let ck_bytes = ck.value();
-                        let user_key = extract_user_key(ck_bytes).to_vec();
-                        let rev = extract_revision(ck_bytes);
-
-                        let current_latest = latest_per_key.get(&user_key).copied().unwrap_or(0);
-                        if rev > current_latest {
-                            latest_per_key.insert(user_key, rev);
-                        }
-                    }
-
-                    for (key, rev) in &latest_per_key {
-                        latest_table.insert(key.as_slice(), *rev)?;
-                    }
-                }
-                wtxn.commit()?;
-            }
-        }
-
+        let rev = inner.revision;
         Ok(KvStore {
-            db,
+            inner: Arc::new(RwLock::new(inner)),
+            revision_atomic: Arc::new(AtomicI64::new(rev)),
             db_path,
-            revision: AtomicI64::new(current_rev),
         })
     }
 
-    /// Get the database file size in bytes.
+    /// Get the database file size in bytes (snapshot size, or 0 if no snapshot).
     pub fn db_file_size(&self) -> Result<i64, std::io::Error> {
-        let metadata = std::fs::metadata(&self.db_path)?;
-        Ok(metadata.len() as i64)
+        let snapshot_path = self.db_path.join("kv.snapshot");
+        match std::fs::metadata(&snapshot_path) {
+            Ok(m) => Ok(m.len() as i64),
+            Err(_) => Ok(0),
+        }
     }
 
-    /// Read the entire database file into memory for snapshotting.
+    /// Read the snapshot file into memory for sending to followers.
     pub fn snapshot_bytes(&self) -> Result<Vec<u8>, std::io::Error> {
-        std::fs::read(&self.db_path)
+        // Generate a fresh snapshot and return its bytes
+        let inner = self.inner.read().unwrap();
+        let snap = Snapshot {
+            kv: inner.kv.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+            revisions: inner.revisions.iter().map(|(k, v)| (*k, v.clone())).collect(),
+            latest: inner.latest.iter().map(|(k, v)| (k.clone(), *v)).collect(),
+            revision: inner.revision,
+            raft_applied_index: inner.raft_applied_index,
+        };
+        bincode::serialize(&snap)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))
     }
 
-    /// Trigger internal compaction of the redb database.
-    ///
-    /// redb manages its own page-level compaction automatically, but
-    /// committing an empty write transaction flushes any pending internal
-    /// housekeeping and reclaims unused pages. This is the closest analogue
-    /// to etcd's "defragment" operation when backed by redb.
-    pub fn compact_db(&self) -> Result<bool, redb::Error> {
-        let txn = self.db.begin_write()?;
-        txn.commit()?;
+    /// No-op for in-memory store.
+    pub fn compact_db(&self) -> Result<bool, StoreError> {
         Ok(true)
     }
 
     /// Get the current revision number.
-    pub fn current_revision(&self) -> Result<i64, redb::Error> {
-        Ok(self.revision.load(Ordering::SeqCst))
+    pub fn current_revision(&self) -> Result<i64, StoreError> {
+        Ok(self.revision_atomic.load(Ordering::SeqCst))
     }
 
-    /// Get the last applied Raft log index (persisted in meta table).
-    pub fn last_applied_raft_index(&self) -> Result<u64, redb::Error> {
-        let txn = self.db.begin_read()?;
-        let table = txn.open_table(META_TABLE)?;
-        match table.get("raft_applied_index")? {
-            Some(val) => {
-                let idx: u64 = deserialize_u64(val.value());
-                Ok(idx)
-            }
-            None => Ok(0),
-        }
+    /// Get the last applied Raft log index.
+    pub fn last_applied_raft_index(&self) -> Result<u64, StoreError> {
+        let inner = self.inner.read().unwrap();
+        Ok(inner.raft_applied_index)
     }
 
-    /// Set the last applied Raft log index (persisted in meta table).
-    pub fn set_last_applied_raft_index(&self, index: u64) -> Result<(), redb::Error> {
-        let txn = self.db.begin_write()?;
-        {
-            let mut table = txn.open_table(META_TABLE)?;
-            let val = bincode::serialize(&index).expect("serialize raft index");
-            table.insert("raft_applied_index", val.as_slice())?;
-        }
-        txn.commit()?;
+    /// Set the last applied Raft log index.
+    pub fn set_last_applied_raft_index(&self, index: u64) -> Result<(), StoreError> {
+        let mut inner = self.inner.write().unwrap();
+        inner.raft_applied_index = index;
         Ok(())
     }
 
@@ -366,137 +342,65 @@ impl KvStore {
         key: impl AsRef<[u8]>,
         value: impl AsRef<[u8]>,
         lease_id: i64,
-    ) -> Result<PutResult, redb::Error> {
+    ) -> Result<PutResult, StoreError> {
         let key = key.as_ref();
         let value = value.as_ref();
+        let mut inner = self.inner.write().unwrap();
 
-        let txn = self.db.begin_write()?;
-        let result;
-        {
-            let mut kv_table = txn.open_table(KV_TABLE)?;
-            let mut rev_table = txn.open_table(REV_TABLE)?;
-            let mut meta_table = txn.open_table(META_TABLE)?;
-            let mut latest_table = txn.open_table(LATEST_TABLE)?;
+        let new_rev = inner.revision + 1;
+        inner.revision = new_rev;
+        self.revision_atomic.store(new_rev, Ordering::SeqCst);
 
-            // Increment revision atomically.
-            let new_rev = self.revision.fetch_add(1, Ordering::SeqCst) + 1;
+        let prev = find_latest_kv(&inner, key, new_rev as u64);
+        let (create_revision, version) = match &prev {
+            Some(p) if p.version > 0 => (p.create_revision, p.version + 1),
+            _ => (new_rev, 1),
+        };
 
-            // Look up previous value for this key.
-            let prev =
-                self.find_latest_kv_in_table(&kv_table, &latest_table, key, new_rev as u64)?;
+        let ikv = InternalKeyValue {
+            key: key.to_vec(), create_revision, mod_revision: new_rev,
+            version, value: value.to_vec(), lease: lease_id,
+        };
+        let compound = make_compound_key(key, new_rev as u64);
+        inner.kv.insert(compound, ikv);
+        inner.latest.insert(key.to_vec(), new_rev as u64);
+        inner.revisions.insert(new_rev as u64, vec![RevisionEntry {
+            key: key.to_vec(), event_type: EventType::Put,
+        }]);
 
-            let (create_revision, version) = match &prev {
-                Some(prev_kv) if prev_kv.version > 0 => {
-                    // Key exists: keep create_revision, bump version.
-                    (prev_kv.create_revision, prev_kv.version + 1)
-                }
-                _ => {
-                    // New key (or previously deleted).
-                    (new_rev, 1)
-                }
-            };
-
-            let ikv = InternalKeyValue {
-                key: key.to_vec(),
-                create_revision,
-                mod_revision: new_rev,
-                version,
-                value: value.to_vec(),
-                lease: lease_id,
-            };
-
-            let compound = make_compound_key(key, new_rev as u64);
-            let serialized = bincode::serialize(&ikv).expect("serialize kv");
-            kv_table.insert(compound.as_slice(), serialized.as_slice())?;
-
-            // Write revision entry.
-            let rev_entries = vec![RevisionEntry {
-                key: key.to_vec(),
-                event_type: EventType::Put,
-            }];
-            let rev_bytes = bincode::serialize(&rev_entries).expect("serialize rev entry");
-            rev_table.insert(new_rev as u64, rev_bytes.as_slice())?;
-
-            // Update meta revision.
-            let rev_bytes = bincode::serialize(&new_rev).expect("serialize rev");
-            meta_table.insert("revision", rev_bytes.as_slice())?;
-
-            // Update LATEST_TABLE.
-            latest_table.insert(key, new_rev as u64)?;
-
-            result = PutResult {
-                revision: new_rev,
-                prev_kv: prev.map(|p| p.to_proto()),
-            };
-        }
-        txn.commit()?;
-        Ok(result)
+        Ok(PutResult { revision: new_rev, prev_kv: prev.map(|p| p.to_proto()) })
     }
 
-    /// Query a range of keys. If `range_end` is empty, returns the single key.
-    /// If `range_end` is non-empty, returns keys in [key, range_end).
-    /// If `revision` is 0 or negative, uses the latest revision.
+    /// Range query. If `range_end` is empty, returns a single key.
     pub fn range(
         &self,
         key: &[u8],
         range_end: &[u8],
         limit: i64,
         revision: i64,
-    ) -> Result<RangeResult, redb::Error> {
-        let txn = self.db.begin_read()?;
-        let kv_table = txn.open_table(KV_TABLE)?;
-        let meta_table = txn.open_table(META_TABLE)?;
-        let latest_table = txn.open_table(LATEST_TABLE)?;
-
-        // For read transactions, read revision from META_TABLE for snapshot consistency.
-        let max_rev = match meta_table.get("revision")? {
-            Some(val) => deserialize_i64(val.value()),
-            None => 0,
-        };
-
+    ) -> Result<RangeResult, StoreError> {
+        let inner = self.inner.read().unwrap();
+        let max_rev = inner.revision;
         let query_rev = if revision > 0 { revision } else { max_rev };
 
         if range_end.is_empty() {
-            // Single key lookup.
-            let kv = self.find_latest_kv_at_rev_readonly(
-                &kv_table,
-                &latest_table,
-                key,
-                query_rev as u64,
-            )?;
+            let kv = find_latest_kv_at_rev(&inner, key, query_rev as u64);
             match kv {
                 Some(ikv) if ikv.version > 0 => Ok(RangeResult {
-                    kvs: vec![ikv.to_proto()],
-                    count: 1,
-                    more: false,
+                    kvs: vec![ikv.to_proto()], count: 1, more: false,
                 }),
-                _ => Ok(RangeResult {
-                    kvs: vec![],
-                    count: 0,
-                    more: false,
-                }),
+                _ => Ok(RangeResult { kvs: vec![], count: 0, more: false }),
             }
         } else {
-            // Range query [key, range_end).
-            // We need to find all unique user keys in the range and get their
-            // latest values at or before query_rev.
-            let all_keys =
-                self.collect_unique_keys_in_range(&kv_table, key, range_end, query_rev as u64)?;
-
+            let all_keys = collect_unique_keys_in_range(&inner, key, range_end, query_rev as u64);
             let mut kvs = Vec::new();
             for user_key in &all_keys {
-                if let Some(ikv) = self.find_latest_kv_at_rev_readonly(
-                    &kv_table,
-                    &latest_table,
-                    user_key,
-                    query_rev as u64,
-                )? {
+                if let Some(ikv) = find_latest_kv_at_rev(&inner, user_key, query_rev as u64) {
                     if ikv.version > 0 {
                         kvs.push(ikv.to_proto());
                     }
                 }
             }
-
             let total_count = kvs.len() as i64;
             let more = if limit > 0 && total_count > limit {
                 kvs.truncate(limit as usize);
@@ -504,751 +408,92 @@ impl KvStore {
             } else {
                 false
             };
-
-            Ok(RangeResult {
-                count: total_count,
-                kvs,
-                more,
-            })
+            Ok(RangeResult { count: total_count, kvs, more })
         }
     }
 
-    /// Delete keys in range [key, range_end). If range_end is empty, delete the
-    /// single key. Returns the new revision, number of deleted keys, and
-    /// previous values.
+    /// Delete a key or range of keys. Returns the number deleted and prev values.
     pub fn delete_range(
         &self,
         key: &[u8],
         range_end: &[u8],
-    ) -> Result<DeleteResult, redb::Error> {
-        let txn = self.db.begin_write()?;
-        let result;
-        {
-            let mut kv_table = txn.open_table(KV_TABLE)?;
-            let mut rev_table = txn.open_table(REV_TABLE)?;
-            let mut meta_table = txn.open_table(META_TABLE)?;
-            let mut latest_table = txn.open_table(LATEST_TABLE)?;
+    ) -> Result<DeleteResult, StoreError> {
+        let mut inner = self.inner.write().unwrap();
+        let new_rev = inner.revision + 1;
+        inner.revision = new_rev;
+        self.revision_atomic.store(new_rev, Ordering::SeqCst);
 
-            let current_rev = self.revision.load(Ordering::SeqCst);
-
-            // Find keys to delete.
-            let keys_to_delete = if range_end.is_empty() {
-                // Single key.
-                match self.find_latest_kv_in_table(
-                    &kv_table,
-                    &latest_table,
-                    key,
-                    (current_rev + 1) as u64,
-                )? {
-                    Some(ikv) if ikv.version > 0 => vec![ikv],
-                    _ => vec![],
-                }
-            } else {
-                // Range [key, range_end).
-                let user_keys = self.collect_unique_keys_in_range_rw(
-                    &kv_table,
-                    key,
-                    range_end,
-                    (current_rev + 1) as u64,
-                )?;
-                let mut result = Vec::new();
-                for ukey in &user_keys {
-                    if let Some(ikv) = self.find_latest_kv_in_table(
-                        &kv_table,
-                        &latest_table,
-                        ukey,
-                        (current_rev + 1) as u64,
-                    )? {
-                        if ikv.version > 0 {
-                            result.push(ikv);
-                        }
-                    }
-                }
-                result
-            };
-
-            if keys_to_delete.is_empty() {
-                result = DeleteResult {
-                    revision: current_rev,
-                    deleted: 0,
-                    prev_kvs: vec![],
-                };
-            } else {
-                let new_rev = self.revision.fetch_add(1, Ordering::SeqCst) + 1;
-                let mut rev_entries = Vec::new();
-                let mut prev_kvs = Vec::new();
-
-                for ikv in &keys_to_delete {
-                    // Write tombstone.
-                    let tombstone = InternalKeyValue {
-                        key: ikv.key.clone(),
-                        create_revision: 0,
-                        mod_revision: new_rev,
-                        version: 0,
-                        value: vec![],
-                        lease: 0,
-                    };
-
-                    let compound = make_compound_key(&ikv.key, new_rev as u64);
-                    let serialized = bincode::serialize(&tombstone).expect("serialize tombstone");
-                    kv_table.insert(compound.as_slice(), serialized.as_slice())?;
-
-                    // Update LATEST_TABLE to point to the tombstone revision.
-                    latest_table.insert(ikv.key.as_slice(), new_rev as u64)?;
-
-                    rev_entries.push(RevisionEntry {
-                        key: ikv.key.clone(),
-                        event_type: EventType::Delete,
-                    });
-
-                    prev_kvs.push(ikv.to_proto());
-                }
-
-                let rev_bytes = bincode::serialize(&rev_entries).expect("serialize rev entries");
-                rev_table.insert(new_rev as u64, rev_bytes.as_slice())?;
-
-                let rev_meta = bincode::serialize(&new_rev).expect("serialize rev");
-                meta_table.insert("revision", rev_meta.as_slice())?;
-
-                result = DeleteResult {
-                    revision: new_rev,
-                    deleted: keys_to_delete.len() as i64,
-                    prev_kvs,
-                };
-            }
-        }
-        txn.commit()?;
-        Ok(result)
+        do_delete_range(&mut inner, key, range_end, new_rev)
     }
 
-    // ── Txn (compare-and-swap) ────────────────────────────────────────────
-
-    /// Execute a transaction (compare-and-swap).
-    ///
-    /// Evaluates all compare conditions against the current state. If all pass,
-    /// executes the success ops; otherwise executes the failure ops. All
-    /// operations within a branch are applied atomically within a single
-    /// revision.
+    /// Execute a transaction with compare-and-swap semantics.
     pub fn txn(
         &self,
-        compares: Vec<TxnCompare>,
-        success: Vec<TxnOp>,
-        failure: Vec<TxnOp>,
-    ) -> Result<TxnResult, redb::Error> {
-        // First, evaluate compares using a read-only transaction.
-        let succeeded = self.evaluate_compares(&compares)?;
-
-        // Execute the appropriate branch.
-        let ops = if succeeded { &success } else { &failure };
-
-        let mut responses = Vec::new();
-        let mut final_revision = self.current_revision()?;
-
-        for op in ops {
-            match op {
-                TxnOp::Range {
-                    key,
-                    range_end,
-                    limit,
-                    revision,
-                } => {
-                    let result = self.range(key, range_end, *limit, *revision)?;
-                    responses.push(TxnOpResponse::Range(result));
-                }
-                TxnOp::Put {
-                    key,
-                    value,
-                    lease_id,
-                } => {
-                    let result = self.put(key, value, *lease_id)?;
-                    final_revision = result.revision;
-                    responses.push(TxnOpResponse::Put(result));
-                }
-                TxnOp::DeleteRange { key, range_end } => {
-                    let result = self.delete_range(key, range_end)?;
-                    final_revision = result.revision;
-                    responses.push(TxnOpResponse::DeleteRange(result));
-                }
-            }
-        }
-
-        Ok(TxnResult {
-            succeeded,
-            responses,
-            revision: final_revision,
-        })
-    }
-
-    /// Compact the store up to the given revision.
-    ///
-    /// Removes all KV entries with revision < compact_revision, keeping only
-    /// the latest version of each key at or before the compact revision.
-    /// Also removes revision table entries for compacted revisions.
-    pub fn compact(&self, revision: i64) -> Result<(), redb::Error> {
-        let txn = self.db.begin_write()?;
-        {
-            let mut kv_table = txn.open_table(KV_TABLE)?;
-            let mut rev_table = txn.open_table(REV_TABLE)?;
-
-            // Collect all compound keys that should be removed.
-            // We keep the latest entry for each user key at or before the
-            // compact revision, and remove all older entries.
-            let mut keys_to_remove: Vec<Vec<u8>> = Vec::new();
-            let mut latest_per_key: std::collections::HashMap<Vec<u8>, (u64, Vec<u8>)> =
-                std::collections::HashMap::new();
-
-            // Scan all entries up to the compact revision.
-            for entry in kv_table.iter()? {
-                let (ck, _) = entry?;
-                let ck_bytes = ck.value().to_vec();
-                let rev = extract_revision(&ck_bytes);
-                let user_key = extract_user_key(&ck_bytes).to_vec();
-
-                if rev <= revision as u64 {
-                    // Track the latest compound key for each user key.
-                    match latest_per_key.get(&user_key) {
-                        Some((existing_rev, existing_ck)) => {
-                            if rev > *existing_rev {
-                                // This is newer; the old one should be removed.
-                                keys_to_remove.push(existing_ck.clone());
-                                latest_per_key.insert(user_key, (rev, ck_bytes));
-                            } else {
-                                // This is older; remove it.
-                                keys_to_remove.push(ck_bytes);
-                            }
-                        }
-                        None => {
-                            latest_per_key.insert(user_key, (rev, ck_bytes));
-                        }
-                    }
-                }
-            }
-
-            // Remove old compound keys.
-            for ck in &keys_to_remove {
-                kv_table.remove(ck.as_slice())?;
-            }
-
-            // Remove revision entries for compacted revisions.
-            let mut revs_to_remove: Vec<u64> = Vec::new();
-            for entry in rev_table.range(0..revision as u64)? {
-                let (rev, _) = entry?;
-                revs_to_remove.push(rev.value());
-            }
-            for rev in revs_to_remove {
-                rev_table.remove(rev)?;
-            }
-        }
-        txn.commit()?;
-        Ok(())
-    }
-
-    /// Return all mutations since `after_revision` (exclusive).
-    /// Each entry is `(key, event_type, kv_at_revision)`.
-    /// event_type: 0 = PUT, 1 = DELETE.
-    pub fn changes_since(
-        &self,
-        after_revision: i64,
-    ) -> Result<Vec<(Vec<u8>, i32, mvccpb::KeyValue)>, redb::Error> {
-        let txn = self.db.begin_read()?;
-        let rev_table = txn.open_table(REV_TABLE)?;
-        let kv_table = txn.open_table(KV_TABLE)?;
-
-        let start_rev = (after_revision + 1) as u64;
-        let mut results = Vec::new();
-
-        let range = rev_table.range(start_rev..)?;
-        for entry in range {
-            let (rev_key, rev_val) = entry?;
-            let revision = rev_key.value();
-            let entries: Vec<RevisionEntry> = deserialize_rev_entries(rev_val.value());
-
-            for re in entries {
-                let event_type = match re.event_type {
-                    EventType::Put => 0,
-                    EventType::Delete => 1,
-                };
-
-                let compound = make_compound_key(&re.key, revision);
-                let kv = match kv_table.get(compound.as_slice())? {
-                    Some(val) => {
-                        let ikv: InternalKeyValue = deserialize_kv(val.value());
-                        ikv.to_proto()
-                    }
-                    None => mvccpb::KeyValue {
-                        key: re.key.clone(),
-                        mod_revision: revision as i64,
-                        ..Default::default()
-                    },
-                };
-
-                results.push((re.key, event_type, kv));
-            }
-        }
-
-        Ok(results)
-    }
-
-    // ── Private helpers ─────────────────────────────────────────────────────
-
-    /// Evaluate all compare conditions. Returns `true` if all pass.
-    fn evaluate_compares(&self, compares: &[TxnCompare]) -> Result<bool, redb::Error> {
-        let txn = self.db.begin_read()?;
-        let kv_table = txn.open_table(KV_TABLE)?;
-        let meta_table = txn.open_table(META_TABLE)?;
-        let latest_table = txn.open_table(LATEST_TABLE)?;
-
-        let current_rev = match meta_table.get("revision")? {
-            Some(val) => deserialize_i64(val.value()),
-            None => 0,
-        };
-
-        for cmp in compares {
-            let kv = self.find_latest_kv_at_rev_readonly(
-                &kv_table,
-                &latest_table,
-                &cmp.key,
-                current_rev as u64,
-            )?;
-
-            let passes = match &cmp.target {
-                TxnCompareTarget::Version(target_val) => {
-                    let actual = kv.as_ref().map(|k| k.version).unwrap_or(0);
-                    compare_i64(actual, *target_val, &cmp.result)
-                }
-                TxnCompareTarget::CreateRevision(target_val) => {
-                    let actual = kv.as_ref().map(|k| k.create_revision).unwrap_or(0);
-                    compare_i64(actual, *target_val, &cmp.result)
-                }
-                TxnCompareTarget::ModRevision(target_val) => {
-                    let actual = kv.as_ref().map(|k| k.mod_revision).unwrap_or(0);
-                    compare_i64(actual, *target_val, &cmp.result)
-                }
-                TxnCompareTarget::Value(target_val) => {
-                    let actual = kv
-                        .as_ref()
-                        .map(|k| k.value.as_slice())
-                        .unwrap_or(&[]);
-                    compare_bytes(actual, target_val, &cmp.result)
-                }
-                TxnCompareTarget::Lease(target_val) => {
-                    let actual = kv.as_ref().map(|k| k.lease).unwrap_or(0);
-                    compare_i64(actual, *target_val, &cmp.result)
-                }
-            };
-
-            if !passes {
-                return Ok(false);
-            }
-        }
-
-        Ok(true)
-    }
-
-    /// Find the latest value for a user key at or before the given revision.
-    /// Works with a writable table reference. Uses LATEST_TABLE for O(1) lookups
-    /// when possible, falling back to range scan for historical queries.
-    fn find_latest_kv_in_table(
-        &self,
-        table: &redb::Table<&[u8], &[u8]>,
-        latest_table: &redb::Table<&[u8], u64>,
-        key: &[u8],
-        before_rev: u64,
-    ) -> Result<Option<InternalKeyValue>, redb::Error> {
-        // Try LATEST_TABLE first for O(1) lookup.
-        if let Some(latest_rev_guard) = latest_table.get(key)? {
-            let latest_rev = latest_rev_guard.value();
-            if latest_rev < before_rev {
-                // The latest revision is before our cutoff — direct point lookup.
-                let compound = make_compound_key(key, latest_rev);
-                if let Some(val) = table.get(compound.as_slice())? {
-                    return Ok(Some(deserialize_kv(val.value())));
-                }
-            }
-        }
-
-        // Fall back to range scan (for historical queries or if LATEST_TABLE miss).
-        let start = make_compound_key(key, 0);
-        let end = make_compound_key(key, before_rev);
-
-        let mut latest: Option<InternalKeyValue> = None;
-        for entry in table.range(start.as_slice()..=end.as_slice())? {
-            let (ck, val) = entry?;
-            let ck_bytes = ck.value();
-            if extract_user_key(ck_bytes) == key {
-                let ikv: InternalKeyValue = deserialize_kv(val.value());
-                latest = Some(ikv);
-            }
-        }
-        Ok(latest)
-    }
-
-    /// Find the latest value for a user key at or before the given revision.
-    /// Works with a read-only table reference. Uses LATEST_TABLE for O(1) lookups
-    /// when possible, falling back to range scan for historical queries.
-    fn find_latest_kv_at_rev_readonly(
-        &self,
-        table: &redb::ReadOnlyTable<&[u8], &[u8]>,
-        latest_table: &redb::ReadOnlyTable<&[u8], u64>,
-        key: &[u8],
-        at_rev: u64,
-    ) -> Result<Option<InternalKeyValue>, redb::Error> {
-        // Try LATEST_TABLE first for O(1) lookup.
-        if let Some(latest_rev_guard) = latest_table.get(key)? {
-            let latest_rev = latest_rev_guard.value();
-            if latest_rev <= at_rev {
-                // The latest revision is at or before our cutoff — direct point lookup.
-                let compound = make_compound_key(key, latest_rev);
-                if let Some(val) = table.get(compound.as_slice())? {
-                    return Ok(Some(deserialize_kv(val.value())));
-                }
-            }
-        }
-
-        // Fall back to range scan (for historical queries or if LATEST_TABLE miss).
-        let start = make_compound_key(key, 0);
-        let end = make_compound_key(key, at_rev);
-
-        let mut latest: Option<InternalKeyValue> = None;
-        for entry in table.range(start.as_slice()..=end.as_slice())? {
-            let (ck, val) = entry?;
-            let ck_bytes = ck.value();
-            if extract_user_key(ck_bytes) == key {
-                let ikv: InternalKeyValue = deserialize_kv(val.value());
-                latest = Some(ikv);
-            }
-        }
-        Ok(latest)
-    }
-
-    /// Collect unique user keys in [key, range_end) from writable table, up to max_rev.
-    fn collect_unique_keys_in_range_rw(
-        &self,
-        table: &redb::Table<&[u8], &[u8]>,
-        key_start: &[u8],
-        range_end: &[u8],
-        max_rev: u64,
-    ) -> Result<Vec<Vec<u8>>, redb::Error> {
-        // Build compound range: from (key_start, rev 0) to the compound key just before range_end.
-        let start_compound = make_compound_key(key_start, 0);
-        // We need all compound keys whose user key < range_end.
-        // The upper bound: range_end + \x00 + max revision.
-        let end_compound = make_compound_key(range_end, 0);
-
-        let mut seen = std::collections::BTreeSet::new();
-        for entry in table.range(start_compound.as_slice()..end_compound.as_slice())? {
-            let (ck, _) = entry?;
-            let ck_bytes = ck.value();
-            let user_key = extract_user_key(ck_bytes);
-            let rev = extract_revision(ck_bytes);
-            // Only consider entries within max_rev.
-            if rev <= max_rev && user_key >= key_start && user_key < range_end {
-                seen.insert(user_key.to_vec());
-            }
-        }
-        Ok(seen.into_iter().collect())
-    }
-
-    // ── Batch apply (single transaction for N operations) ─────────────────
-
-    /// Apply multiple KvCommands in a single redb write transaction, persisting
-    /// `last_applied_index` at the end. Returns one `BatchOpResult` per command.
-    ///
-    /// Each command is paired with a pre-assigned revision. If the revision is > 0,
-    /// the store uses it instead of generating its own. If 0, the store auto-assigns
-    /// (backward-compatible behavior).
-    pub fn batch_apply_with_index(
-        &self,
-        commands: &[(KvCommand, i64)],
-        last_applied_index: u64,
-    ) -> Result<Vec<BatchOpResult>, redb::Error> {
-        let txn = self.db.begin_write()?;
-        let mut results = Vec::with_capacity(commands.len());
-        {
-            let mut kv_table = txn.open_table(KV_TABLE)?;
-            let mut rev_table = txn.open_table(REV_TABLE)?;
-            let mut meta_table = txn.open_table(META_TABLE)?;
-            let mut latest_table = txn.open_table(LATEST_TABLE)?;
-
-            for (cmd, preassigned_rev) in commands {
-                let batch_result = match cmd {
-                    KvCommand::Put { key, value, lease_id } => {
-                        self.batch_put(
-                            &mut kv_table, &mut rev_table, &mut meta_table, &mut latest_table,
-                            key, value, *lease_id, *preassigned_rev,
-                        )?
-                    }
-                    KvCommand::DeleteRange { key, range_end } => {
-                        self.batch_delete_range(
-                            &mut kv_table, &mut rev_table, &mut meta_table, &mut latest_table,
-                            key, range_end, *preassigned_rev,
-                        )?
-                    }
-                    KvCommand::Txn { compares, success, failure } => {
-                        self.batch_txn(
-                            &mut kv_table, &mut rev_table, &mut meta_table, &mut latest_table,
-                            compares, success, failure, *preassigned_rev,
-                        )?
-                    }
-                    KvCommand::Compact { revision } => {
-                        // Compact within the same transaction.
-                        self.batch_compact(&mut kv_table, &mut rev_table, *revision)?;
-                        let rev = self.revision.load(Ordering::SeqCst);
-                        BatchOpResult {
-                            apply_result: ApplyResultData::Compact { revision: rev },
-                            watch_events: vec![],
-                        }
-                    }
-                };
-                results.push(batch_result);
-            }
-
-            // Persist final revision to META_TABLE once.
-            let final_rev = self.revision.load(Ordering::SeqCst);
-            let rev_bytes = bincode::serialize(&final_rev).expect("serialize rev");
-            meta_table.insert("revision", rev_bytes.as_slice())?;
-
-            // Persist last_applied_index once.
-            let idx_bytes = bincode::serialize(&last_applied_index).expect("serialize raft index");
-            meta_table.insert("raft_applied_index", idx_bytes.as_slice())?;
-        }
-        txn.commit()?;
-        Ok(results)
-    }
-
-    /// Put within an open write transaction. Returns BatchOpResult.
-    ///
-    /// If `preassigned_rev > 0`, the store uses it instead of auto-incrementing.
-    fn batch_put(
-        &self,
-        kv_table: &mut redb::Table<&[u8], &[u8]>,
-        rev_table: &mut redb::Table<u64, &[u8]>,
-        _meta_table: &mut redb::Table<&str, &[u8]>,
-        latest_table: &mut redb::Table<&[u8], u64>,
-        key: &[u8],
-        value: &[u8],
-        lease_id: i64,
-        preassigned_rev: i64,
-    ) -> Result<BatchOpResult, redb::Error> {
-        let new_rev = if preassigned_rev > 0 {
-            self.revision.store(preassigned_rev, Ordering::SeqCst);
-            preassigned_rev
-        } else {
-            self.revision.fetch_add(1, Ordering::SeqCst) + 1
-        };
-
-        let prev = self.find_latest_kv_in_table(kv_table, latest_table, key, new_rev as u64)?;
-
-        let (create_revision, version) = match &prev {
-            Some(prev_kv) if prev_kv.version > 0 => (prev_kv.create_revision, prev_kv.version + 1),
-            _ => (new_rev, 1),
-        };
-
-        let ikv = InternalKeyValue {
-            key: key.to_vec(),
-            create_revision,
-            mod_revision: new_rev,
-            version,
-            value: value.to_vec(),
-            lease: lease_id,
-        };
-
-        let compound = make_compound_key(key, new_rev as u64);
-        let serialized = bincode::serialize(&ikv).expect("serialize kv");
-        kv_table.insert(compound.as_slice(), serialized.as_slice())?;
-
-        let rev_entries = vec![RevisionEntry {
-            key: key.to_vec(),
-            event_type: EventType::Put,
-        }];
-        let rev_bytes = bincode::serialize(&rev_entries).expect("serialize rev entry");
-        rev_table.insert(new_rev as u64, rev_bytes.as_slice())?;
-
-        latest_table.insert(key, new_rev as u64)?;
-
-        let notify_kv = mvccpb::KeyValue {
-            key: key.to_vec(),
-            create_revision,
-            mod_revision: new_rev,
-            version,
-            value: value.to_vec(),
-            lease: lease_id,
-        };
-
-        let watch_event = WatchEvent {
-            key: key.to_vec(),
-            event_type: 0, // PUT
-            kv: notify_kv,
-            prev_kv: prev.as_ref().map(|p| p.to_proto()),
-        };
-
-        Ok(BatchOpResult {
-            apply_result: ApplyResultData::Put(PutResult {
-                revision: new_rev,
-                prev_kv: prev.map(|p| p.to_proto()),
-            }),
-            watch_events: vec![watch_event],
-        })
-    }
-
-    /// Delete range within an open write transaction. Returns BatchOpResult.
-    ///
-    /// If `preassigned_rev > 0`, the store uses it instead of auto-incrementing.
-    fn batch_delete_range(
-        &self,
-        kv_table: &mut redb::Table<&[u8], &[u8]>,
-        rev_table: &mut redb::Table<u64, &[u8]>,
-        _meta_table: &mut redb::Table<&str, &[u8]>,
-        latest_table: &mut redb::Table<&[u8], u64>,
-        key: &[u8],
-        range_end: &[u8],
-        preassigned_rev: i64,
-    ) -> Result<BatchOpResult, redb::Error> {
-        let current_rev = self.revision.load(Ordering::SeqCst);
-
-        let keys_to_delete = if range_end.is_empty() {
-            match self.find_latest_kv_in_table(kv_table, latest_table, key, (current_rev + 1) as u64)? {
-                Some(ikv) if ikv.version > 0 => vec![ikv],
-                _ => vec![],
-            }
-        } else {
-            let user_keys = self.collect_unique_keys_in_range_rw(kv_table, key, range_end, (current_rev + 1) as u64)?;
-            let mut result = Vec::new();
-            for ukey in &user_keys {
-                if let Some(ikv) = self.find_latest_kv_in_table(kv_table, latest_table, ukey, (current_rev + 1) as u64)? {
-                    if ikv.version > 0 {
-                        result.push(ikv);
-                    }
-                }
-            }
-            result
-        };
-
-        if keys_to_delete.is_empty() {
-            return Ok(BatchOpResult {
-                apply_result: ApplyResultData::DeleteRange(DeleteResult {
-                    revision: current_rev,
-                    deleted: 0,
-                    prev_kvs: vec![],
-                }),
-                watch_events: vec![],
-            });
-        }
-
-        let new_rev = if preassigned_rev > 0 {
-            self.revision.store(preassigned_rev, Ordering::SeqCst);
-            preassigned_rev
-        } else {
-            self.revision.fetch_add(1, Ordering::SeqCst) + 1
-        };
-        let mut rev_entries = Vec::new();
-        let mut prev_kvs = Vec::new();
-        let mut watch_events = Vec::new();
-
-        for ikv in &keys_to_delete {
-            let tombstone = InternalKeyValue {
-                key: ikv.key.clone(),
-                create_revision: 0,
-                mod_revision: new_rev,
-                version: 0,
-                value: vec![],
-                lease: 0,
-            };
-            let compound = make_compound_key(&ikv.key, new_rev as u64);
-            let serialized = bincode::serialize(&tombstone).expect("serialize tombstone");
-            kv_table.insert(compound.as_slice(), serialized.as_slice())?;
-            latest_table.insert(ikv.key.as_slice(), new_rev as u64)?;
-
-            rev_entries.push(RevisionEntry {
-                key: ikv.key.clone(),
-                event_type: EventType::Delete,
-            });
-
-            let prev_proto = ikv.to_proto();
-            let tombstone_kv = mvccpb::KeyValue {
-                key: ikv.key.clone(),
-                create_revision: 0,
-                mod_revision: new_rev,
-                version: 0,
-                value: vec![],
-                lease: 0,
-            };
-            watch_events.push(WatchEvent {
-                key: ikv.key.clone(),
-                event_type: 1, // DELETE
-                kv: tombstone_kv,
-                prev_kv: Some(prev_proto.clone()),
-            });
-            prev_kvs.push(prev_proto);
-        }
-
-        let rev_bytes = bincode::serialize(&rev_entries).expect("serialize rev entries");
-        rev_table.insert(new_rev as u64, rev_bytes.as_slice())?;
-
-        Ok(BatchOpResult {
-            apply_result: ApplyResultData::DeleteRange(DeleteResult {
-                revision: new_rev,
-                deleted: keys_to_delete.len() as i64,
-                prev_kvs,
-            }),
-            watch_events,
-        })
-    }
-
-    /// Txn within an open write transaction. Returns BatchOpResult.
-    ///
-    /// If `preassigned_rev > 0`, it is used as the base revision for sub-operations.
-    /// Sub-ops get preassigned_rev, preassigned_rev+1, etc.
-    fn batch_txn(
-        &self,
-        kv_table: &mut redb::Table<&[u8], &[u8]>,
-        rev_table: &mut redb::Table<u64, &[u8]>,
-        meta_table: &mut redb::Table<&str, &[u8]>,
-        latest_table: &mut redb::Table<&[u8], u64>,
         compares: &[TxnCompare],
         success: &[TxnOp],
         failure: &[TxnOp],
-        preassigned_rev: i64,
-    ) -> Result<BatchOpResult, redb::Error> {
-        // Evaluate compares against current in-transaction state.
-        let current_rev = self.revision.load(Ordering::SeqCst);
-        let succeeded = self.evaluate_compares_in_txn(kv_table, latest_table, compares, current_rev as u64)?;
-
-        // For Txn with pre-assigned revision, set up the base so sub-ops auto-increment
-        // from preassigned_rev. Sub-ops use preassigned_rev=0 (auto-assign) and the
-        // store's atomic counter provides the correct sequence.
-        if preassigned_rev > 0 {
-            self.revision.store(preassigned_rev - 1, Ordering::SeqCst);
-        }
-
+    ) -> Result<TxnResult, StoreError> {
+        let mut inner = self.inner.write().unwrap();
+        let succeeded = evaluate_compares(&inner, compares);
         let ops = if succeeded { success } else { failure };
         let mut responses = Vec::new();
-        let mut final_revision = if preassigned_rev > 0 { preassigned_rev - 1 } else { current_rev };
-        let mut all_watch_events = Vec::new();
 
         for op in ops {
             match op {
+                TxnOp::Put { key, value, lease_id } => {
+                    let new_rev = inner.revision + 1;
+                    inner.revision = new_rev;
+                    self.revision_atomic.store(new_rev, Ordering::SeqCst);
+
+                    let prev = find_latest_kv(&inner, key, new_rev as u64);
+                    let (create_revision, version) = match &prev {
+                        Some(p) if p.version > 0 => (p.create_revision, p.version + 1),
+                        _ => (new_rev, 1),
+                    };
+                    let ikv = InternalKeyValue {
+                        key: key.clone(), create_revision, mod_revision: new_rev,
+                        version, value: value.clone(), lease: *lease_id,
+                    };
+                    let compound = make_compound_key(key, new_rev as u64);
+                    inner.kv.insert(compound, ikv);
+                    inner.latest.insert(key.clone(), new_rev as u64);
+                    inner.revisions.insert(new_rev as u64, vec![RevisionEntry {
+                        key: key.clone(), event_type: EventType::Put,
+                    }]);
+                    responses.push(TxnOpResponse::Put(PutResult {
+                        revision: new_rev, prev_kv: prev.map(|p| p.to_proto()),
+                    }));
+                }
+                TxnOp::DeleteRange { key, range_end } => {
+                    let new_rev = inner.revision + 1;
+                    inner.revision = new_rev;
+                    self.revision_atomic.store(new_rev, Ordering::SeqCst);
+                    let result = do_delete_range(&mut inner, key, range_end, new_rev)?;
+                    responses.push(TxnOpResponse::DeleteRange(result));
+                }
                 TxnOp::Range { key, range_end, limit, revision } => {
-                    // Read from the in-transaction tables.
-                    let query_rev = if *revision > 0 { *revision } else { self.revision.load(Ordering::SeqCst) };
-                    let result = if range_end.is_empty() {
-                        let kv = self.find_latest_kv_in_table(kv_table, latest_table, key, query_rev as u64)?;
+                    let max_rev = inner.revision;
+                    let query_rev = if *revision > 0 { *revision } else { max_rev };
+                    if range_end.is_empty() {
+                        let kv = find_latest_kv_at_rev(&inner, key, query_rev as u64);
                         match kv {
-                            Some(ikv) if ikv.version > 0 => RangeResult {
-                                kvs: vec![ikv.to_proto()],
-                                count: 1,
-                                more: false,
-                            },
-                            _ => RangeResult { kvs: vec![], count: 0, more: false },
+                            Some(ikv) if ikv.version > 0 => {
+                                responses.push(TxnOpResponse::Range(RangeResult {
+                                    kvs: vec![ikv.to_proto()], count: 1, more: false,
+                                }));
+                            }
+                            _ => {
+                                responses.push(TxnOpResponse::Range(RangeResult {
+                                    kvs: vec![], count: 0, more: false,
+                                }));
+                            }
                         }
                     } else {
-                        let all_keys = self.collect_unique_keys_in_range_rw(kv_table, key, range_end, query_rev as u64)?;
+                        let all_keys = collect_unique_keys_in_range(&inner, key, range_end, query_rev as u64);
                         let mut kvs = Vec::new();
                         for user_key in &all_keys {
-                            if let Some(ikv) = self.find_latest_kv_in_table(kv_table, latest_table, user_key, query_rev as u64)? {
-                                if ikv.version > 0 {
-                                    kvs.push(ikv.to_proto());
-                                }
+                            if let Some(ikv) = find_latest_kv_at_rev(&inner, user_key, query_rev as u64) {
+                                if ikv.version > 0 { kvs.push(ikv.to_proto()); }
                             }
                         }
                         let total_count = kvs.len() as i64;
@@ -1258,180 +503,483 @@ impl KvStore {
                         } else {
                             false
                         };
-                        RangeResult { count: total_count, kvs, more }
-                    };
-                    responses.push(TxnOpResponse::Range(result));
-                }
-                TxnOp::Put { key, value, lease_id } => {
-                    // Sub-ops use 0 (auto-assign); base was set above for pre-assigned Txn.
-                    let batch = self.batch_put(kv_table, rev_table, meta_table, latest_table, key, value, *lease_id, 0)?;
-                    if let ApplyResultData::Put(ref r) = batch.apply_result {
-                        final_revision = r.revision;
-                        responses.push(TxnOpResponse::Put(PutResult {
-                            revision: r.revision,
-                            prev_kv: r.prev_kv.clone(),
-                        }));
+                        responses.push(TxnOpResponse::Range(RangeResult { count: total_count, kvs, more }));
                     }
-                    all_watch_events.extend(batch.watch_events);
-                }
-                TxnOp::DeleteRange { key, range_end } => {
-                    // Sub-ops use 0 (auto-assign); base was set above for pre-assigned Txn.
-                    let batch = self.batch_delete_range(kv_table, rev_table, meta_table, latest_table, key, range_end, 0)?;
-                    if let ApplyResultData::DeleteRange(ref r) = batch.apply_result {
-                        final_revision = r.revision;
-                        responses.push(TxnOpResponse::DeleteRange(DeleteResult {
-                            revision: r.revision,
-                            deleted: r.deleted,
-                            prev_kvs: r.prev_kvs.clone(),
-                        }));
-                    }
-                    all_watch_events.extend(batch.watch_events);
                 }
             }
         }
 
-        Ok(BatchOpResult {
-            apply_result: ApplyResultData::Txn(TxnResult {
-                succeeded,
-                responses,
-                revision: final_revision,
-            }),
-            watch_events: all_watch_events,
-        })
+        let rev = inner.revision;
+        Ok(TxnResult { succeeded, responses, revision: rev })
     }
 
-    /// Compact within an open write transaction.
-    fn batch_compact(
-        &self,
-        kv_table: &mut redb::Table<&[u8], &[u8]>,
-        rev_table: &mut redb::Table<u64, &[u8]>,
-        revision: i64,
-    ) -> Result<(), redb::Error> {
-        let mut keys_to_remove: Vec<Vec<u8>> = Vec::new();
-        let mut latest_per_key: std::collections::HashMap<Vec<u8>, (u64, Vec<u8>)> =
-            std::collections::HashMap::new();
-
-        for entry in kv_table.iter()? {
-            let (ck, _) = entry?;
-            let ck_bytes = ck.value().to_vec();
-            let rev = extract_revision(&ck_bytes);
-            let user_key = extract_user_key(&ck_bytes).to_vec();
-
-            if rev <= revision as u64 {
-                match latest_per_key.get(&user_key) {
-                    Some((existing_rev, existing_ck)) => {
-                        if rev > *existing_rev {
-                            keys_to_remove.push(existing_ck.clone());
-                            latest_per_key.insert(user_key, (rev, ck_bytes));
-                        } else {
-                            keys_to_remove.push(ck_bytes);
-                        }
-                    }
-                    None => {
-                        latest_per_key.insert(user_key, (rev, ck_bytes));
-                    }
-                }
-            }
-        }
-
-        for ck in &keys_to_remove {
-            kv_table.remove(ck.as_slice())?;
-        }
-
-        let mut revs_to_remove: Vec<u64> = Vec::new();
-        for entry in rev_table.range(0..revision as u64)? {
-            let (rev, _) = entry?;
-            revs_to_remove.push(rev.value());
-        }
-        for rev in revs_to_remove {
-            rev_table.remove(rev)?;
-        }
-
+    /// Compact revisions up to and including the given revision.
+    pub fn compact(&self, revision: i64) -> Result<(), StoreError> {
+        let mut inner = self.inner.write().unwrap();
+        do_compact(&mut inner, revision);
         Ok(())
     }
 
-    /// Evaluate compares against writable tables (within an open transaction).
-    fn evaluate_compares_in_txn(
+    /// Return watch events (key, event_type, kv) since `after_revision`.
+    pub fn changes_since(
         &self,
-        kv_table: &redb::Table<&[u8], &[u8]>,
-        latest_table: &redb::Table<&[u8], u64>,
-        compares: &[TxnCompare],
-        current_rev: u64,
-    ) -> Result<bool, redb::Error> {
-        for cmp in compares {
-            let kv = self.find_latest_kv_in_table(kv_table, latest_table, &cmp.key, current_rev)?;
+        after_revision: i64,
+    ) -> Result<Vec<(Vec<u8>, i32, mvccpb::KeyValue)>, StoreError> {
+        let inner = self.inner.read().unwrap();
+        let start_rev = (after_revision + 1) as u64;
+        let mut results = Vec::new();
 
-            let passes = match &cmp.target {
-                TxnCompareTarget::Version(target_val) => {
-                    let actual = kv.as_ref().map(|k| k.version).unwrap_or(0);
-                    compare_i64(actual, *target_val, &cmp.result)
+        for (&rev, entries) in inner.revisions.range(start_rev..) {
+            for re in entries {
+                let event_type = match re.event_type {
+                    EventType::Put => 0,
+                    EventType::Delete => 1,
+                };
+                let compound = make_compound_key(&re.key, rev);
+                let kv = match inner.kv.get(&compound) {
+                    Some(ikv) => ikv.to_proto(),
+                    None => mvccpb::KeyValue {
+                        key: re.key.clone(),
+                        mod_revision: rev as i64,
+                        ..Default::default()
+                    },
+                };
+                results.push((re.key.clone(), event_type, kv));
+            }
+        }
+        Ok(results)
+    }
+
+    /// Apply a batch of commands atomically within a single write lock.
+    /// Updates `raft_applied_index` at the end.
+    pub fn batch_apply_with_index(
+        &self,
+        commands: &[(KvCommand, i64)],
+        last_applied_index: u64,
+    ) -> Result<Vec<BatchOpResult>, StoreError> {
+        let mut inner = self.inner.write().unwrap();
+        let mut results = Vec::with_capacity(commands.len());
+
+        for (cmd, preassigned_rev) in commands {
+            let result = match cmd {
+                KvCommand::Put { key, value, lease_id } => {
+                    batch_put(&mut inner, &self.revision_atomic, key, value, *lease_id, *preassigned_rev)?
                 }
-                TxnCompareTarget::CreateRevision(target_val) => {
-                    let actual = kv.as_ref().map(|k| k.create_revision).unwrap_or(0);
-                    compare_i64(actual, *target_val, &cmp.result)
+                KvCommand::DeleteRange { key, range_end } => {
+                    batch_delete_range(&mut inner, &self.revision_atomic, key, range_end, *preassigned_rev)?
                 }
-                TxnCompareTarget::ModRevision(target_val) => {
-                    let actual = kv.as_ref().map(|k| k.mod_revision).unwrap_or(0);
-                    compare_i64(actual, *target_val, &cmp.result)
+                KvCommand::Txn { compares, success, failure } => {
+                    batch_txn(&mut inner, &self.revision_atomic, compares, success, failure, *preassigned_rev)?
                 }
-                TxnCompareTarget::Value(target_val) => {
-                    let actual = kv.as_ref().map(|k| k.value.as_slice()).unwrap_or(&[]);
-                    compare_bytes(actual, target_val, &cmp.result)
-                }
-                TxnCompareTarget::Lease(target_val) => {
-                    let actual = kv.as_ref().map(|k| k.lease).unwrap_or(0);
-                    compare_i64(actual, *target_val, &cmp.result)
+                KvCommand::Compact { revision } => {
+                    do_compact(&mut inner, *revision);
+                    let rev = inner.revision;
+                    BatchOpResult {
+                        apply_result: ApplyResultData::Compact { revision: rev },
+                        watch_events: vec![],
+                    }
                 }
             };
-
-            if !passes {
-                return Ok(false);
-            }
+            results.push(result);
         }
-        Ok(true)
+
+        inner.raft_applied_index = last_applied_index;
+        Ok(results)
     }
 
-    /// Collect unique user keys in [key, range_end) from read-only table, up to max_rev.
-    fn collect_unique_keys_in_range(
-        &self,
-        table: &redb::ReadOnlyTable<&[u8], &[u8]>,
-        key_start: &[u8],
-        range_end: &[u8],
-        max_rev: u64,
-    ) -> Result<Vec<Vec<u8>>, redb::Error> {
-        let start_compound = make_compound_key(key_start, 0);
-        let end_compound = make_compound_key(range_end, 0);
+    /// Serialize the entire store to a snapshot file (atomic via tmp + rename).
+    pub fn snapshot(&self) -> Result<(), StoreError> {
+        let inner = self.inner.read().unwrap();
+        let snap = Snapshot {
+            kv: inner.kv.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+            revisions: inner.revisions.iter().map(|(k, v)| (*k, v.clone())).collect(),
+            latest: inner.latest.iter().map(|(k, v)| (k.clone(), *v)).collect(),
+            revision: inner.revision,
+            raft_applied_index: inner.raft_applied_index,
+        };
+        drop(inner);
 
-        let mut seen = std::collections::BTreeSet::new();
-        for entry in table.range(start_compound.as_slice()..end_compound.as_slice())? {
-            let (ck, _) = entry?;
-            let ck_bytes = ck.value();
-            let user_key = extract_user_key(ck_bytes);
-            let rev = extract_revision(ck_bytes);
-            if rev <= max_rev && user_key >= key_start && user_key < range_end {
-                seen.insert(user_key.to_vec());
-            }
-        }
-        Ok(seen.into_iter().collect())
+        let bytes = bincode::serialize(&snap).map_err(|e| StoreError::Serialization(e.to_string()))?;
+        let tmp_path = self.db_path.join("kv.snapshot.tmp");
+        let snap_path = self.db_path.join("kv.snapshot");
+        std::fs::write(&tmp_path, &bytes)?;
+        std::fs::rename(&tmp_path, &snap_path)?;
+        Ok(())
+    }
+
+    /// Return the db_path for compatibility.
+    pub fn db_path(&self) -> &Path {
+        &self.db_path
     }
 }
 
-// ── Compare helpers ──────────────────────────────────────────────────────
+// ── Free functions for operations on KvInner ────────────────────────────────
 
-fn compare_i64(actual: i64, target: i64, result: &TxnCompareResult) -> bool {
-    match result {
-        TxnCompareResult::Equal => actual == target,
-        TxnCompareResult::Greater => actual > target,
-        TxnCompareResult::Less => actual < target,
-        TxnCompareResult::NotEqual => actual != target,
+fn find_latest_kv(inner: &KvInner, key: &[u8], max_rev: u64) -> Option<InternalKeyValue> {
+    if let Some(&latest_rev) = inner.latest.get(key) {
+        if latest_rev <= max_rev {
+            let compound = make_compound_key(key, latest_rev);
+            return inner.kv.get(&compound).cloned();
+        }
+    }
+    find_latest_kv_by_scan(inner, key, max_rev)
+}
+
+fn find_latest_kv_at_rev(inner: &KvInner, key: &[u8], rev: u64) -> Option<InternalKeyValue> {
+    if let Some(&latest_rev) = inner.latest.get(key) {
+        if latest_rev <= rev {
+            let compound = make_compound_key(key, latest_rev);
+            return inner.kv.get(&compound).cloned();
+        }
+    }
+    find_latest_kv_by_scan(inner, key, rev)
+}
+
+fn find_latest_kv_by_scan(inner: &KvInner, key: &[u8], max_rev: u64) -> Option<InternalKeyValue> {
+    let start = make_compound_key(key, 0);
+    let end = make_compound_key(key, max_rev + 1);
+    inner.kv.range(start..end).next_back().map(|(_, v)| v.clone())
+}
+
+fn collect_unique_keys_in_range(inner: &KvInner, start: &[u8], end: &[u8], max_rev: u64) -> Vec<Vec<u8>> {
+    use std::collections::BTreeSet;
+    let range_start = make_compound_key(start, 0);
+    let range_end = if end == b"\x00" {
+        Vec::new()
+    } else {
+        make_compound_key(end, 0)
+    };
+
+    let mut unique_keys = BTreeSet::new();
+    let iter: Box<dyn Iterator<Item = _>> = if range_end.is_empty() {
+        Box::new(inner.kv.range(range_start..))
+    } else {
+        Box::new(inner.kv.range(range_start..range_end))
+    };
+
+    for (ck, _) in iter {
+        let rev = extract_revision(ck);
+        if rev <= max_rev {
+            let user_key = extract_user_key(ck).to_vec();
+            unique_keys.insert(user_key);
+        }
+    }
+    unique_keys.into_iter().collect()
+}
+
+fn do_delete_range(inner: &mut KvInner, key: &[u8], range_end: &[u8], new_rev: i64) -> Result<DeleteResult, StoreError> {
+    let keys_to_delete = if range_end.is_empty() {
+        if find_latest_kv(inner, key, new_rev as u64).map_or(false, |kv| kv.version > 0) {
+            vec![key.to_vec()]
+        } else {
+            vec![]
+        }
+    } else {
+        collect_unique_keys_in_range(inner, key, range_end, new_rev as u64)
+            .into_iter()
+            .filter(|k| find_latest_kv(inner, k, new_rev as u64).map_or(false, |kv| kv.version > 0))
+            .collect()
+    };
+
+    let mut prev_kvs = Vec::new();
+    let mut rev_entries = Vec::new();
+    for k in &keys_to_delete {
+        let prev = find_latest_kv(inner, k, new_rev as u64);
+        if let Some(p) = &prev {
+            prev_kvs.push(p.to_proto());
+        }
+        let ikv = InternalKeyValue {
+            key: k.clone(), create_revision: 0, mod_revision: new_rev,
+            version: 0, value: vec![], lease: 0,
+        };
+        let compound = make_compound_key(k, new_rev as u64);
+        inner.kv.insert(compound, ikv);
+        inner.latest.insert(k.clone(), new_rev as u64);
+        rev_entries.push(RevisionEntry { key: k.clone(), event_type: EventType::Delete });
+    }
+    if !rev_entries.is_empty() {
+        inner.revisions.insert(new_rev as u64, rev_entries);
+    }
+
+    Ok(DeleteResult { deleted: keys_to_delete.len() as i64, prev_kvs, revision: new_rev })
+}
+
+fn do_compact(inner: &mut KvInner, revision: i64) {
+    let mut keys_to_remove = Vec::new();
+    let mut latest_per_key: HashMap<Vec<u8>, (u64, Vec<u8>)> = HashMap::new();
+
+    for (ck, _) in inner.kv.iter() {
+        let rev = extract_revision(ck);
+        let user_key = extract_user_key(ck).to_vec();
+
+        if rev <= revision as u64 {
+            match latest_per_key.get(&user_key) {
+                Some((existing_rev, existing_ck)) => {
+                    if rev > *existing_rev {
+                        keys_to_remove.push(existing_ck.clone());
+                        latest_per_key.insert(user_key, (rev, ck.clone()));
+                    } else {
+                        keys_to_remove.push(ck.clone());
+                    }
+                }
+                None => {
+                    latest_per_key.insert(user_key, (rev, ck.clone()));
+                }
+            }
+        }
+    }
+
+    for ck in &keys_to_remove {
+        inner.kv.remove(ck);
+    }
+
+    let revs_to_remove: Vec<u64> = inner.revisions.range(..revision as u64).map(|(&k, _)| k).collect();
+    for rev in revs_to_remove {
+        inner.revisions.remove(&rev);
     }
 }
 
-fn compare_bytes(actual: &[u8], target: &[u8], result: &TxnCompareResult) -> bool {
-    match result {
-        TxnCompareResult::Equal => actual == target,
-        TxnCompareResult::Greater => actual > target,
-        TxnCompareResult::Less => actual < target,
-        TxnCompareResult::NotEqual => actual != target,
+fn batch_put(
+    inner: &mut KvInner,
+    revision_atomic: &AtomicI64,
+    key: &[u8],
+    value: &[u8],
+    lease_id: i64,
+    preassigned_rev: i64,
+) -> Result<BatchOpResult, StoreError> {
+    let new_rev = if preassigned_rev > 0 {
+        inner.revision = preassigned_rev;
+        revision_atomic.store(preassigned_rev, Ordering::SeqCst);
+        preassigned_rev
+    } else {
+        let r = inner.revision + 1;
+        inner.revision = r;
+        revision_atomic.store(r, Ordering::SeqCst);
+        r
+    };
+
+    let prev = find_latest_kv(inner, key, new_rev as u64);
+    let (create_revision, version) = match &prev {
+        Some(p) if p.version > 0 => (p.create_revision, p.version + 1),
+        _ => (new_rev, 1),
+    };
+
+    let ikv = InternalKeyValue {
+        key: key.to_vec(), create_revision, mod_revision: new_rev,
+        version, value: value.to_vec(), lease: lease_id,
+    };
+    let compound = make_compound_key(key, new_rev as u64);
+    inner.kv.insert(compound, ikv);
+    inner.latest.insert(key.to_vec(), new_rev as u64);
+    inner.revisions.insert(new_rev as u64, vec![RevisionEntry {
+        key: key.to_vec(), event_type: EventType::Put,
+    }]);
+
+    let notify_kv = mvccpb::KeyValue {
+        key: key.to_vec(), create_revision, mod_revision: new_rev,
+        version, value: value.to_vec(), lease: lease_id,
+    };
+    let watch_event = WatchEvent {
+        key: key.to_vec(), event_type: 0, kv: notify_kv,
+        prev_kv: prev.as_ref().map(|p| p.to_proto()),
+    };
+
+    Ok(BatchOpResult {
+        apply_result: ApplyResultData::Put(PutResult {
+            revision: new_rev, prev_kv: prev.map(|p| p.to_proto()),
+        }),
+        watch_events: vec![watch_event],
+    })
+}
+
+fn batch_delete_range(
+    inner: &mut KvInner,
+    revision_atomic: &AtomicI64,
+    key: &[u8],
+    range_end: &[u8],
+    preassigned_rev: i64,
+) -> Result<BatchOpResult, StoreError> {
+    let new_rev = if preassigned_rev > 0 {
+        inner.revision = preassigned_rev;
+        revision_atomic.store(preassigned_rev, Ordering::SeqCst);
+        preassigned_rev
+    } else {
+        let r = inner.revision + 1;
+        inner.revision = r;
+        revision_atomic.store(r, Ordering::SeqCst);
+        r
+    };
+
+    let keys_to_delete = if range_end.is_empty() {
+        if find_latest_kv(inner, key, new_rev as u64).map_or(false, |kv| kv.version > 0) {
+            vec![key.to_vec()]
+        } else {
+            vec![]
+        }
+    } else {
+        collect_unique_keys_in_range(inner, key, range_end, new_rev as u64)
+            .into_iter()
+            .filter(|k| find_latest_kv(inner, k, new_rev as u64).map_or(false, |kv| kv.version > 0))
+            .collect()
+    };
+
+    let mut prev_kvs = Vec::new();
+    let mut watch_events = Vec::new();
+    let mut rev_entries = Vec::new();
+
+    for k in &keys_to_delete {
+        let prev = find_latest_kv(inner, k, new_rev as u64);
+        let tombstone = InternalKeyValue {
+            key: k.clone(), create_revision: 0, mod_revision: new_rev,
+            version: 0, value: vec![], lease: 0,
+        };
+        let compound = make_compound_key(k, new_rev as u64);
+        inner.kv.insert(compound, tombstone);
+        inner.latest.insert(k.clone(), new_rev as u64);
+        rev_entries.push(RevisionEntry { key: k.clone(), event_type: EventType::Delete });
+
+        let notify_kv = mvccpb::KeyValue {
+            key: k.clone(), mod_revision: new_rev, ..Default::default()
+        };
+        watch_events.push(WatchEvent {
+            key: k.clone(), event_type: 1, kv: notify_kv,
+            prev_kv: prev.as_ref().map(|p| p.to_proto()),
+        });
+        if let Some(p) = prev { prev_kvs.push(p.to_proto()); }
     }
+
+    if !rev_entries.is_empty() {
+        inner.revisions.insert(new_rev as u64, rev_entries);
+    }
+
+    Ok(BatchOpResult {
+        apply_result: ApplyResultData::DeleteRange(DeleteResult {
+            deleted: keys_to_delete.len() as i64, prev_kvs, revision: new_rev,
+        }),
+        watch_events,
+    })
+}
+
+fn batch_txn(
+    inner: &mut KvInner,
+    revision_atomic: &AtomicI64,
+    compares: &[TxnCompare],
+    success: &[TxnOp],
+    failure: &[TxnOp],
+    preassigned_rev: i64,
+) -> Result<BatchOpResult, StoreError> {
+    let succeeded = evaluate_compares(inner, compares);
+    let ops = if succeeded { success } else { failure };
+
+    if preassigned_rev > 0 {
+        inner.revision = preassigned_rev - 1;
+        revision_atomic.store(preassigned_rev - 1, Ordering::SeqCst);
+    }
+
+    let mut responses = Vec::new();
+    let mut all_watch_events = Vec::new();
+
+    for op in ops {
+        match op {
+            TxnOp::Put { key, value, lease_id } => {
+                let result = batch_put(inner, revision_atomic, key, value, *lease_id, 0)?;
+                all_watch_events.extend(result.watch_events);
+                responses.push(TxnOpResponse::Put(match result.apply_result {
+                    ApplyResultData::Put(r) => r,
+                    _ => unreachable!(),
+                }));
+            }
+            TxnOp::DeleteRange { key, range_end } => {
+                let result = batch_delete_range(inner, revision_atomic, key, range_end, 0)?;
+                all_watch_events.extend(result.watch_events);
+                responses.push(TxnOpResponse::DeleteRange(match result.apply_result {
+                    ApplyResultData::DeleteRange(r) => r,
+                    _ => unreachable!(),
+                }));
+            }
+            TxnOp::Range { key, range_end, limit, revision } => {
+                let max_rev = inner.revision;
+                let query_rev = if *revision > 0 { *revision } else { max_rev };
+                if range_end.is_empty() {
+                    let kv = find_latest_kv_at_rev(inner, key, query_rev as u64);
+                    match kv {
+                        Some(ikv) if ikv.version > 0 => {
+                            responses.push(TxnOpResponse::Range(RangeResult {
+                                kvs: vec![ikv.to_proto()], count: 1, more: false,
+                            }));
+                        }
+                        _ => {
+                            responses.push(TxnOpResponse::Range(RangeResult {
+                                kvs: vec![], count: 0, more: false,
+                            }));
+                        }
+                    }
+                } else {
+                    let all_keys = collect_unique_keys_in_range(inner, key, range_end, query_rev as u64);
+                    let mut kvs = Vec::new();
+                    for user_key in &all_keys {
+                        if let Some(ikv) = find_latest_kv_at_rev(inner, user_key, query_rev as u64) {
+                            if ikv.version > 0 { kvs.push(ikv.to_proto()); }
+                        }
+                    }
+                    let total_count = kvs.len() as i64;
+                    let more = if *limit > 0 && total_count > *limit {
+                        kvs.truncate(*limit as usize);
+                        true
+                    } else {
+                        false
+                    };
+                    responses.push(TxnOpResponse::Range(RangeResult { count: total_count, kvs, more }));
+                }
+            }
+        }
+    }
+
+    let rev = inner.revision;
+    Ok(BatchOpResult {
+        apply_result: ApplyResultData::Txn(TxnResult { succeeded, responses, revision: rev }),
+        watch_events: all_watch_events,
+    })
+}
+
+fn evaluate_compares(inner: &KvInner, compares: &[TxnCompare]) -> bool {
+    for compare in compares {
+        let kv = find_latest_kv(inner, &compare.key, inner.revision as u64);
+        let actual = kv.as_ref();
+
+        let cmp_result = match &compare.target {
+            TxnCompareTarget::Version(v) => {
+                let actual_v = actual.map(|kv| kv.version).unwrap_or(0);
+                actual_v.cmp(v)
+            }
+            TxnCompareTarget::CreateRevision(v) => {
+                let actual_v = actual.map(|kv| kv.create_revision).unwrap_or(0);
+                actual_v.cmp(v)
+            }
+            TxnCompareTarget::ModRevision(v) => {
+                let actual_v = actual.map(|kv| kv.mod_revision).unwrap_or(0);
+                actual_v.cmp(v)
+            }
+            TxnCompareTarget::Value(v) => {
+                let actual_v = actual.map(|kv| kv.value.as_slice()).unwrap_or(&[]);
+                actual_v.cmp(v.as_slice())
+            }
+            TxnCompareTarget::Lease(v) => {
+                let actual_v = actual.map(|kv| kv.lease).unwrap_or(0);
+                actual_v.cmp(v)
+            }
+        };
+
+        let success = match compare.result {
+            TxnCompareResult::Equal => cmp_result == std::cmp::Ordering::Equal,
+            TxnCompareResult::Greater => cmp_result == std::cmp::Ordering::Greater,
+            TxnCompareResult::Less => cmp_result == std::cmp::Ordering::Less,
+            TxnCompareResult::NotEqual => cmp_result != std::cmp::Ordering::Equal,
+        };
+
+        if !success {
+            return false;
+        }
+    }
+    true
 }
