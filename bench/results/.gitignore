@@ -1,4 +1,5 @@
 *
 !.gitignore
+!RESULTS.md
 !barkeeper/.gitkeep
 !etcd/.gitkeep

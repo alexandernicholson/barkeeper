@@ -307,14 +307,24 @@ cargo test
 
 ## Benchmarks
 
+Single-node, identical Docker containers (2 CPU, 512MB RAM). Load via [oha](https://github.com/hatoo/oha) against HTTP/JSON gateway.
+
+| Scenario | Barkeeper | etcd | Ratio |
+|---|---|---|---|
+| Write c=1 | 1,964 req/s | 1,874 req/s | **1.05x** |
+| Write c=100 | 4,250 req/s | 9,611 req/s | 0.44x |
+| Read c=100 | 19,138 req/s | 10,015 req/s | **1.91x** |
+| Read P99 | 11.69ms | 36.27ms | **3.1x faster** |
+| Mixed read (c=80) | 10,679 req/s | 7,006 req/s | **1.52x** |
+| Mixed write (c=20) | 1,951 req/s | 2,039 req/s | 0.96x |
+| Conn scaling c=1000 | 77,804 req/s | 78,419 req/s | **1.00x** |
+
+Full results: [`bench/results/RESULTS.md`](bench/results/RESULTS.md)
+
 ```bash
-# Requires Docker and oha (https://github.com/hatoo/oha)
+# Run it yourself (requires Docker and oha)
 bench/harness/run.sh all
 ```
-
-Runs barkeeper and etcd in identical Docker containers (2 CPU, 512MB RAM) and
-compares write throughput, read throughput, mixed workload, large values, and
-connection scaling. Results are written to `bench/results/RESULTS.md`.
 
 ## Differences from etcd
 
