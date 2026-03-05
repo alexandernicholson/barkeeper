@@ -12,7 +12,6 @@ rebar-core = { git = "https://github.com/alexandernicholson/rebar.git", branch =
 rebar-cluster = { git = "https://github.com/alexandernicholson/rebar.git", branch = "main" }
 
 # Storage
-redb = "2"
 dashmap = "6"
 
 # gRPC

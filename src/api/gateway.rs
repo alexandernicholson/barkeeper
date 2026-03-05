@@ -702,7 +702,6 @@ async fn handle_put(
     State(state): State<GatewayState>,
     body: axum::body::Bytes,
 ) -> impl IntoResponse {
-    let _put_t0 = std::time::Instant::now();
     let req: PutRequest = parse_json(&body);
     let key = decode_b64(&req.key);
     let value = decode_b64(&req.value);
@@ -761,7 +760,6 @@ async fn handle_put(
             json_error(StatusCode::INTERNAL_SERVER_ERROR, e).into_response()
         }
     };
-    tracing::info!(elapsed_us = _put_t0.elapsed().as_micros() as u64, "handle_put");
     resp
 }
 

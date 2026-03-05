@@ -65,7 +65,6 @@ pub struct RaftHandle {
 impl RaftHandle {
     /// Submit a proposal and wait for the result.
     pub async fn propose(&self, data: Vec<u8>) -> Result<ClientProposalResult, String> {
-        let t0 = std::time::Instant::now();
         let (tx, rx) = oneshot::channel();
         let proposal = ClientProposal {
             id: rand::random(),
@@ -76,10 +75,7 @@ impl RaftHandle {
             .send(proposal)
             .await
             .map_err(|_| "raft node stopped".to_string())?;
-        let send_us = t0.elapsed().as_micros() as u64;
-        let result = rx.await.map_err(|_| "proposal dropped".to_string());
-        tracing::info!(send_us, total_us = t0.elapsed().as_micros() as u64, "raft_propose");
-        result
+        rx.await.map_err(|_| "proposal dropped".to_string())
     }
 
     /// Returns the last applied Raft log index.
@@ -200,7 +196,6 @@ pub async fn spawn_raft_node(
 
                 // Client proposals (group commit)
                 Some(proposal) = proposal_rx.recv() => {
-                    let _gc_t0 = std::time::Instant::now();
                     let mut wal_buffer = WalBuffer::new();
                     let mut batch = vec![proposal];
                     loop {
@@ -211,13 +206,10 @@ pub async fn spawn_raft_node(
                             }
                         }
                         let mut all_actions = Vec::new();
-                        {
-                            let _step_span = tracing::info_span!("raft_step", batch_size = batch.len()).entered();
-                            for p in batch.drain(..) {
-                                pending_responses.insert(p.id, p.response_tx);
-                                let actions = core.step(Event::Proposal { id: p.id, data: p.data });
-                                all_actions.extend(actions);
-                            }
+                        for p in batch.drain(..) {
+                            pending_responses.insert(p.id, p.response_tx);
+                            let actions = core.step(Event::Proposal { id: p.id, data: p.data });
+                            all_actions.extend(actions);
                         }
                         let merged = merge_log_actions(all_actions);
                         execute_actions_buffered(
@@ -234,7 +226,6 @@ pub async fn spawn_raft_node(
                         }
                     }
                     wal_buffer.flush(&log_store, &mut pending_responses).await;
-                    tracing::info!(elapsed_us = _gc_t0.elapsed().as_micros() as u64, "group_commit");
                     term_ref.store(core.state.persistent.current_term, Ordering::Relaxed);
                     leader_ref.store(core.state.leader_id.unwrap_or(0), Ordering::Relaxed);
                 }
@@ -308,24 +299,18 @@ impl WalBuffer {
 
         let ls = log_store.clone();
         let entries = std::mem::take(&mut self.entries);
-        let entry_count = entries.len();
         let hard_state = self.hard_state.take();
-        let wal_t0 = std::time::Instant::now();
         tokio::task::spawn_blocking(move || {
             ls.flush(&entries, hard_state.as_ref()).unwrap()
         })
         .await
         .unwrap();
-        tracing::info!(elapsed_us = wal_t0.elapsed().as_micros() as u64, entries = entry_count, "wal_flush");
 
-        let resp_count = self.deferred_responses.len();
-        let resp_t0 = std::time::Instant::now();
         for (id, result) in self.deferred_responses.drain(..) {
             if let Some(tx) = pending_responses.remove(&id) {
                 let _ = tx.send(result);
             }
         }
-        tracing::info!(elapsed_us = resp_t0.elapsed().as_micros() as u64, count = resp_count, "send_responses");
     }
 }
 
@@ -361,7 +346,6 @@ async fn execute_actions_buffered(
                 recent_entries.retain(|e| e.index <= idx);
             }
             Action::ApplyEntries { from, to } => {
-                let _apply_t0 = std::time::Instant::now();
                 let expected_count = (*to - *from + 1) as usize;
                 let mem_entries: Vec<LogEntry> = recent_entries
                     .iter()
@@ -404,7 +388,7 @@ async fn execute_actions_buffered(
                 apply_tx.send(entries).await.ok();
                 applied_index.store(*to, Ordering::Relaxed);
                 commit_index.store(*to, Ordering::Release);
-                tracing::info!(elapsed_us = _apply_t0.elapsed().as_micros() as u64, from = from, to = to, "apply_entries");
+
             }
             Action::RespondToProposal { id, result } => {
                 let result_clone = match result {
@@ -465,7 +449,6 @@ async fn execute_actions_buffered_rebar(
                 recent_entries.retain(|e| e.index <= idx);
             }
             Action::ApplyEntries { from, to } => {
-                let _apply_t0 = std::time::Instant::now();
                 let expected_count = (*to - *from + 1) as usize;
                 let mem_entries: Vec<LogEntry> = recent_entries
                     .iter()
@@ -508,7 +491,7 @@ async fn execute_actions_buffered_rebar(
                 apply_tx.send(entries).await.ok();
                 applied_index.store(*to, Ordering::Relaxed);
                 commit_index.store(*to, Ordering::Release);
-                tracing::info!(elapsed_us = _apply_t0.elapsed().as_micros() as u64, from = from, to = to, "apply_entries");
+
             }
             Action::RespondToProposal { id, result } => {
                 let result_clone = match result {

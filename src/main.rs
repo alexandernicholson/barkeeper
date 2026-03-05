@@ -77,10 +77,7 @@ struct Cli {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    tracing_subscriber::fmt()
-        .with_span_events(tracing_subscriber::fmt::format::FmtSpan::CLOSE)
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
-        .init();
+    tracing_subscriber::fmt::init();
     let cli = Cli::parse();
 
     let tls_config = TlsConfig {
@@ -107,7 +104,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Auto-detect cluster state: if data-dir has existing Raft log,
         // treat as "existing" regardless of --initial-cluster-state.
         let effective_state = if cli.initial_cluster_state == "new"
-            && std::path::Path::new(&cli.data_dir).join("raft.redb").exists()
+            && std::path::Path::new(&cli.data_dir).join("raft.wal").exists()
         {
             tracing::info!("detected existing data in {}, using initial-cluster-state=existing", cli.data_dir);
             "existing".to_string()
