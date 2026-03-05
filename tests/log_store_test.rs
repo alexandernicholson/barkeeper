@@ -125,3 +125,59 @@ fn test_overwrite_entries() {
     let entry = store.get(1).unwrap().unwrap();
     assert_eq!(entry.term, 2);
 }
+
+#[test]
+fn test_flush_entries_and_hard_state() {
+    let dir = tempdir().unwrap();
+    let store = LogStore::open(dir.path().join("test.redb")).unwrap();
+
+    let entries = vec![
+        make_entry(1, 1, "a"),
+        make_entry(1, 2, "b"),
+    ];
+    let state = PersistentState {
+        current_term: 3,
+        voted_for: Some(1),
+    };
+
+    store.flush(&entries, Some(&state)).unwrap();
+
+    // Verify entries were written
+    assert_eq!(store.len().unwrap(), 2);
+    assert_eq!(store.last_index().unwrap(), 2);
+    let entry = store.get(1).unwrap().unwrap();
+    assert_eq!(entry.term, 1);
+
+    // Verify hard state was written
+    let loaded = store.load_hard_state().unwrap().unwrap();
+    assert_eq!(loaded.current_term, 3);
+    assert_eq!(loaded.voted_for, Some(1));
+}
+
+#[test]
+fn test_flush_entries_only() {
+    let dir = tempdir().unwrap();
+    let store = LogStore::open(dir.path().join("test.redb")).unwrap();
+
+    let entries = vec![make_entry(1, 1, "x")];
+    store.flush(&entries, None).unwrap();
+
+    assert_eq!(store.len().unwrap(), 1);
+    assert!(store.load_hard_state().unwrap().is_none());
+}
+
+#[test]
+fn test_flush_hard_state_only() {
+    let dir = tempdir().unwrap();
+    let store = LogStore::open(dir.path().join("test.redb")).unwrap();
+
+    let state = PersistentState {
+        current_term: 7,
+        voted_for: None,
+    };
+    store.flush(&[], Some(&state)).unwrap();
+
+    assert_eq!(store.len().unwrap(), 0);
+    let loaded = store.load_hard_state().unwrap().unwrap();
+    assert_eq!(loaded.current_term, 7);
+}

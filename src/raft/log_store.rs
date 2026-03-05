@@ -45,6 +45,35 @@ impl LogStore {
         Ok(())
     }
 
+    /// Flush log entries and optionally hard state in a single write transaction.
+    /// This is the group-commit path: one fsync covers both log append and state persist.
+    pub fn flush(
+        &self,
+        entries: &[LogEntry],
+        hard_state: Option<&PersistentState>,
+    ) -> Result<(), redb::Error> {
+        if entries.is_empty() && hard_state.is_none() {
+            return Ok(());
+        }
+        let txn = self.db.begin_write()?;
+        {
+            if !entries.is_empty() {
+                let mut table = txn.open_table(LOG_TABLE)?;
+                for entry in entries {
+                    let bytes = bincode::serialize(entry).expect("serialize log entry");
+                    table.insert(entry.index, bytes.as_slice())?;
+                }
+            }
+            if let Some(state) = hard_state {
+                let mut table = txn.open_table(META_TABLE)?;
+                let bytes = bincode::serialize(state).expect("serialize hard state");
+                table.insert("hard_state", bytes.as_slice())?;
+            }
+        }
+        txn.commit()?;
+        Ok(())
+    }
+
     /// Get a single log entry by index.
     pub fn get(&self, index: u64) -> Result<Option<LogEntry>, redb::Error> {
         let txn = self.db.begin_read()?;
