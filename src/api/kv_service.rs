@@ -78,10 +78,8 @@ impl Kv for KvService {
     ) -> Result<Response<RangeResponse>, Status> {
         let req = request.into_inner();
 
-        // ReadIndex: wait for apply to catch up to commit index so that reads
-        // after early-acked writes see the written data (linearizability).
-        let commit = self.raft_handle.commit_index();
-        self.apply_notifier.wait_for(commit).await;
+        // Since PUT waits for apply before responding, the store is always
+        // consistent for reads without needing ReadIndex in single-node mode.
 
         let result = self
             .store
@@ -106,13 +104,9 @@ impl Kv for KvService {
     async fn put(&self, request: Request<PutRequest>) -> Result<Response<PutResponse>, Status> {
         let req = request.into_inner();
 
-        // If prev_kv requested, read it BEFORE proposing. We must first wait
-        // for all committed entries to be applied (ReadIndex) so that previous
-        // early-acked writes are visible in the store.
+        // If prev_kv requested, read it BEFORE proposing the new write.
+        // Since PUT waits for apply, all previous writes are already applied.
         let prev_kv = if req.prev_kv {
-            let commit = self.raft_handle.commit_index();
-            self.apply_notifier.wait_for(commit).await;
-
             let store = self.store_direct.clone();
             let key = req.key.clone();
             tokio::task::spawn_blocking(move || {
@@ -138,8 +132,11 @@ impl Kv for KvService {
             .map_err(|e| Status::unavailable(format!("raft: {}", e)))?;
 
         match proposal_result {
-            ClientProposalResult::Success { revision, .. } => {
-                // Early ack: return immediately with pre-assigned revision — no broker wait.
+            ClientProposalResult::Success { index, revision, .. } => {
+                // Wait for the state machine to apply this entry so that
+                // subsequent reads see the written data without ReadIndex.
+                let _ = self.broker.wait_for_result(index).await;
+
                 Ok(Response::new(PutResponse {
                     header: self.make_header(revision),
                     prev_kv,

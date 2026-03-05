@@ -96,6 +96,8 @@ struct RangeRequest {
     limit: Option<i64>,
     #[serde(default)]
     revision: Option<i64>,
+    #[serde(default)]
+    serializable: Option<bool>,
 }
 
 #[derive(Debug, Serialize)]
@@ -583,10 +585,9 @@ async fn handle_range(
     let limit = req.limit.unwrap_or(0);
     let revision = req.revision.unwrap_or(0);
 
-    // ReadIndex: wait for apply to catch up to commit index so that reads
-    // after early-acked writes see the written data (linearizability).
-    let commit = state.raft_handle.commit_index();
-    state.apply_notifier.wait_for(commit).await;
+    // Since PUT waits for apply before responding, the store is always
+    // consistent for reads without needing ReadIndex.  Serializable field
+    // is accepted but ignored in single-node mode.
 
     // Bypass the actor channel — run the range query directly on the
     // blocking thread pool.  redb supports concurrent read transactions
@@ -625,13 +626,9 @@ async fn handle_put(
     let value = decode_b64(&req.value);
     let lease_id = req.lease.unwrap_or(0);
 
-    // If prev_kv requested, read it BEFORE proposing. We must first wait
-    // for all committed entries to be applied (ReadIndex) so that previous
-    // early-acked writes are visible in the store.
+    // If prev_kv requested, read it BEFORE proposing the new write.
+    // Since PUT waits for apply, all previous writes are already applied.
     let prev_kv = if req.prev_kv.unwrap_or(false) {
-        let commit = state.raft_handle.commit_index();
-        state.apply_notifier.wait_for(commit).await;
-
         let store = Arc::clone(&state.store_direct);
         let k = key.clone();
         tokio::task::spawn_blocking(move || {
@@ -663,8 +660,11 @@ async fn handle_put(
     };
 
     match proposal_result {
-        ClientProposalResult::Success { revision, .. } => {
-            // Early ack: return immediately with pre-assigned revision — no broker wait.
+        ClientProposalResult::Success { index, revision, .. } => {
+            // Wait for the state machine to apply this entry so that
+            // subsequent reads see the written data without ReadIndex.
+            let _ = state.broker.wait_for_result(index).await;
+
             axum::Json(PutResponse {
                 header: state.make_header(revision),
                 prev_kv,

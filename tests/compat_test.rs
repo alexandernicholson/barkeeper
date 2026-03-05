@@ -1162,7 +1162,7 @@ async fn test_read_after_write_linearizability() {
         .await
         .unwrap();
 
-    // Read immediately -- ReadIndex ensures we wait for apply.
+    // Read immediately -- PUT waits for apply so data is visible.
     let get: Value = client
         .post(format!("http://{}/v3/kv/range", addr))
         .body(format!(r#"{{"key":"{}"}}"#, b64("linear-key")))
