@@ -173,7 +173,7 @@ pub async fn spawn_raft_node(
                 // Client proposals (batched)
                 Some(proposal) = proposal_rx.recv() => {
                     let mut proposals = vec![proposal];
-                    while proposals.len() < 128 {
+                    while proposals.len() < 64 {
                         match proposal_rx.try_recv() {
                             Ok(p) => proposals.push(p),
                             Err(_) => break,
@@ -403,7 +403,7 @@ pub async fn spawn_raft_node_rebar(
                     // Client proposals (batched)
                     Some(proposal) = proposal_rx.recv() => {
                         let mut proposals = vec![proposal];
-                        while proposals.len() < 128 {
+                        while proposals.len() < 64 {
                             match proposal_rx.try_recv() {
                                 Ok(p) => proposals.push(p),
                                 Err(_) => break,
