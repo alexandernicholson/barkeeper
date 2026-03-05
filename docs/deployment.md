@@ -151,9 +151,8 @@ graph TD
 6. The state machine on **all nodes** applies the command to their local KvStore
 7. The leader returns the result to the client via the `ApplyResultBroker`
 
-Data persists across pod restarts because each node's `kv.redb` contains all
-applied mutations. The state machine tracks `last_applied_raft_index` to avoid
-re-applying entries after restart.
+Data persists across pod restarts because each node's WAL and snapshot files contain all
+applied mutations. On startup, the in-memory KV store is reconstructed from the `kv.snapshot` file (or by replaying the WAL if no snapshot exists). The state machine tracks `last_applied_raft_index` to avoid re-applying entries after restart.
 
 ### CLI Flags for Clustering
 
@@ -571,7 +570,7 @@ Copy the snapshot to the data directory and restart barkeeper:
 
 ```bash
 sudo systemctl stop barkeeper
-cp snapshot.db /var/lib/barkeeper/kv.redb
+cp snapshot.db /var/lib/barkeeper/kv.snapshot
 sudo systemctl start barkeeper
 ```
 
@@ -583,11 +582,13 @@ sudo systemctl start barkeeper
 
 | File | Purpose |
 |------|---------|
-| `kv.redb` | MVCC key-value store (all user data) and last applied Raft index |
-| `raft.redb` | Raft log and hard state (term, votedFor) |
+| `kv.snapshot` | Serialized snapshot of the in-memory KV store (all user data) for fast startup |
+| `raft.wal` | Append-only WAL containing Raft log entries and hard state (term, votedFor) |
 
-On restart, barkeeper auto-detects existing data (if `raft.redb` exists in the
-data directory) and uses `initial-cluster-state=existing`. The state machine
+On restart, barkeeper auto-detects existing data (if `raft.wal` exists in the
+data directory) and uses `initial-cluster-state=existing`. The in-memory KV
+store is reconstructed from `kv.snapshot` (if present) or by replaying the WAL.
+The state machine
 resumes from the persisted `last_applied_raft_index`, skipping already-applied
 Raft entries to prevent duplicate mutations.
 
@@ -630,7 +631,7 @@ the database to reclaim space:
 # Compact revisions up to revision 100
 curl -s http://127.0.0.1:2380/v3/kv/compaction -d '{"revision":"100"}' | jq .
 
-# Defragment (triggers redb compaction)
+# Defragment (no-op for in-memory store; kept for API compatibility)
 curl -s http://127.0.0.1:2380/v3/maintenance/defragment -d '{}' | jq .
 ```
 

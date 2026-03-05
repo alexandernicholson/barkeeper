@@ -43,8 +43,8 @@ graph TD
     S --> R["RaftProcess<br>consensus engine"]
     S --> SM["StateMachine<br>apply loop"]
     S --> F["(future)"]
-    R --> LS["LogStore (redb)<br>raft.redb"]
-    SM --> KV["KvStore (redb)<br>kv.redb"]
+    R --> LS["LogStore (WAL)<br>raft.wal"]
+    SM --> KV["KvStore (BTreeMap)<br>kv.snapshot"]
 ```
 
 **Current actor layout:**
@@ -54,10 +54,10 @@ graph TD
     S["BarkeepSupervisor (OneForAll)<br>max_restarts=5/30s"]
     S --> R["RaftProcess<br>Rebar distributed actor (ProcessContext mailbox)"]
     R --> RC["RaftCore<br>pure Event-&gt;Action state machine"]
-    R --> LS["LogStore<br>durable log (redb: raft.redb)"]
+    R --> LS["LogStore<br>durable log (append-only WAL: raft.wal)"]
     S --> SM["StateMachine<br>applies committed entries to KvStore"]
-    S --> KVA["KvStoreActor<br>Rebar actor (KvStoreCmd, spawn_blocking for redb)"]
-    KVA --> KV["KvStore<br>MVCC store (redb: kv.redb)"]
+    S --> KVA["KvStoreActor<br>Rebar actor (KvStoreCmd, in-memory BTreeMap)"]
+    KVA --> KV["KvStore<br>MVCC store (BTreeMap + WAL: kv.snapshot)"]
     S --> LET["LeaseExpiryTimer<br>supervised Rebar child (ChildEntry, Permanent)"]
     S --> WHA["WatchHubActor<br>Rebar actor (WatchHubCmd, streaming via mpsc)"]
     S --> LM["LeaseManager<br>TTL tracking, expiry detection"]
@@ -73,7 +73,7 @@ graph TD
 |-----------|--------|-----|
 | RaftNode | Migrated | `spawn_raft_node_rebar` — Rebar distributed actor with `ProcessContext` mailbox |
 | LeaseExpiryTimer | Migrated | Supervised `ChildEntry` (Permanent restart) under `BarkeepSupervisor` |
-| KvStore | Migrated | `spawn_kv_store_actor` — Rebar actor with `KvStoreCmd` typed commands, `spawn_blocking` for all redb ops |
+| KvStore | Migrated | `spawn_kv_store_actor` — Rebar actor with `KvStoreCmd` typed commands, in-memory BTreeMap operations |
 | WatchHub | Migrated | `spawn_watch_hub_actor` — Rebar actor with `WatchHubCmd`, streaming via mpsc channels |
 | ClusterManager | Migrated | `spawn_cluster_actor` — Rebar actor with `ClusterCmd`, SWIM-backed membership |
 | AuthManager | Migrated | `spawn_auth_actor` — Rebar actor with `AuthCmd`, `spawn_blocking` for bcrypt |
@@ -106,7 +106,7 @@ graph TD
     Client --> Service["gRPC / HTTP<br>KvService.put()"]
     Service --> Raft["RaftHandle.propose(data)<br>propose(serialized KvCommand)"]
     Raft -->|"single-node: commits immediately<br>multi-node: replicates, waits for quorum"| SM["StateMachine<br>(on all nodes)"]
-    SM --> KV["KvStore.put()<br>(redb txn)"]
+    SM --> KV["KvStore.put()<br>(in-memory BTreeMap)"]
     SM --> Watch["WatchHub.notify()<br>fan-out to matching watchers"]
     SM --> Lease["LeaseManager.attach_key()<br>(if lease != 0)"]
     SM -->|"ApplyResultBroker"| Service
@@ -132,7 +132,7 @@ This matches etcd's serializable read behaviour (the default for `Range`).
 graph TD
     Client["Client<br>(etcdctl / HTTP)"]
     Client --> Service["gRPC / HTTP<br>KvService.range()"]
-    Service --> KV["KvStore.range()<br>read-only redb txn<br>supports revision parameter"]
+    Service --> KV["KvStore.range()<br>in-memory BTreeMap read<br>supports revision parameter"]
     KV --> Result["RangeResult<br>kvs: Vec&lt;KeyValue&gt;<br>count: i64<br>more: bool"]
 ```
 
@@ -185,7 +185,7 @@ Lease lifecycle:
 ## MVCC Storage Model
 
 Barkeeper implements Multi-Version Concurrency Control (MVCC) using compound
-keys in redb. Every mutation creates a new revision, preserving history.
+keys in in-memory BTreeMaps. Every mutation creates a new revision, preserving history.
 
 ### Compound Key Format
 
@@ -207,15 +207,16 @@ extract_user_key(compound)       -> &[u8]     // everything before last 9 bytes
 extract_revision(compound)       -> u64       // last 8 bytes as BE u64
 ```
 
-### redb Tables
+### In-Memory BTreeMaps
 
-| Table       | Key Type        | Value Type                     | Purpose                        |
+| BTreeMap    | Key Type        | Value Type                     | Purpose                        |
 |-------------|-----------------|--------------------------------|--------------------------------|
-| `kv`        | `&[u8]`         | `&[u8]` (JSON InternalKeyValue)| MVCC key-value data            |
-| `revisions` | `u64`           | `&[u8]` (JSON RevisionEntry[]) | Which keys changed per revision|
-| `kv_meta`   | `&str`          | `&[u8]`                        | Current revision counter       |
-| `raft_log`  | `u64`           | `&[u8]` (JSON LogEntry)        | Raft log entries               |
-| `raft_meta` | `&str`          | `&[u8]`                        | Raft hard state                |
+| `kv`        | `Vec<u8>`       | `InternalKeyValue` (JSON)      | MVCC key-value data            |
+| `revisions` | `u64`           | `Vec<RevisionEntry>` (JSON)    | Which keys changed per revision|
+| `latest`    | `Vec<u8>`       | `u64`                          | Latest revision per user key   |
+| `meta`      | `String`        | `Vec<u8>`                      | Current revision counter       |
+
+All BTreeMaps are held behind an `RwLock` and backed by an append-only WAL for durability. On startup, the KV store is reconstructed from a `kv.snapshot` file (if present) or by replaying the WAL.
 
 ### InternalKeyValue
 
@@ -284,7 +285,7 @@ graph LR
 | Action                | Side Effect                          |
 |-----------------------|--------------------------------------|
 | `SendMessage`         | Transmit RPC to peer node            |
-| `PersistHardState`    | Write term/votedFor to redb          |
+| `PersistHardState`    | Write term/votedFor to WAL           |
 | `AppendToLog`         | Append entries to log store          |
 | `TruncateLogAfter`    | Remove conflicting log entries       |
 | `ApplyEntries`        | Apply committed entries to KV store  |
@@ -299,7 +300,7 @@ graph LR
 RaftState {
     node_id: u64,
     role: Follower | Candidate | Leader,
-    persistent: {           // survives restart (redb)
+    persistent: {           // survives restart (WAL)
         current_term: u64,
         voted_for: Option<u64>,
     },
@@ -318,7 +319,7 @@ RaftState {
 
 ### Log Store
 
-The durable Raft log uses redb with two tables:
+The durable Raft log uses an append-only WAL (`raft.wal`):
 
 - `raft_log`: `u64 (index) -> JSON LogEntry`
 - `raft_meta`: `"hard_state" -> JSON PersistentState`
@@ -397,7 +398,7 @@ follower acknowledgment.
 | Language             | Go                      | Rust                                |
 | Actor Runtime        | goroutines              | Rebar (OneForAll supervisor)        |
 | Consensus            | etcd/raft (Go lib)      | Custom RaftCore (Event->Action)     |
-| Storage Engine       | bbolt (B+ tree)         | redb (B+ tree, Rust-native)         |
+| Storage Engine       | bbolt (B+ tree)         | In-memory BTreeMap + append-only WAL (pure Rust) |
 | gRPC Framework       | grpc-go                 | tonic                               |
 | HTTP Gateway         | grpc-gateway            | axum (custom handler)               |
 | Serialization        | protobuf                | prost (protobuf) + serde_json       |
@@ -405,7 +406,7 @@ follower acknowledgment.
 | Inter-node Transport | gRPC streaming           | RebarTcpTransport (Rebar TCP frames, msgpack) |
 | Cluster Membership   | peer URL exchange        | SWIM protocol (gossip-based)        |
 | Cluster Discovery    | peer URL exchange        | `--initial-cluster` CLI flag or DNS SRV autodiscovery |
-| MVCC                 | Custom B-tree            | Compound keys in redb               |
+| MVCC                 | Custom B-tree            | Compound keys in BTreeMap            |
 | TLS                  | Manual + auto            | Manual + auto-TLS (rcgen)           |
 
 ---
@@ -440,7 +441,7 @@ CLI entry point using clap. Parses `--name`, `--data-dir`,
   `MemberRemove`, `MemberUpdate`, `MemberPromote`.
 - **`maintenance_service.rs`** -- gRPC Maintenance service: `Status`,
   `HashKV`, `Alarm` (GET/ACTIVATE/DEACTIVATE with in-memory alarm store),
-  `Defragment` (real redb compaction), `Snapshot` (chunked 64KB streaming).
+  `Defragment` (no-op, kept for API compatibility), `Snapshot` (chunked 64KB streaming).
 - **`auth_service.rs`** -- gRPC Auth service: `AuthEnable`, `AuthDisable`,
   `UserAdd`, `UserDelete`, `UserChangePassword`, `UserGrant`, `UserRevoke`,
   `UserList`, `UserGet`, `RoleAdd`, `RoleDelete`, `RoleGrant`, `RoleRevoke`,
@@ -462,8 +463,8 @@ CLI entry point using clap. Parses `--name`, `--data-dir`,
 - **`messages.rs`** -- `LogEntry`, `LogEntryData` (Command/ConfigChange/Noop),
   `RaftMessage` enum, all Raft RPC request/response types, `ClientProposal`.
   Includes msgpack encode/decode helpers for Rebar messaging.
-- **`log_store.rs`** -- Durable log storage backed by redb. append, get,
-  get_range, truncate_after, hard state persistence.
+- **`log_store.rs`** -- Durable log storage backed by an append-only WAL.
+  append, get, get_range, truncate_after, hard state persistence.
 - **`transport.rs`** -- `RaftTransport` trait and `LocalTransport`
   (in-process testing).
 - **`rebar_transport.rs`** -- `RebarTcpTransport` for multi-node clusters via
@@ -474,13 +475,14 @@ CLI entry point using clap. Parses `--name`, `--data-dir`,
 
 ### `src/kv/`
 
-- **`store.rs`** -- MVCC KvStore backed by redb. Compound key encoding,
-  `put`, `range`, `delete_range`, `txn` (compare-and-swap), `compact`,
-  `snapshot_bytes` (full db snapshot), `compact_db` (redb compaction).
-  Uses three redb tables: `kv`, `revisions`, `kv_meta`.
+- **`store.rs`** -- MVCC KvStore backed by in-memory BTreeMaps with an
+  append-only WAL for durability. Compound key encoding, `put`, `range`,
+  `delete_range`, `txn` (compare-and-swap), `compact`, `snapshot_bytes`
+  (serialized snapshot). Uses four BTreeMaps: `kv`, `revisions`, `latest`,
+  `meta`, all behind an `RwLock`.
 - **`actor.rs`** -- `KvStoreActor` and `KvStoreActorHandle`. Rebar actor
-  wrapping KvStore with typed `KvStoreCmd` commands. All redb operations
-  use `spawn_blocking` for non-blocking I/O.
+  wrapping KvStore with typed `KvStoreCmd` commands. All KV operations
+  are in-memory and do not require `spawn_blocking`.
 - **`state_machine.rs`** -- `StateMachine` apply loop and `KvCommand` enum
   (Put/DeleteRange/Txn/Compact). Spawned via `spawn_state_machine()`, receives
   committed log entries from Raft over an mpsc channel. Applies mutations to
@@ -554,13 +556,13 @@ graph TD
     Client -->|"HTTP :2380"| HTTP["axum HTTP<br>gateway"]
     GRPC -->|"propose via RaftHandle"| Raft["RaftNode"]
     HTTP -->|"propose via RaftHandle"| Raft
-    Raft --> RDB["redb (raft.redb)"]
+    Raft --> RDB["WAL (raft.wal)"]
     Raft -->|"committed entries"| SM["StateMachine"]
     SM -->|"apply mutations"| KVA["KvStoreActorHandle"]
     SM -->|"notify"| WHA["WatchHubActorHandle"]
     SM -->|"ApplyResultBroker"| GRPC
     SM -->|"ApplyResultBroker"| HTTP
-    KVA -->|"spawn_blocking"| KVDB["redb (kv.redb)"]
+    KVA --> KVDB["BTreeMap (kv.snapshot + WAL)"]
     WHA --> W["watchers<br>(mpsc)"]
     GRPC -->|"reads"| KVA
     HTTP -->|"reads"| KVA

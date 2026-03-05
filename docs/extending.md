@@ -511,7 +511,7 @@ async fn start_test_instance() -> (SocketAddr, tempfile::TempDir) {
     };
 
     // All components are accessed through Rebar actor handles.
-    let kv_store = KvStore::open(dir.path().join("kv.redb")).expect("open KvStore");
+    let kv_store = KvStore::open(dir.path()).expect("open KvStore");
     let kv_runtime = Runtime::new(1);
     let store = spawn_kv_store_actor(&kv_runtime, kv_store).await;
 

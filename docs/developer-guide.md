@@ -75,7 +75,7 @@ By default the server listens on:
 |------------------------|------------------|------------------------------------------|
 | `--listen-client-urls` | `127.0.0.1:2379` | Address for the gRPC client listener     |
 | `--name`               | `default`        | Human-readable name for this node        |
-| `--data-dir`           | `data.barkeeper`  | Directory for redb data files            |
+| `--data-dir`           | `data.barkeeper`  | Directory for data files (WAL and snapshots) |
 | `--node-id`            | `1`              | Raft node identifier                     |
 | `--listen-peer-urls`   | `http://localhost:2380` | URL for peer traffic              |
 | `--initial-cluster`    |                  | Comma-separated cluster members (`1=http://10.0.0.1:2380,...`), or a bare hostname for DNS SRV autodiscovery |
@@ -235,7 +235,7 @@ cargo test
 
 ### Test Files
 
-The test suite contains **181 tests** across 24 test files:
+The test suite contains **200 tests** across 20 test files:
 
 | File                              | Tests | Description                                                     |
 |-----------------------------------|-------|-----------------------------------------------------------------|
@@ -300,8 +300,8 @@ barkeeper/
 |   |   |-- maintenance_service.rs # gRPC Maintenance service (Status, Defragment, Alarm, Snapshot)
 |   |
 |   |-- kv/                 # Key-value storage layer
-|   |   |-- store.rs        #   MVCC KV store backed by redb (put, range, delete, txn, compact, snapshot, changes_since)
-|   |   |-- actor.rs        #   KvStoreActor (Rebar actor wrapping KvStore with spawn_blocking)
+|   |   |-- store.rs        #   MVCC KV store backed by in-memory BTreeMap + WAL (put, range, delete, txn, compact, snapshot, changes_since)
+|   |   |-- actor.rs        #   KvStoreActor (Rebar actor wrapping KvStore, in-memory operations)
 |   |   |-- state_machine.rs#   Raft state machine (applies committed entries to KvStore on all nodes)
 |   |   |-- apply_broker.rs#   ApplyResultBroker (connects state machine results to service handlers)
 |   |
@@ -310,7 +310,7 @@ barkeeper/
 |   |   |-- node.rs         #   RaftNode actor: timers, channels, action execution, applied_index
 |   |   |-- state.rs        #   Raft state types (RaftRole, PersistentState, VolatileState, LeaderState)
 |   |   |-- messages.rs     #   Raft RPC message types (AppendEntries, RequestVote, InstallSnapshot)
-|   |   |-- log_store.rs    #   Durable Raft log backed by redb
+|   |   |-- log_store.rs    #   Durable Raft log backed by append-only WAL
 |   |   |-- transport.rs    #   RaftTransport trait + LocalTransport for in-process testing
 |   |   |-- rebar_transport.rs  # RebarTcpTransport for multi-node clusters (msgpack over Rebar TCP frames)
 |   |   |-- snapshot.rs     #   Snapshot metadata types
@@ -441,8 +441,8 @@ These conventions are implemented via custom serde serializers and
 ### MVCC compound keys
 
 The KV store uses Multi-Version Concurrency Control. Each mutation creates
-a new revision. Keys are stored in redb with compound keys that encode both
-the user key and the revision:
+a new revision. Keys are stored in in-memory BTreeMaps with compound keys
+that encode both the user key and the revision:
 
 ```
 compound_key = user_key_bytes + 0x00 + revision_as_8_byte_big_endian

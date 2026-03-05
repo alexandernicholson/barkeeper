@@ -2,7 +2,7 @@
 
 An etcd-compatible distributed key-value store built on the [Rebar](https://github.com/alexandernicholson/rebar) actor runtime.
 
-barkeeper implements the etcd v3 API surface -- both gRPC and HTTP/JSON gateway -- on top of a Raft consensus engine written from scratch as Rebar actors, with [redb](https://github.com/cberner/redb) for durable storage. No C dependencies, no cgo, single static binary.
+barkeeper implements the etcd v3 API surface -- both gRPC and HTTP/JSON gateway -- on top of a Raft consensus engine written from scratch as Rebar actors, with an in-memory BTreeMap KV store backed by an append-only WAL for durability. No C dependencies, no cgo, single static binary.
 
 ## Status
 
@@ -40,7 +40,7 @@ barkeeper implements the etcd v3 API surface -- both gRPC and HTTP/JSON gateway 
 - **DNS autodiscovery** -- Kubernetes StatefulSet support via DNS SRV resolution (bare hostname in `--initial-cluster` triggers DNS mode)
 - **NodeDrain** -- three-phase graceful shutdown protocol for safe node removal
 - **Registry** -- OR-Set CRDT for distributed process name resolution
-- **Pure Rust** -- no C dependencies; storage via redb, not boltdb
+- **Pure Rust** -- no C dependencies; in-memory BTreeMap + append-only WAL, not boltdb
 
 ## Quick Start
 
@@ -108,7 +108,7 @@ barkeeper is structured as a Rebar actor tree with supervised processes:
 graph TD
     S["BarkeepSupervisor<br>(OneForAll)"]
     S --> R["RaftProcess<br>consensus engine"]
-    S --> KSA["KvStoreActor<br>MVCC KV store (redb via spawn_blocking)"]
+    S --> KSA["KvStoreActor<br>MVCC KV store (in-memory BTreeMap + WAL)"]
     S --> WHA["WatchHubActor<br>change notification with revision replay"]
     S --> L["LeaseProcess<br>TTL management (Raft-proposed expiry)"]
     S --> CA["ClusterActor<br>membership management"]
@@ -123,7 +123,7 @@ graph TD
     API -->|"propose"| Raft["RaftNode Actor<br>(leader election, log replication)"]
     Raft -->|"msgpack over Rebar TCP frames"| Peers["Peer Nodes<br>(Rebar DistributedRuntime)"]
     Raft -->|"committed entries"| SM["StateMachine<br>(applies to KV store on all nodes)"]
-    SM --> KSA["KvStoreActor<br>(MVCC store backed by redb)"]
+    SM --> KSA["KvStoreActor<br>(MVCC store backed by in-memory BTreeMap)"]
     SM --> WHA["WatchHubActor<br>(fan-out events to watchers)"]
     SM -->|"ApplyResultBroker"| API
     API -->|"reads"| KSA
@@ -140,7 +140,7 @@ graph TD
 
 **State machine** receives committed log entries from Raft and applies them to the KV store on **all nodes** (leader and followers). This ensures consistent state across the cluster and data persistence across restarts. An `ApplyResultBroker` connects the state machine back to service handlers so leaders can return results to clients. The state machine also triggers watch notifications and manages lease key attachments.
 
-**KvStoreActor** wraps the MVCC KV store as a Rebar actor, using `spawn_blocking` for redb I/O. Implements revision-indexed storage where each mutation increments a global revision counter. Range queries can read at any historical revision. Compaction removes old revisions to reclaim space.
+**KvStoreActor** wraps the MVCC KV store as a Rebar actor. The KV store is an in-memory BTreeMap that serves as a materialized view of the append-only WAL, reconstructed from WAL replay (or snapshot) on startup. Implements revision-indexed storage where each mutation increments a global revision counter. Range queries can read at any historical revision. Compaction removes old revisions from the in-memory BTreeMaps.
 
 **WatchHubActor** delivers real-time notifications for PUT and DELETE events as a Rebar actor. Supports exact-key and prefix-based watching, streaming events to connected watchers as keys change, with revision-based history replay.
 
@@ -303,7 +303,7 @@ Byte fields (key, value) are base64-encoded in JSON, matching etcd's HTTP gatewa
 cargo test
 ```
 
-181 tests across 24 test files covering Raft consensus, log store, KV store (MVCC, transactions, compaction), etcd HTTP gateway API compatibility, watch notifications (including revision replay), lease expiry, TLS configuration, auth enforcement, multi-node clustering, multi-node data replication, SWIM membership, registry CRDT, Rebar actor handles (KvStore, WatchHub, Auth, Cluster), and gRPC transport.
+200 tests across 20 test files covering Raft consensus, log store, KV store (MVCC, transactions, compaction), etcd HTTP gateway API compatibility, watch notifications (including revision replay), lease expiry, TLS configuration, auth enforcement, multi-node clustering, multi-node data replication, SWIM membership, registry CRDT, Rebar actor handles (KvStore, WatchHub, Auth, Cluster), and gRPC transport.
 
 ## Benchmarks
 
@@ -378,4 +378,3 @@ The protobuf definitions in `proto/` are vendored from [etcd](https://github.com
 
 - [etcd](https://github.com/etcd-io/etcd) -- the protocol buffer definitions and API design that barkeeper implements
 - [Rebar](https://github.com/alexandernicholson/rebar) -- the BEAM-inspired actor runtime powering barkeeper's concurrency model
-- [redb](https://github.com/cberner/redb) -- the pure-Rust embedded database used for durable storage

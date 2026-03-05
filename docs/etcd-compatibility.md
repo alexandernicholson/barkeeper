@@ -17,7 +17,7 @@ Tested against: **etcd 3.5.17**
 | Put | Yes | `POST /v3/kv/put` | Full | Supports prev_kv, lease attachment |
 | DeleteRange | Yes | `POST /v3/kv/deleterange` | Full | Prefix deletes, prev_kv |
 | Txn | Yes | `POST /v3/kv/txn` | Full | All compare targets (Value, Version, Create, Mod, Lease) and result operators (Equal, Greater, Less, NotEqual) supported. Nested txn returns UNIMPLEMENTED. Watch notifications fire for mutations inside txns. |
-| Compact | Yes | `POST /v3/kv/compaction` | Full | Real compaction on redb via both gRPC and HTTP gateway. |
+| Compact | Yes | `POST /v3/kv/compaction` | Full | In-memory compaction (removes old revisions from BTreeMaps) via both gRPC and HTTP gateway. |
 
 ### Watch Service (`etcdserverpb.Watch`)
 
@@ -51,7 +51,7 @@ Tested against: **etcd 3.5.17**
 |-----|------|-------------|--------|-------|
 | Status | Yes | `POST /v3/maintenance/status` | Full | Reports version, dbSize, leader, raft term |
 | Alarm | Yes | `POST /v3/maintenance/alarm` | Full | GET/ACTIVATE/DEACTIVATE with in-memory AlarmMember store (NOSPACE, CORRUPT) |
-| Defragment | Yes | `POST /v3/maintenance/defragment` | Full | Triggers real redb compaction via empty write transaction commit |
+| Defragment | Yes | `POST /v3/maintenance/defragment` | Full | No-op (in-memory store has no disk fragmentation); kept for API compatibility |
 | Hash | Yes | Not exposed | Stub | Returns zero hash |
 | HashKV | Yes | Not exposed | Stub | Returns zero hash |
 | Snapshot | Yes | `POST /v3/maintenance/snapshot` | Full | Chunked 64KB streaming snapshot of the database file |
@@ -206,7 +206,7 @@ incompatibilities:
 |-------|------|-----------|
 | cluster_id / member_id | Random 64-bit IDs | Sequential |
 | Lease IDs | Random 64-bit IDs | Sequential |
-| Storage engine | bbolt | redb |
+| Storage engine | bbolt | In-memory BTreeMap + append-only WAL |
 | version | `3.5.x` | `0.1.0` |
 | Peer URLs | Separate peer port | Shares client port |
 
