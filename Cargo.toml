@@ -13,6 +13,7 @@ rebar-cluster = { git = "https://github.com/alexandernicholson/rebar.git", branc
 
 # Storage
 redb = "2"
+dashmap = "6"
 
 # gRPC
 tonic = { version = "0.12", features = ["tls"] }
