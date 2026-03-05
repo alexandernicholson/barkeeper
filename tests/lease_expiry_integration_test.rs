@@ -53,7 +53,7 @@ async fn start_instance_with_lease_expiry() -> (SocketAddr, KvStoreActorHandle, 
 
     spawn_state_machine(
         apply_rx,
-        kv_store,
+        Arc::clone(&kv_store),
         watch_hub.clone(),
         Arc::clone(&lease_manager),
         Arc::clone(&broker),
@@ -91,6 +91,7 @@ async fn start_instance_with_lease_expiry() -> (SocketAddr, KvStoreActorHandle, 
     let app = gateway::create_router(
         raft_handle.clone(),
         store.clone(),
+        Arc::clone(&kv_store),
         watch_hub.clone(),
         Arc::clone(&lease_manager),
         cluster_manager,

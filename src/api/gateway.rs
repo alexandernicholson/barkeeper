@@ -26,7 +26,7 @@ use crate::cluster::actor::ClusterActorHandle;
 use crate::kv::actor::KvStoreActorHandle;
 use crate::kv::apply_broker::{ApplyResult, ApplyResultBroker};
 use crate::kv::state_machine::KvCommand;
-use crate::kv::store::{TxnCompare, TxnCompareResult, TxnCompareTarget, TxnOp, TxnOpResponse};
+use crate::kv::store::{KvStore, TxnCompare, TxnCompareResult, TxnCompareTarget, TxnOp, TxnOpResponse};
 use crate::lease::manager::LeaseManager;
 use crate::raft::messages::ClientProposalResult;
 use crate::raft::node::RaftHandle;
@@ -67,6 +67,7 @@ fn is_empty_str(val: &str) -> bool {
 #[derive(Clone)]
 pub struct GatewayState {
     pub store: KvStoreActorHandle,
+    pub store_direct: Arc<KvStore>,
     pub watch_hub: WatchHubActorHandle,
     pub lease_manager: Arc<LeaseManager>,
     pub cluster_manager: ClusterActorHandle,
@@ -496,6 +497,7 @@ async fn auth_middleware(
 pub fn create_router(
     raft_handle: RaftHandle,
     store: KvStoreActorHandle,
+    store_direct: Arc<KvStore>,
     watch_hub: WatchHubActorHandle,
     lease_manager: Arc<LeaseManager>,
     cluster_manager: ClusterActorHandle,
@@ -508,6 +510,7 @@ pub fn create_router(
 ) -> Router {
     let state = GatewayState {
         store,
+        store_direct,
         watch_hub,
         lease_manager,
         cluster_manager,
@@ -576,9 +579,20 @@ async fn handle_range(
     let limit = req.limit.unwrap_or(0);
     let revision = req.revision.unwrap_or(0);
 
-    match state.store.range(key, range_end, limit, revision).await {
+    // Bypass the actor channel — run the range query directly on the
+    // blocking thread pool.  redb supports concurrent read transactions
+    // so multiple reads execute in parallel without serialising through
+    // the single-threaded actor.
+    let store = Arc::clone(&state.store_direct);
+    let result = tokio::task::spawn_blocking(move || {
+        store.range(&key, &range_end, limit, revision)
+    })
+    .await
+    .expect("range spawn_blocking");
+
+    match result {
         Ok(result) => {
-            let rev = state.store.current_revision().await.unwrap_or(0);
+            let rev = state.store_direct.current_revision().unwrap_or(0);
             let kvs: Vec<JsonKeyValue> = result.kvs.iter().map(proto_kv_to_json).collect();
             axum::Json(RangeResponse {
                 header: state.make_header(rev),

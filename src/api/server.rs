@@ -401,6 +401,7 @@ impl BarkeepServer {
         let http_app = gateway::create_router(
             raft_handle,
             store.clone(),
+            Arc::clone(&kv_store),
             watch_hub.clone(),
             Arc::clone(&lease_manager),
             cluster_manager,

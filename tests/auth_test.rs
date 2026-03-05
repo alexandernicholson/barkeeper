@@ -64,7 +64,7 @@ async fn start_test_instance() -> (SocketAddr, tempfile::TempDir) {
 
     spawn_state_machine(
         apply_rx,
-        kv_store,
+        Arc::clone(&kv_store),
         watch_hub.clone(),
         Arc::clone(&lease_manager),
         Arc::clone(&broker),
@@ -73,6 +73,7 @@ async fn start_test_instance() -> (SocketAddr, tempfile::TempDir) {
     let app = gateway::create_router(
         raft_handle.clone(),
         store.clone(),
+        Arc::clone(&kv_store),
         watch_hub.clone(),
         Arc::clone(&lease_manager),
         cluster_manager,
