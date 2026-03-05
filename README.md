@@ -311,13 +311,13 @@ Single-node, native on tmpfs. Load via [oha](https://github.com/hatoo/oha) again
 
 | Scenario | Barkeeper | etcd | Ratio |
 |---|---|---|---|
-| Write c=1 | 2,319 req/s | 2,340 req/s | **0.99x** |
-| Write c=100 | 4,351 req/s | 16,210 req/s | 0.27x |
-| Read c=100 | 32,583 req/s | 16,149 req/s | **2.02x** |
-| Read P99 | 6.77ms | 14.39ms | **2.1x faster** |
-| Mixed read (c=80) | 19,913 req/s | 11,207 req/s | **1.78x** |
-| Mixed write (c=20) | 2,377 req/s | 3,538 req/s | 0.67x |
-| Conn scaling c=1000 | 27,181 req/s | 16,959 req/s | **1.60x** |
+| Write c=1 | 3,599 req/s | 2,340 req/s | **1.54x** |
+| Write c=100 | 4,713 req/s | 16,210 req/s | 0.29x |
+| Read c=100 | 32,596 req/s | 16,149 req/s | **2.02x** |
+| Read P99 | 6.63ms | 14.39ms | **2.2x faster** |
+| Mixed read (c=80) | 21,774 req/s | 11,207 req/s | **1.94x** |
+| Mixed write (c=20) | 2,371 req/s | 3,538 req/s | 0.67x |
+| Conn scaling c=1000 | 26,248 req/s | 16,959 req/s | **1.55x** |
 
 Full results: [`bench/results/RESULTS.md`](bench/results/RESULTS.md)
 
