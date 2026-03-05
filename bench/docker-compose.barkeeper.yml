@@ -1,0 +1,23 @@
+services:
+  barkeeper:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    command:
+      - --listen-client-urls=0.0.0.0:2379
+      - --data-dir=/data
+    ports:
+      - "2379:2379"
+      - "2380:2380"
+    tmpfs:
+      - /data
+    deploy:
+      resources:
+        limits:
+          cpus: "2"
+          memory: 512M
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "-X", "POST", "http://localhost:2380/v3/maintenance/status", "-d", "{}"]
+      interval: 2s
+      timeout: 5s
+      retries: 30

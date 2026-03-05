@@ -1,0 +1,127 @@
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: barkeeper
+  namespace: default
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector:
+    app: barkeeper
+  ports:
+    - name: client
+      port: 2379
+      targetPort: 2379
+    - name: http
+      port: 2380
+      targetPort: 2380
+    - name: peer
+      port: 2381
+      targetPort: 2381
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: barkeeper-client
+  namespace: default
+spec:
+  type: NodePort
+  selector:
+    app: barkeeper
+  ports:
+    - name: client
+      port: 2379
+      targetPort: 2379
+      nodePort: 30379
+    - name: http
+      port: 2380
+      targetPort: 2380
+      nodePort: 30380
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: barkeeper
+  namespace: default
+spec:
+  serviceName: barkeeper
+  replicas: 3
+  podManagementPolicy: Parallel
+  selector:
+    matchLabels:
+      app: barkeeper
+  template:
+    metadata:
+      labels:
+        app: barkeeper
+    spec:
+      terminationGracePeriodSeconds: 10
+      containers:
+        - name: barkeeper
+          image: barkeeper:local
+          imagePullPolicy: Never
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              ORDINAL=$(echo $POD_NAME | rev | cut -d'-' -f1 | rev)
+              NODE_ID=$((ORDINAL + 1))
+
+              exec barkeeper \
+                --name=$POD_NAME \
+                --node-id=$NODE_ID \
+                --listen-client-urls=0.0.0.0:2379 \
+                --listen-peer-urls=http://0.0.0.0:2381 \
+                --initial-cluster="1=http://barkeeper-0.barkeeper.default.svc.cluster.local:2381,2=http://barkeeper-1.barkeeper.default.svc.cluster.local:2381,3=http://barkeeper-2.barkeeper.default.svc.cluster.local:2381" \
+                --initial-cluster-state=new \
+                --data-dir=/data
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: RUST_LOG
+              value: "info,barkeeper::api::server=debug"
+          ports:
+            - containerPort: 2379
+              name: client
+            - containerPort: 2380
+              name: http
+            - containerPort: 2381
+              name: peer
+          readinessProbe:
+            exec:
+              command:
+                - /bin/sh
+                - -c
+                - "curl -sf http://localhost:2380/v3/maintenance/status -d '{}' > /dev/null"
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            timeoutSeconds: 3
+          livenessProbe:
+            exec:
+              command:
+                - /bin/sh
+                - -c
+                - "curl -sf http://localhost:2380/v3/maintenance/status -d '{}' > /dev/null"
+            initialDelaySeconds: 60
+            periodSeconds: 10
+            timeoutSeconds: 3
+          resources:
+            requests:
+              memory: "128Mi"
+              cpu: "100m"
+            limits:
+              memory: "512Mi"
+              cpu: "1"
+          volumeMounts:
+            - name: data
+              mountPath: /data
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: [ReadWriteOnce]
+        resources:
+          requests:
+            storage: 1Gi

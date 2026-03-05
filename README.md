@@ -14,7 +14,8 @@ barkeeper implements the etcd v3 API surface -- both gRPC and HTTP/JSON gateway 
 | TLS | Auto-TLS and manual certificate support |
 | Auth Enforcement | HTTP middleware + gRPC interceptor (bcrypt passwords) |
 | Watch Notifications | Working, with revision-based replay |
-| Lease Expiry | Raft-proposed expiry (consistent across nodes) |
+| Lease Expiry | TTL-based expiry with key cleanup on revoke |
+| Data Persistence | All nodes apply via state machine; survives restarts |
 | Actor Runtime | Rebar |
 
 ## Features
@@ -119,11 +120,13 @@ graph TD
 ```mermaid
 graph TD
     Client["Client Request"] --> API["gRPC Service / HTTP Gateway"]
-    API --> Raft["RaftNode Actor<br>(leader election, log replication)"]
+    API -->|"propose"| Raft["RaftNode Actor<br>(leader election, log replication)"]
     Raft -->|"msgpack over Rebar TCP frames"| Peers["Peer Nodes<br>(Rebar DistributedRuntime)"]
-    Raft --> SM["StateMachine<br>(logs committed entries)"]
-    API --> KSA["KvStoreActor<br>(MVCC store backed by redb)"]
-    API --> WHA["WatchHubActor<br>(fan-out events to watchers)"]
+    Raft -->|"committed entries"| SM["StateMachine<br>(applies to KV store on all nodes)"]
+    SM --> KSA["KvStoreActor<br>(MVCC store backed by redb)"]
+    SM --> WHA["WatchHubActor<br>(fan-out events to watchers)"]
+    SM -->|"ApplyResultBroker"| API
+    API -->|"reads"| KSA
     SWIM["SWIM Protocol"] -->|"membership events"| Raft
 ```
 
@@ -135,7 +138,7 @@ graph TD
 
 **Rebar DistributedRuntime** -- inter-node Raft messages travel over TCP using Rebar frames with msgpack serialization, replacing the previous gRPC transport layer. The `Registry` actor provides an OR-Set CRDT for distributed process name resolution across the cluster.
 
-**State machine** receives committed log entries from Raft and logs them for observability. Actual KV mutations are applied at the service layer after Raft commit.
+**State machine** receives committed log entries from Raft and applies them to the KV store on **all nodes** (leader and followers). This ensures consistent state across the cluster and data persistence across restarts. An `ApplyResultBroker` connects the state machine back to service handlers so leaders can return results to clients. The state machine also triggers watch notifications and manages lease key attachments.
 
 **KvStoreActor** wraps the MVCC KV store as a Rebar actor, using `spawn_blocking` for redb I/O. Implements revision-indexed storage where each mutation increments a global revision counter. Range queries can read at any historical revision. Compaction removes old revisions to reclaim space.
 
@@ -301,6 +304,17 @@ cargo test
 ```
 
 181 tests across 24 test files covering Raft consensus, log store, KV store (MVCC, transactions, compaction), etcd HTTP gateway API compatibility, watch notifications (including revision replay), lease expiry, TLS configuration, auth enforcement, multi-node clustering, multi-node data replication, SWIM membership, registry CRDT, Rebar actor handles (KvStore, WatchHub, Auth, Cluster), and gRPC transport.
+
+## Benchmarks
+
+```bash
+# Requires Docker and oha (https://github.com/hatoo/oha)
+bench/harness/run.sh all
+```
+
+Runs barkeeper and etcd in identical Docker containers (2 CPU, 512MB RAM) and
+compares write throughput, read throughput, mixed workload, large values, and
+connection scaling. Results are written to `bench/results/RESULTS.md`.
 
 ## Differences from etcd
 

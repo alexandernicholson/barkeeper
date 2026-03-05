@@ -147,7 +147,7 @@ impl Maintenance for MaintenanceService {
             header: self.make_header().await,
             version: env!("CARGO_PKG_VERSION").to_string(),
             db_size,
-            leader: self.member_id,
+            leader: self.raft_handle.leader_id(),
             raft_index: 0,
             raft_term: self.raft_term.load(Ordering::Relaxed),
             raft_applied_index: self.raft_handle.applied_index(),

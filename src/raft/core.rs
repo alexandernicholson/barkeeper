@@ -471,11 +471,11 @@ impl RaftCore {
                 .cloned()
                 .collect();
             self.pending_proposals.retain(|(_, idx)| *idx > new_commit);
-            for (id, _) in committed {
+            for (id, entry_index) in committed {
                 actions.push(Action::RespondToProposal {
                     id,
                     result: ClientProposalResult::Success {
-                        index: new_commit,
+                        index: entry_index,
                         revision: 0,
                     },
                 });

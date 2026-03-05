@@ -114,8 +114,15 @@ impl MyServiceTrait for MyService {
 ```
 
 Key conventions:
-- The service struct holds `Arc` references to shared state (store, watch hub,
-  lease manager, etc.) plus `cluster_id`, `member_id`, and `raft_term`.
+- The service struct holds `Arc` references to shared state (store, lease
+  manager, `ApplyResultBroker`, etc.) plus `cluster_id`, `member_id`, and
+  `raft_term`.
+- **Write operations** (mutations) must go through Raft: serialize a `KvCommand`,
+  call `raft_handle.propose(data)`, then wait for the result via
+  `broker.wait_for_result(index)`. The state machine applies the mutation to
+  the KV store and sends the result back through the broker.
+- **Read operations** (queries) can read directly from the KV store via
+  `store.range(...)` without going through Raft.
 - `make_header()` produces a `ResponseHeader` with the current Raft term.
 - Errors are returned as `tonic::Status` (e.g., `Status::internal(...)`).
 
@@ -622,24 +629,20 @@ When writing assertions, keep these proto3 rules in mind:
 - **Byte fields are base64**: `key`, `value`, and `keys` (in lease TTL
   responses) are base64-encoded strings.
 
-### Benchmarking against real etcd
+### Performance benchmarking
 
-The `benchmark/` directory contains scripts for capturing reference output
-from a real etcd instance and comparing it with barkeeper:
+The `bench/` directory contains a performance benchmark harness comparing
+barkeeper against etcd using [oha](https://github.com/hatoo/oha):
 
-- `benchmark/run_etcd_benchmark.sh` -- Starts a single-node etcd and runs
-  all API operations, saving JSON output to `benchmark/results/etcd/`.
-- `benchmark/run_barkeeper_benchmark.sh` -- Runs the same operations against
-  a barkeeper instance, saving to `benchmark/results/barkeeper/`.
-- `benchmark/compare.sh` -- Diffs the results side by side.
+- `bench/harness/run.sh` -- Main entry point. Runs Docker containers and
+  oha load tests against the HTTP/JSON gateway.
+- `bench/harness/report.py` -- Parses oha JSON output into markdown
+  comparison tables and CSV.
+- `bench/docker-compose.barkeeper.yml` / `bench/docker-compose.etcd.yml` --
+  Single-node container configs with matching resource limits (2 CPU, 512MB).
 
-To add a new benchmark case:
-
-1. Add the `curl` command to both `run_etcd_benchmark.sh` and
-   `run_barkeeper_benchmark.sh`.
-2. Save output to matching filenames under `results/etcd/` and
-   `results/barkeeper/`.
-3. Run `benchmark/compare.sh` to verify parity.
+To add a new benchmark scenario, add the oha command to `run.sh` and a
+corresponding table section to `report.py`.
 
 ### Running tests
 

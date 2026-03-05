@@ -101,6 +101,20 @@ pub async fn spawn_kv_store_actor(runtime: &Runtime, store: KvStore) -> KvStoreA
                             }).await.expect("kv store spawn_blocking panicked");
                             let _ = reply.send(result);
                         }
+                        KvStoreCmd::LastAppliedRaftIndex { reply } => {
+                            let s = Arc::clone(&store);
+                            let result = tokio::task::spawn_blocking(move || {
+                                s.last_applied_raft_index().map_err(|e| e.to_string())
+                            }).await.expect("kv store spawn_blocking panicked");
+                            let _ = reply.send(result);
+                        }
+                        KvStoreCmd::SetLastAppliedRaftIndex { index, reply } => {
+                            let s = Arc::clone(&store);
+                            let result = tokio::task::spawn_blocking(move || {
+                                s.set_last_applied_raft_index(index).map_err(|e| e.to_string())
+                            }).await.expect("kv store spawn_blocking panicked");
+                            let _ = reply.send(result);
+                        }
                     }
                 }
                 // Also listen on Rebar mailbox for future distributed messages.
@@ -266,6 +280,26 @@ impl KvStoreActorHandle {
         let (reply, rx) = oneshot::channel();
         self.cmd_tx
             .send(KvStoreCmd::CompactDb { reply })
+            .await
+            .expect("kv store actor dead");
+        rx.await.expect("kv store actor dropped")
+    }
+
+    /// Get the last applied Raft log index.
+    pub async fn last_applied_raft_index(&self) -> Result<u64, String> {
+        let (reply, rx) = oneshot::channel();
+        self.cmd_tx
+            .send(KvStoreCmd::LastAppliedRaftIndex { reply })
+            .await
+            .expect("kv store actor dead");
+        rx.await.expect("kv store actor dropped")
+    }
+
+    /// Set the last applied Raft log index.
+    pub async fn set_last_applied_raft_index(&self, index: u64) -> Result<(), String> {
+        let (reply, rx) = oneshot::channel();
+        self.cmd_tx
+            .send(KvStoreCmd::SetLastAppliedRaftIndex { index, reply })
             .await
             .expect("kv store actor dead");
         rx.await.expect("kv store actor dropped")

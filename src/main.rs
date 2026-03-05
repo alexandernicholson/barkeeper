@@ -90,8 +90,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     // Parse cluster configuration using the discovery module.
+    // Uses async resolution to support DNS hostnames in --initial-cluster.
     let cluster_config = if let Some(ref raw) = cli.initial_cluster {
-        let (mode, peers) = discovery::parse_initial_cluster(raw, None, 2380)?;
+        let (mode, peers) = discovery::parse_initial_cluster_async(raw, None, 2380).await?;
         let peer_ids: Vec<u64> = peers.keys().filter(|id| **id != cli.node_id).copied().collect();
 
         let listen_peer_addr: SocketAddr = cli.listen_peer_urls
@@ -99,6 +100,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .trim_start_matches("https://")
             .parse()
             .expect("invalid --listen-peer-urls address");
+
+        // Auto-detect cluster state: if data-dir has existing Raft log,
+        // treat as "existing" regardless of --initial-cluster-state.
+        let effective_state = if cli.initial_cluster_state == "new"
+            && std::path::Path::new(&cli.data_dir).join("raft.redb").exists()
+        {
+            tracing::info!("detected existing data in {}, using initial-cluster-state=existing", cli.data_dir);
+            "existing".to_string()
+        } else {
+            cli.initial_cluster_state
+        };
 
         tracing::info!(
             node_id = cli.node_id,
@@ -120,7 +132,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 peers,
                 listen_peer_addr: Some(listen_peer_addr),
                 raw_initial_cluster: Some(raw.clone()),
-                initial_cluster_state: cli.initial_cluster_state,
+                initial_cluster_state: effective_state,
             },
         )
     } else {

@@ -302,7 +302,8 @@ barkeeper/
 |   |-- kv/                 # Key-value storage layer
 |   |   |-- store.rs        #   MVCC KV store backed by redb (put, range, delete, txn, compact, snapshot, changes_since)
 |   |   |-- actor.rs        #   KvStoreActor (Rebar actor wrapping KvStore with spawn_blocking)
-|   |   |-- state_machine.rs#   Raft state machine (logs committed entries for observability)
+|   |   |-- state_machine.rs#   Raft state machine (applies committed entries to KvStore on all nodes)
+|   |   |-- apply_broker.rs#   ApplyResultBroker (connects state machine results to service handlers)
 |   |
 |   |-- raft/               # Raft consensus implementation
 |   |   |-- core.rs         #   Pure state machine: Event -> Vec<Action> (no I/O)
@@ -338,13 +339,13 @@ barkeeper/
 |
 |-- tests/                  # Integration and unit test files (see table above)
 |
-|-- benchmark/              # Performance benchmarking scripts and results
-|   |-- run_barkeeper_benchmark.sh
-|   |-- run_etcd_benchmark.sh
-|   |-- run_perf_benchmark.sh  # HTTP throughput/latency benchmarks
-|   |-- compare.sh
-|   |-- results/
-|   |-- RESULTS.md
+|-- bench/                  # Performance benchmark (barkeeper vs etcd)
+|   |-- harness/
+|   |   |-- run.sh          #   Entry point: Docker + oha load tests
+|   |   |-- report.py       #   Parse oha JSON → markdown tables + CSV
+|   |-- docker-compose.barkeeper.yml
+|   |-- docker-compose.etcd.yml
+|   |-- results/            #   oha JSON output (gitignored except .gitkeep)
 |
 |-- benches/                # Criterion microbenchmarks
     |-- kv_bench.rs         # KvStore benchmarks (put, range, txn)

@@ -231,6 +231,31 @@ impl KvStore {
         }
     }
 
+    /// Get the last applied Raft log index (persisted in meta table).
+    pub fn last_applied_raft_index(&self) -> Result<u64, redb::Error> {
+        let txn = self.db.begin_read()?;
+        let table = txn.open_table(META_TABLE)?;
+        match table.get("raft_applied_index")? {
+            Some(val) => {
+                let idx: u64 = serde_json::from_slice(val.value()).expect("deserialize raft index");
+                Ok(idx)
+            }
+            None => Ok(0),
+        }
+    }
+
+    /// Set the last applied Raft log index (persisted in meta table).
+    pub fn set_last_applied_raft_index(&self, index: u64) -> Result<(), redb::Error> {
+        let txn = self.db.begin_write()?;
+        {
+            let mut table = txn.open_table(META_TABLE)?;
+            let val = serde_json::to_vec(&index).expect("serialize raft index");
+            table.insert("raft_applied_index", val.as_slice())?;
+        }
+        txn.commit()?;
+        Ok(())
+    }
+
     /// Put a key-value pair into the store. Returns the new revision and the
     /// previous value (if any).
     pub fn put(

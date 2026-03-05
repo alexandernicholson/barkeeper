@@ -57,9 +57,9 @@ impl LeaseManager {
         lease_id
     }
 
-    /// Revoke a lease. Returns true if the lease existed and was removed.
-    pub async fn revoke(&self, id: i64) -> bool {
-        self.leases.lock().await.remove(&id).is_some()
+    /// Revoke a lease. Returns the attached keys if the lease existed, or None.
+    pub async fn revoke(&self, id: i64) -> Option<Vec<Vec<u8>>> {
+        self.leases.lock().await.remove(&id).map(|entry| entry.keys)
     }
 
     /// Keep a lease alive by resetting its grant time. Returns the remaining

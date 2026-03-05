@@ -167,12 +167,20 @@ Watch is implemented as a gRPC bidirectional stream on the `Watch` RPC.
   non-zero lease, the key is attached automatically. The expiry loop uses
   the returned key list to delete keys from the KV store.
 
-- **Revoke** immediately removes the lease. Revoking a nonexistent lease
+- **Revoke** immediately removes the lease and deletes all attached keys
+  from the KV store (matching etcd behavior). Revoking a nonexistent lease
   returns `NOT_FOUND`.
 
 ---
 
 ## Known Differences and Limitations
+
+### Data persistence and replication
+
+All KV mutations are applied by the state machine on **every node** in the
+cluster (leader and followers), matching etcd's behavior. Data persists
+across pod restarts and full cluster restarts. The state machine tracks
+`last_applied_raft_index` to prevent double-application on restart.
 
 ### Nested transactions
 
@@ -225,29 +233,26 @@ instance-specific values.
   lease list. The 2 instance-specific tests (member_list,
   maintenance_status) pass structurally but contain different IDs/versions.
 
-Full results are in `benchmark/RESULTS.md`.
-
 ---
 
-## Running the Benchmark Yourself
+## Performance Benchmark
 
-The benchmark suite runs both etcd and barkeeper through the same set of
-operations and compares their output.
+The `bench/` directory contains a performance benchmark harness that
+compares barkeeper against etcd using [oha](https://github.com/hatoo/oha).
 
 ```bash
-cd benchmark
+# Run against both barkeeper and etcd (requires Docker and oha)
+bench/harness/run.sh all
 
-# Run against a real etcd instance (requires etcd + etcdctl on PATH)
-./run_etcd_benchmark.sh
+# Run against barkeeper only
+bench/harness/run.sh barkeeper
 
-# Run against barkeeper (requires target/release/barkeeper)
-./run_barkeeper_benchmark.sh
-
-# Compare the two result sets
-./compare.sh
+# Run against etcd only
+bench/harness/run.sh etcd
 ```
 
-Results are written to `benchmark/results/etcd/` and
-`benchmark/results/barkeeper/`. The compare script normalizes
-instance-specific values (cluster_id, member_id, revision, raft_term,
-lease IDs) before diffing.
+Scenarios: write throughput ramp, read throughput, mixed workload
+(80/20 read/write), large values (64KB), and connection scaling.
+
+Results are written to `bench/results/RESULTS.md` with comparison
+tables and `bench/results/results.csv` for further analysis.

@@ -24,6 +24,7 @@ use crate::auth::actor::AuthActorHandle;
 use crate::proto::etcdserverpb::{alarm_request::AlarmAction, AlarmMember, AlarmType};
 use crate::cluster::actor::ClusterActorHandle;
 use crate::kv::actor::KvStoreActorHandle;
+use crate::kv::apply_broker::{ApplyResult, ApplyResultBroker};
 use crate::kv::state_machine::KvCommand;
 use crate::kv::store::{TxnCompare, TxnCompareResult, TxnCompareTarget, TxnOp, TxnOpResponse};
 use crate::lease::manager::LeaseManager;
@@ -75,6 +76,7 @@ pub struct GatewayState {
     pub raft_term: Arc<AtomicU64>,
     pub raft_handle: RaftHandle,
     pub alarms: Arc<Mutex<Vec<AlarmMember>>>,
+    pub broker: Arc<ApplyResultBroker>,
 }
 
 // ── JSON request / response types ───────────────────────────────────────────
@@ -502,6 +504,7 @@ pub fn create_router(
     raft_term: Arc<AtomicU64>,
     auth_manager: AuthActorHandle,
     alarms: Arc<Mutex<Vec<AlarmMember>>>,
+    broker: Arc<ApplyResultBroker>,
 ) -> Router {
     let state = GatewayState {
         store,
@@ -514,6 +517,7 @@ pub fn create_router(
         raft_term,
         raft_handle,
         alarms,
+        broker,
     };
 
     Router::new()
@@ -615,44 +619,24 @@ async fn handle_put(
     };
 
     match proposal_result {
-        ClientProposalResult::Success { .. } => {
-            match state.store.put(key.clone(), value.clone(), lease_id).await {
-                Ok(result) => {
-                    // Notify watchers of the put event.
-                    let (create_rev, ver) = match &result.prev_kv {
-                        Some(prev) => (prev.create_revision, prev.version + 1),
-                        None => (result.revision, 1),
-                    };
-                    let notify_kv = crate::proto::mvccpb::KeyValue {
-                        key: key.clone(),
-                        create_revision: create_rev,
-                        mod_revision: result.revision,
-                        version: ver,
-                        value: value.clone(),
-                        lease: lease_id,
-                    };
-                    state.watch_hub.notify(key.clone(), 0, notify_kv, result.prev_kv.clone()).await;
-
-                    // Attach the key to its lease so the expiry timer can clean it up.
-                    if lease_id != 0 {
-                        state.lease_manager.attach_key(lease_id, key.clone()).await;
-                    }
-
+        ClientProposalResult::Success { index, .. } => {
+            // Wait for the state machine to apply this entry.
+            let result = state.broker.wait_for_result(index).await;
+            match result {
+                ApplyResult::Put(put_result) => {
                     let prev_kv = if req.prev_kv.unwrap_or(false) {
-                        result.prev_kv.as_ref().map(proto_kv_to_json)
+                        put_result.prev_kv.as_ref().map(proto_kv_to_json)
                     } else {
                         None
                     };
 
                     axum::Json(PutResponse {
-                        header: state.make_header(result.revision),
+                        header: state.make_header(put_result.revision),
                         prev_kv,
                     })
                     .into_response()
                 }
-                Err(e) => {
-                    json_error(StatusCode::INTERNAL_SERVER_ERROR, format!("put: {}", e)).into_response()
-                }
+                _ => json_error(StatusCode::INTERNAL_SERVER_ERROR, "unexpected apply result").into_response(),
             }
         }
         ClientProposalResult::NotLeader { .. } => {
@@ -688,40 +672,25 @@ async fn handle_delete_range(
     };
 
     match proposal_result {
-        ClientProposalResult::Success { .. } => {
-            match state.store.delete_range(key.clone(), range_end.clone()).await {
-                Ok(result) => {
-                    // Notify watchers for each deleted key.
-                    for prev in &result.prev_kvs {
-                        let tombstone = crate::proto::mvccpb::KeyValue {
-                            key: prev.key.clone(),
-                            create_revision: 0,
-                            mod_revision: result.revision,
-                            version: 0,
-                            value: vec![],
-                            lease: 0,
-                        };
-                        state.watch_hub.notify(prev.key.clone(), 1, tombstone, Some(prev.clone())).await;
-                    }
-
+        ClientProposalResult::Success { index, .. } => {
+            // Wait for the state machine to apply this entry.
+            let result = state.broker.wait_for_result(index).await;
+            match result {
+                ApplyResult::DeleteRange(del_result) => {
                     let prev_kvs = if req.prev_kv.unwrap_or(false) {
-                        result.prev_kvs.iter().map(proto_kv_to_json).collect()
+                        del_result.prev_kvs.iter().map(proto_kv_to_json).collect()
                     } else {
                         vec![]
                     };
 
                     axum::Json(DeleteRangeResponse {
-                        header: state.make_header(result.revision),
-                        deleted: result.deleted,
+                        header: state.make_header(del_result.revision),
+                        deleted: del_result.deleted,
                         prev_kvs,
                     })
                     .into_response()
                 }
-                Err(e) => json_error(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("delete: {}", e),
-                )
-                .into_response(),
+                _ => json_error(StatusCode::INTERNAL_SERVER_ERROR, "unexpected apply result").into_response(),
             }
         }
         ClientProposalResult::NotLeader { .. } => {
@@ -827,48 +796,11 @@ async fn handle_txn(
     };
 
     match proposal_result {
-        ClientProposalResult::Success { .. } => {
-            let success_clone = success.clone();
-            let failure_clone = failure.clone();
-
-            match state.store.txn(compares, success, failure).await {
-                Ok(result) => {
-                    // Notify watchers for txn mutations.
-                    let executed_ops = if result.succeeded { &success_clone } else { &failure_clone };
-                    for (op, resp) in executed_ops.iter().zip(result.responses.iter()) {
-                        match (op, resp) {
-                            (TxnOp::Put { key, value, lease_id }, TxnOpResponse::Put(r)) => {
-                                let (create_rev, ver) = match &r.prev_kv {
-                                    Some(prev) => (prev.create_revision, prev.version + 1),
-                                    None => (r.revision, 1),
-                                };
-                                let notify_kv = crate::proto::mvccpb::KeyValue {
-                                    key: key.clone(),
-                                    create_revision: create_rev,
-                                    mod_revision: r.revision,
-                                    version: ver,
-                                    value: value.clone(),
-                                    lease: *lease_id,
-                                };
-                                state.watch_hub.notify(key.clone(), 0, notify_kv, r.prev_kv.clone()).await;
-                            }
-                            (TxnOp::DeleteRange { .. }, TxnOpResponse::DeleteRange(r)) => {
-                                for prev in &r.prev_kvs {
-                                    let tombstone = crate::proto::mvccpb::KeyValue {
-                                        key: prev.key.clone(),
-                                        create_revision: 0,
-                                        mod_revision: r.revision,
-                                        version: 0,
-                                        value: vec![],
-                                        lease: 0,
-                                    };
-                                    state.watch_hub.notify(prev.key.clone(), 1, tombstone, Some(prev.clone())).await;
-                                }
-                            }
-                            _ => {} // Range ops don't need notifications
-                        }
-                    }
-
+        ClientProposalResult::Success { index, .. } => {
+            // Wait for the state machine to apply this entry.
+            let apply_result = state.broker.wait_for_result(index).await;
+            match apply_result {
+                ApplyResult::Txn(result) => {
                     let responses: Vec<TxnResponseOp> = result
                         .responses
                         .into_iter()
@@ -889,7 +821,7 @@ async fn handle_txn(
                                     header: TxnInnerHeader {
                                         revision: r.revision,
                                     },
-                                    prev_kv: None, // prev_kv only when explicitly requested
+                                    prev_kv: None,
                                 }),
                                 response_delete_range: None,
                             },
@@ -912,9 +844,7 @@ async fn handle_txn(
                     })
                     .into_response()
                 }
-                Err(e) => {
-                    json_error(StatusCode::INTERNAL_SERVER_ERROR, format!("txn: {}", e)).into_response()
-                }
+                _ => json_error(StatusCode::INTERNAL_SERVER_ERROR, "unexpected apply result").into_response(),
             }
         }
         ClientProposalResult::NotLeader { .. } => {
@@ -950,21 +880,17 @@ async fn handle_compaction(
     };
 
     match proposal_result {
-        ClientProposalResult::Success { .. } => {
-            match state.store.compact(revision).await {
-                Ok(()) => {
-                    let rev = state.store.current_revision().await.unwrap_or(0);
-                    axum::Json(CompactionResponse {
-                        header: state.make_header(rev),
-                    })
-                    .into_response()
-                }
-                Err(e) => json_error(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("compact: {}", e),
-                )
-                .into_response(),
-            }
+        ClientProposalResult::Success { index, .. } => {
+            // Wait for the state machine to apply this entry.
+            let result = state.broker.wait_for_result(index).await;
+            let rev = match result {
+                ApplyResult::Compact { revision } => revision,
+                _ => state.store.current_revision().await.unwrap_or(0),
+            };
+            axum::Json(CompactionResponse {
+                header: state.make_header(rev),
+            })
+            .into_response()
         }
         ClientProposalResult::NotLeader { .. } => {
             json_error(StatusCode::SERVICE_UNAVAILABLE, "not leader").into_response()
@@ -1000,13 +926,20 @@ async fn handle_lease_revoke(
 ) -> impl IntoResponse {
     let req: LeaseRevokeRequest = parse_json(&body);
     let id = req.id.unwrap_or(0);
-    let existed = state.lease_manager.revoke(id).await;
-    if !existed {
-        return json_error(
-            StatusCode::NOT_FOUND,
-            format!("lease {} not found", id),
-        )
-        .into_response();
+    let keys = match state.lease_manager.revoke(id).await {
+        Some(keys) => keys,
+        None => {
+            return json_error(
+                StatusCode::NOT_FOUND,
+                format!("lease {} not found", id),
+            )
+            .into_response();
+        }
+    };
+
+    // Delete all keys attached to the revoked lease.
+    for key in keys {
+        let _ = state.store.delete_range(key, vec![]).await;
     }
 
     axum::Json(LeaseRevokeResponse {
@@ -1098,7 +1031,7 @@ async fn handle_maintenance_status(
         header: state.make_header(rev),
         version: env!("CARGO_PKG_VERSION").to_string(),
         db_size,
-        leader: state.member_id,
+        leader: state.raft_handle.leader_id(),
         raft_index: 0,
         raft_term: state.raft_term.load(Ordering::Relaxed),
         raft_applied_index: state.raft_handle.applied_index(),
@@ -1446,12 +1379,37 @@ struct AuthRoleGrantPermissionReq {
 
 #[derive(Debug, Deserialize, Default)]
 struct JsonPermissionReq {
-    #[serde(rename = "permType", default)]
+    #[serde(rename = "permType", default, deserialize_with = "deserialize_perm_type")]
     perm_type: i32,
     #[serde(default)]
     key: String,
     #[serde(default)]
     range_end: String,
+}
+
+/// Deserialize perm_type from either a numeric value or a string enum name.
+/// etcd's grpc-gateway accepts both: 0/1/2 or "READ"/"WRITE"/"READWRITE".
+fn deserialize_perm_type<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<i32, D::Error> {
+    use serde::de;
+
+    struct PermTypeVisitor;
+    impl<'de> de::Visitor<'de> for PermTypeVisitor {
+        type Value = i32;
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            f.write_str("an integer or permission string (READ, WRITE, READWRITE)")
+        }
+        fn visit_i64<E: de::Error>(self, v: i64) -> Result<i32, E> { Ok(v as i32) }
+        fn visit_u64<E: de::Error>(self, v: u64) -> Result<i32, E> { Ok(v as i32) }
+        fn visit_str<E: de::Error>(self, v: &str) -> Result<i32, E> {
+            match v {
+                "READ" => Ok(0),
+                "WRITE" => Ok(1),
+                "READWRITE" => Ok(2),
+                other => other.parse::<i32>().map_err(|_| de::Error::unknown_variant(other, &["READ", "WRITE", "READWRITE"])),
+            }
+        }
+    }
+    deserializer.deserialize_any(PermTypeVisitor)
 }
 
 #[derive(Debug, Serialize)]

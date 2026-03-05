@@ -248,4 +248,13 @@ pub enum KvStoreCmd {
     CompactDb {
         reply: oneshot::Sender<Result<bool, String>>,
     },
+    /// Get the last applied Raft log index.
+    LastAppliedRaftIndex {
+        reply: oneshot::Sender<Result<u64, String>>,
+    },
+    /// Set the last applied Raft log index.
+    SetLastAppliedRaftIndex {
+        index: u64,
+        reply: oneshot::Sender<Result<(), String>>,
+    },
 }

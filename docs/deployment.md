@@ -138,7 +138,8 @@ graph TD
         L -->|"AppendEntries"| F2["Follower 2"]
         F1 -->|"ACK"| L
         F2 -->|"ACK"| L
-        L -->|"commit (quorum reached)"| KV["KvStore.put()"]
+        L -->|"commit (quorum reached)"| SM["StateMachine<br>(on all nodes)"]
+        SM --> KV["KvStore.put()"]
     end
 ```
 
@@ -147,8 +148,12 @@ graph TD
 3. The leader proposes the write through Raft
 4. The leader replicates the log entry to followers via `AppendEntries` RPCs
 5. Once a quorum (majority) acknowledges, the entry is committed
-6. The leader applies the command to its KvStore and responds to the client
-7. Followers apply the committed entry to their own KvStores
+6. The state machine on **all nodes** applies the command to their local KvStore
+7. The leader returns the result to the client via the `ApplyResultBroker`
+
+Data persists across pod restarts because each node's `kv.redb` contains all
+applied mutations. The state machine tracks `last_applied_raft_index` to avoid
+re-applying entries after restart.
 
 ### CLI Flags for Clustering
 
@@ -578,8 +583,13 @@ sudo systemctl start barkeeper
 
 | File | Purpose |
 |------|---------|
-| `kv.redb` | MVCC key-value store (all user data) |
+| `kv.redb` | MVCC key-value store (all user data) and last applied Raft index |
 | `raft.redb` | Raft log and hard state (term, votedFor) |
+
+On restart, barkeeper auto-detects existing data (if `raft.redb` exists in the
+data directory) and uses `initial-cluster-state=existing`. The state machine
+resumes from the persisted `last_applied_raft_index`, skipping already-applied
+Raft entries to prevent duplicate mutations.
 
 ### Monitoring
 

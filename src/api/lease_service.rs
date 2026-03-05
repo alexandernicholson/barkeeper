@@ -6,6 +6,7 @@ use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status, Streaming};
 
+use crate::kv::actor::KvStoreActorHandle;
 use crate::lease::manager::LeaseManager;
 use crate::proto::etcdserverpb::lease_server::Lease;
 use crate::proto::etcdserverpb::{
@@ -17,15 +18,17 @@ use crate::proto::etcdserverpb::{
 /// gRPC Lease service implementing the etcd Lease API.
 pub struct LeaseService {
     manager: Arc<LeaseManager>,
+    store: KvStoreActorHandle,
     cluster_id: u64,
     member_id: u64,
     raft_term: Arc<AtomicU64>,
 }
 
 impl LeaseService {
-    pub fn new(manager: Arc<LeaseManager>, cluster_id: u64, member_id: u64, raft_term: Arc<AtomicU64>) -> Self {
+    pub fn new(manager: Arc<LeaseManager>, store: KvStoreActorHandle, cluster_id: u64, member_id: u64, raft_term: Arc<AtomicU64>) -> Self {
         LeaseService {
             manager,
+            store,
             cluster_id,
             member_id,
             raft_term,
@@ -66,14 +69,19 @@ impl Lease for LeaseService {
     ) -> Result<Response<LeaseRevokeResponse>, Status> {
         let req = request.into_inner();
 
-        let existed = self.manager.revoke(req.id).await;
-        if !existed {
-            return Err(Status::not_found(format!("lease {} not found", req.id)));
+        let keys = self.manager.revoke(req.id).await;
+        match keys {
+            Some(keys) => {
+                // Delete all keys attached to the revoked lease.
+                for key in keys {
+                    let _ = self.store.delete_range(key, vec![]).await;
+                }
+                Ok(Response::new(LeaseRevokeResponse {
+                    header: self.make_header(0),
+                }))
+            }
+            None => Err(Status::not_found(format!("lease {} not found", req.id))),
         }
-
-        Ok(Response::new(LeaseRevokeResponse {
-            header: self.make_header(0),
-        }))
     }
 
     type LeaseKeepAliveStream = ReceiverStream<Result<LeaseKeepAliveResponse, Status>>;

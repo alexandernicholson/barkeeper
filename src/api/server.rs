@@ -8,11 +8,12 @@ use tonic::transport::Server;
 
 use rebar::DistributedRuntime;
 use rebar_cluster::connection::manager::{ConnectionManager, TransportConnector};
+use rebar_cluster::transport::tcp::TcpTransport;
+use rebar_cluster::transport::{TransportConnection, TransportError, TransportListener};
 use rebar_cluster::drain::{NodeDrain, DrainConfig};
 use rebar_cluster::registry::orset::Registry;
 use rebar_cluster::swim::gossip::GossipQueue;
 use rebar_cluster::swim::SwimConfig;
-use rebar_cluster::transport::{TransportConnection, TransportError};
 use rebar_core::process::{ExitReason, ProcessId};
 use rebar_core::supervisor::engine::{start_supervisor, ChildEntry};
 use rebar_core::supervisor::spec::{ChildSpec, RestartStrategy, RestartType, SupervisorSpec};
@@ -30,6 +31,7 @@ use crate::cluster::actor::spawn_cluster_actor;
 use crate::cluster::swim_service::SwimService;
 use crate::config::ClusterConfig;
 use crate::kv::actor::spawn_kv_store_actor;
+use crate::kv::apply_broker::ApplyResultBroker;
 use crate::kv::state_machine::spawn_state_machine;
 use crate::kv::store::KvStore;
 use crate::lease::manager::LeaseManager;
@@ -114,8 +116,8 @@ impl BarkeepServer {
         // Create the apply channel between Raft and the state machine.
         let (apply_tx, apply_rx) = mpsc::channel(256);
 
-        // Spawn the state machine apply loop.
-        spawn_state_machine(apply_rx).await;
+        // Create the apply result broker (shared between state machine and service handlers).
+        let broker = Arc::new(ApplyResultBroker::new());
 
         // Create the Rebar registry and peer PID map for the Raft actor.
         let registry = Arc::new(Mutex::new(Registry::new()));
@@ -133,17 +135,107 @@ impl BarkeepServer {
         .await;
         let raft_term = Arc::clone(&raft_handle.current_term);
 
-        // If clustered, connect to peers and start SWIM.
+        // If clustered, populate the peer PID map so Raft can route
+        // messages to remote nodes. The Raft actor is the first process
+        // spawned on each node's distributed runtime, so its local_id
+        // is always 1.
         if cluster_config.is_clustered() {
+            let mut peers_map = peers.lock().unwrap();
+            for (&peer_node_id, _addr) in &cluster_config.peers {
+                if peer_node_id != config.node_id {
+                    let remote_pid = ProcessId::new(peer_node_id, 1);
+                    peers_map.insert(peer_node_id, remote_pid);
+                    tracing::info!(peer_node_id, %remote_pid, "registered peer Raft PID");
+                }
+            }
+            drop(peers_map);
+        }
+
+        // If clustered, start the TCP peer listener first so other
+        // nodes can connect to us, then connect outbound to peers.
+        if cluster_config.is_clustered() {
+            if let Some(peer_addr) = cluster_config.listen_peer_addr {
+                let transport = TcpTransport::new();
+                let listener = transport
+                    .listen(peer_addr)
+                    .await
+                    .expect("failed to bind peer listener");
+                tracing::info!(%peer_addr, "TCP peer listener started");
+
+                // Spawn inbound connection handler — accepts connections
+                // and delivers received frames to local processes.
+                let table = Arc::clone(distributed_runtime.table());
+                tokio::spawn(async move {
+                    loop {
+                        match listener.accept().await {
+                            Ok(mut conn) => {
+                                tracing::debug!("accepted inbound peer connection");
+                                let table = Arc::clone(&table);
+                                tokio::spawn(async move {
+                                    loop {
+                                        match conn.recv().await {
+                                            Ok(frame) => {
+                                                tracing::trace!(msg_type = ?frame.msg_type, "received inbound frame");
+                                                if let Err(e) = rebar_cluster::router::deliver_inbound_frame(&*table, &frame) {
+                                                    tracing::warn!(error = %e, "failed to deliver inbound frame");
+                                                }
+                                            }
+                                            Err(rebar_cluster::transport::TransportError::ConnectionClosed) => break,
+                                            Err(e) => {
+                                                tracing::debug!(error = %e, "inbound connection error");
+                                                break;
+                                            }
+                                        }
+                                    }
+                                });
+                            }
+                            Err(e) => {
+                                tracing::warn!(error = %e, "failed to accept peer connection");
+                            }
+                        }
+                    }
+                });
+            }
+
+            // Retry connecting to peers — in Kubernetes, pods start
+            // concurrently and peers may not be listening yet.
             let cm = distributed_runtime.connection_manager_mut();
-            for (node_id, addr) in &cluster_config.peers {
-                if *node_id != config.node_id {
+            let mut pending: Vec<(u64, SocketAddr)> = cluster_config
+                .peers
+                .iter()
+                .filter(|(id, _)| **id != config.node_id)
+                .map(|(id, addr)| (*id, *addr))
+                .collect();
+
+            for attempt in 1..=30 {
+                let mut still_pending = Vec::new();
+                for (node_id, addr) in &pending {
                     if let Err(e) = cm.on_node_discovered(*node_id, *addr).await {
+                        tracing::debug!(
+                            node_id = node_id,
+                            %addr,
+                            attempt,
+                            error = %e,
+                            "peer not ready, will retry"
+                        );
+                        still_pending.push((*node_id, *addr));
+                    } else {
+                        tracing::info!(node_id = node_id, %addr, "connected to peer");
+                    }
+                }
+                if still_pending.is_empty() {
+                    tracing::info!(attempt, "all peers connected");
+                    break;
+                }
+                pending = still_pending;
+                if attempt < 30 {
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                } else {
+                    for (node_id, addr) in &pending {
                         tracing::warn!(
                             node_id = node_id,
                             %addr,
-                            error = %e,
-                            "failed to connect to peer on startup"
+                            "failed to connect to peer after 30 attempts"
                         );
                     }
                 }
@@ -156,10 +248,6 @@ impl BarkeepServer {
                 if *node_id != config.node_id {
                     swim.add_seed(*node_id, *addr);
                 }
-            }
-
-            if let Some(peer_addr) = cluster_config.listen_peer_addr {
-                tracing::info!(%peer_addr, "TCP peer transport configured");
             }
 
             tracing::info!(
@@ -189,17 +277,26 @@ impl BarkeepServer {
         // Create the Lease manager and gRPC service.
         let lease_manager = Arc::new(LeaseManager::new());
 
+        // Spawn the state machine apply loop (needs store, watch_hub, lease_manager, broker).
+        spawn_state_machine(
+            apply_rx,
+            store.clone(),
+            watch_hub.clone(),
+            Arc::clone(&lease_manager),
+            Arc::clone(&broker),
+        ).await;
+
         // Create the KV gRPC service.
         let kv_service = KvService::new(
             store.clone(),
-            watch_hub.clone(),
             Arc::clone(&lease_manager),
             cluster_id,
             member_id,
             Arc::clone(&raft_term),
             raft_handle.clone(),
+            Arc::clone(&broker),
         );
-        let lease_service = LeaseService::new(Arc::clone(&lease_manager), cluster_id, member_id, Arc::clone(&raft_term));
+        let lease_service = LeaseService::new(Arc::clone(&lease_manager), store.clone(), cluster_id, member_id, Arc::clone(&raft_term));
 
         // Resolve TLS cert/key paths (auto-generate if --auto-tls).
         let tls_paths = if tls_config.is_enabled() {
@@ -309,6 +406,7 @@ impl BarkeepServer {
             Arc::clone(&raft_term),
             auth_manager.clone(),
             alarms,
+            Arc::clone(&broker),
         );
 
         tracing::info!(%http_addr, %scheme, "starting HTTP gateway");
@@ -363,8 +461,9 @@ impl BarkeepServer {
             }
             _ = async {
                 loop {
-                    if !distributed_runtime.process_outbound().await {
-                        // No message was pending; sleep briefly to avoid busy-spinning.
+                    if distributed_runtime.process_outbound().await {
+                        // message routed
+                    } else {
                         tokio::time::sleep(Duration::from_millis(1)).await;
                     }
                 }

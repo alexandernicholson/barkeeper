@@ -55,7 +55,7 @@ graph TD
     S --> R["RaftProcess<br>Rebar distributed actor (ProcessContext mailbox)"]
     R --> RC["RaftCore<br>pure Event-&gt;Action state machine"]
     R --> LS["LogStore<br>durable log (redb: raft.redb)"]
-    S --> SM["StateMachine<br>observability logging for committed entries"]
+    S --> SM["StateMachine<br>applies committed entries to KvStore"]
     S --> KVA["KvStoreActor<br>Rebar actor (KvStoreCmd, spawn_blocking for redb)"]
     KVA --> KV["KvStore<br>MVCC store (redb: kv.redb)"]
     S --> LET["LeaseExpiryTimer<br>supervised Rebar child (ChildEntry, Permanent)"]
@@ -95,23 +95,31 @@ name resolution (e.g. `raft:{node_id}` → `ProcessId`).
 
 All writes flow through Raft consensus before being applied to the KV store.
 The service layer serializes a `KvCommand`, proposes it through `RaftHandle`,
-waits for commit confirmation, then applies the mutation to the store and
-notifies watchers.
+and waits for the state machine to apply it. The state machine is the single
+source of truth for KV mutations on **all nodes** (leader and followers),
+ensuring consistent state across the cluster and data persistence across
+restarts.
 
 ```mermaid
 graph TD
     Client["Client<br>(etcdctl / HTTP)"]
     Client --> Service["gRPC / HTTP<br>KvService.put()"]
     Service --> Raft["RaftHandle.propose(data)<br>propose(serialized KvCommand)"]
-    Raft -->|"single-node: commits immediately<br>multi-node: replicates, waits for quorum"| Result["ClientProposalResult::Success"]
-    Result -->|"service applies after commit"| KV["KvStore.put()<br>(redb txn)"]
-    KV --> Watch["WatchHub.notify()<br>fan-out to matching watchers"]
-    KV --> Lease["LeaseManager.attach_key()<br>(if lease != 0)"]
+    Raft -->|"single-node: commits immediately<br>multi-node: replicates, waits for quorum"| SM["StateMachine<br>(on all nodes)"]
+    SM --> KV["KvStore.put()<br>(redb txn)"]
+    SM --> Watch["WatchHub.notify()<br>fan-out to matching watchers"]
+    SM --> Lease["LeaseManager.attach_key()<br>(if lease != 0)"]
+    SM -->|"ApplyResultBroker"| Service
 ```
 
-The state machine (`spawn_state_machine`) receives committed entries for
-observability logging but does not apply them — the service layer handles
-application after Raft commit to avoid double-apply.
+The state machine (`spawn_state_machine`) receives committed entries from Raft
+and applies them to the KV store, triggers watch notifications, and manages
+lease key attachments. An `ApplyResultBroker` connects the state machine back
+to the service handler so that the leader can return results to clients.
+
+On restart, the state machine tracks `last_applied_raft_index` (persisted in
+the KV store's meta table) to skip entries that were already applied, preventing
+double-application when Raft replays committed entries.
 
 ---
 
@@ -475,8 +483,13 @@ CLI entry point using clap. Parses `--name`, `--data-dir`,
   use `spawn_blocking` for non-blocking I/O.
 - **`state_machine.rs`** -- `StateMachine` apply loop and `KvCommand` enum
   (Put/DeleteRange/Txn/Compact). Spawned via `spawn_state_machine()`, receives
-  committed log entries from Raft over an mpsc channel. Logs entries for
-  observability only; actual application happens at the service layer.
+  committed log entries from Raft over an mpsc channel. Applies mutations to
+  the KV store, triggers watch notifications, and manages lease key attachments.
+  Tracks `last_applied_raft_index` to skip already-applied entries on restart.
+- **`apply_broker.rs`** -- `ApplyResultBroker` connects the state machine to
+  service handlers via oneshot channels keyed by Raft log index. The state
+  machine sends results after applying; service handlers wait for results to
+  return to clients.
 
 ### `src/watch/`
 
@@ -539,15 +552,19 @@ graph TD
     Client["Client (etcdctl)"]
     Client -->|"gRPC :2379"| GRPC["tonic gRPC<br>services"]
     Client -->|"HTTP :2380"| HTTP["axum HTTP<br>gateway"]
-    GRPC -->|"actor handles"| KVA["KvStoreActorHandle"]
-    HTTP -->|"actor handles"| KVA
+    GRPC -->|"propose via RaftHandle"| Raft["RaftNode"]
+    HTTP -->|"propose via RaftHandle"| Raft
+    Raft --> RDB["redb (raft.redb)"]
+    Raft -->|"committed entries"| SM["StateMachine"]
+    SM -->|"apply mutations"| KVA["KvStoreActorHandle"]
+    SM -->|"notify"| WHA["WatchHubActorHandle"]
+    SM -->|"ApplyResultBroker"| GRPC
+    SM -->|"ApplyResultBroker"| HTTP
     KVA -->|"spawn_blocking"| KVDB["redb (kv.redb)"]
-    GRPC --> WHA["WatchHubActorHandle"]
-    HTTP --> WHA
     WHA --> W["watchers<br>(mpsc)"]
+    GRPC -->|"reads"| KVA
+    HTTP -->|"reads"| KVA
     GRPC --> CA["ClusterActorHandle"]
     GRPC --> AA["AuthActorHandle"]
-    KVA --> Raft["RaftNode"]
-    Raft --> RDB["redb (raft.redb)"]
     GRPC --> LM["LeaseManager<br>(in-memory)"]
 ```

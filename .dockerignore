@@ -1,0 +1,8 @@
+target/
+.git/
+k8s-test/
+benchmark/
+tests/
+docs/
+*.md
+LICENSE

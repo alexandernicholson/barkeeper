@@ -4,6 +4,7 @@ use std::sync::Arc;
 use tonic::{Request, Response, Status};
 
 use crate::kv::actor::KvStoreActorHandle;
+use crate::kv::apply_broker::{ApplyResult, ApplyResultBroker};
 use crate::kv::state_machine::KvCommand;
 use crate::kv::store::{
     TxnCompare, TxnCompareResult, TxnCompareTarget, TxnOp, TxnOpResponse,
@@ -18,37 +19,37 @@ use crate::proto::etcdserverpb::{
 };
 use crate::raft::node::RaftHandle;
 use crate::raft::messages::ClientProposalResult;
-use crate::watch::actor::WatchHubActorHandle;
 
 /// gRPC KV service implementing the etcd KV API.
 pub struct KvService {
     store: KvStoreActorHandle,
-    watch_hub: WatchHubActorHandle,
+    #[allow(dead_code)]
     lease_manager: Arc<LeaseManager>,
     cluster_id: u64,
     member_id: u64,
     raft_term: Arc<AtomicU64>,
     raft_handle: RaftHandle,
+    broker: Arc<ApplyResultBroker>,
 }
 
 impl KvService {
     pub fn new(
         store: KvStoreActorHandle,
-        watch_hub: WatchHubActorHandle,
         lease_manager: Arc<LeaseManager>,
         cluster_id: u64,
         member_id: u64,
         raft_term: Arc<AtomicU64>,
         raft_handle: RaftHandle,
+        broker: Arc<ApplyResultBroker>,
     ) -> Self {
         KvService {
             store,
-            watch_hub,
             lease_manager,
             cluster_id,
             member_id,
             raft_term,
             raft_handle,
+            broker,
         }
     }
 
@@ -105,44 +106,24 @@ impl Kv for KvService {
             .map_err(|e| Status::unavailable(format!("raft: {}", e)))?;
 
         match proposal_result {
-            ClientProposalResult::Success { .. } => {
-                // Committed. Apply to store.
-                let result = self
-                    .store
-                    .put(req.key.clone(), req.value.clone(), req.lease)
-                    .await
-                    .map_err(|e| Status::internal(format!("put failed: {}", e)))?;
+            ClientProposalResult::Success { index, .. } => {
+                // Wait for the state machine to apply this entry.
+                let result = self.broker.wait_for_result(index).await;
+                match result {
+                    ApplyResult::Put(put_result) => {
+                        let prev_kv = if req.prev_kv {
+                            put_result.prev_kv
+                        } else {
+                            None
+                        };
 
-                // Notify watchers of the put event.
-                let (create_rev, ver) = match &result.prev_kv {
-                    Some(prev) => (prev.create_revision, prev.version + 1),
-                    None => (result.revision, 1),
-                };
-                let notify_kv = crate::proto::mvccpb::KeyValue {
-                    key: req.key.clone(),
-                    create_revision: create_rev,
-                    mod_revision: result.revision,
-                    version: ver,
-                    value: req.value.clone(),
-                    lease: req.lease,
-                };
-                self.watch_hub.notify(req.key.clone(), 0, notify_kv, result.prev_kv.clone()).await;
-
-                // Attach the key to its lease so the expiry timer can clean it up.
-                if req.lease != 0 {
-                    self.lease_manager.attach_key(req.lease, req.key.clone()).await;
+                        Ok(Response::new(PutResponse {
+                            header: self.make_header(put_result.revision),
+                            prev_kv,
+                        }))
+                    }
+                    _ => Err(Status::internal("unexpected apply result for put")),
                 }
-
-                let prev_kv = if req.prev_kv {
-                    result.prev_kv
-                } else {
-                    None
-                };
-
-                Ok(Response::new(PutResponse {
-                    header: self.make_header(result.revision),
-                    prev_kv,
-                }))
             }
             ClientProposalResult::NotLeader { .. } => {
                 Err(Status::unavailable("not leader"))
@@ -170,38 +151,25 @@ impl Kv for KvService {
             .map_err(|e| Status::unavailable(format!("raft: {}", e)))?;
 
         match proposal_result {
-            ClientProposalResult::Success { .. } => {
-                // Committed. Apply to store.
-                let result = self
-                    .store
-                    .delete_range(req.key.clone(), req.range_end.clone())
-                    .await
-                    .map_err(|e| Status::internal(format!("delete failed: {}", e)))?;
+            ClientProposalResult::Success { index, .. } => {
+                // Wait for the state machine to apply this entry.
+                let result = self.broker.wait_for_result(index).await;
+                match result {
+                    ApplyResult::DeleteRange(del_result) => {
+                        let prev_kvs = if req.prev_kv {
+                            del_result.prev_kvs
+                        } else {
+                            vec![]
+                        };
 
-                // Notify watchers for each deleted key.
-                for prev in &result.prev_kvs {
-                    let tombstone = crate::proto::mvccpb::KeyValue {
-                        key: prev.key.clone(),
-                        create_revision: 0,
-                        mod_revision: result.revision,
-                        version: 0,
-                        value: vec![],
-                        lease: 0,
-                    };
-                    self.watch_hub.notify(prev.key.clone(), 1, tombstone, Some(prev.clone())).await;
+                        Ok(Response::new(DeleteRangeResponse {
+                            header: self.make_header(del_result.revision),
+                            deleted: del_result.deleted,
+                            prev_kvs,
+                        }))
+                    }
+                    _ => Err(Status::internal("unexpected apply result for delete_range")),
                 }
-
-                let prev_kvs = if req.prev_kv {
-                    result.prev_kvs
-                } else {
-                    vec![]
-                };
-
-                Ok(Response::new(DeleteRangeResponse {
-                    header: self.make_header(result.revision),
-                    deleted: result.deleted,
-                    prev_kvs,
-                }))
             }
             ClientProposalResult::NotLeader { .. } => {
                 Err(Status::unavailable("not leader"))
@@ -222,24 +190,24 @@ impl Kv for KvService {
             .map(|c| convert_compare(c))
             .collect::<Result<Vec<_>, _>>()?;
 
-        // Convert proto ops to internal types.
+        // Convert proto ops to internal types (skip empty request ops).
         let success = req
             .success
             .iter()
-            .map(|op| convert_request_op(op))
+            .filter_map(|op| convert_request_op(op).transpose())
             .collect::<Result<Vec<_>, _>>()?;
 
         let failure = req
             .failure
             .iter()
-            .map(|op| convert_request_op(op))
+            .filter_map(|op| convert_request_op(op).transpose())
             .collect::<Result<Vec<_>, _>>()?;
 
         // Serialize command and propose through Raft.
         let cmd = KvCommand::Txn {
-            compares: compares.clone(),
-            success: success.clone(),
-            failure: failure.clone(),
+            compares,
+            success,
+            failure,
         };
         let data = serde_json::to_vec(&cmd).map_err(|e| Status::internal(e.to_string()))?;
 
@@ -247,68 +215,26 @@ impl Kv for KvService {
             .map_err(|e| Status::unavailable(format!("raft: {}", e)))?;
 
         match proposal_result {
-            ClientProposalResult::Success { .. } => {
-                // Committed. Apply to store.
+            ClientProposalResult::Success { index, .. } => {
+                // Wait for the state machine to apply this entry.
+                let result = self.broker.wait_for_result(index).await;
+                match result {
+                    ApplyResult::Txn(txn_result) => {
+                        // Convert results to proto responses.
+                        let responses: Vec<ResponseOp> = txn_result
+                            .responses
+                            .into_iter()
+                            .map(|resp| convert_txn_op_response(resp, self.cluster_id, self.member_id, self.raft_term.load(Ordering::Relaxed)))
+                            .collect();
 
-                // Clone ops before the store consumes them — needed for watch notifications.
-                let success_ops = success.clone();
-                let failure_ops = failure.clone();
-
-                // Execute the transaction directly on the store.
-                let result = self
-                    .store
-                    .txn(compares, success, failure)
-                    .await
-                    .map_err(|e| Status::internal(format!("txn failed: {}", e)))?;
-
-                // Notify watchers for txn mutations.
-                let executed_ops = if result.succeeded { &success_ops } else { &failure_ops };
-                for (op, resp) in executed_ops.iter().zip(result.responses.iter()) {
-                    match (op, resp) {
-                        (TxnOp::Put { key, value, lease_id }, TxnOpResponse::Put(r)) => {
-                            let (create_rev, ver) = match &r.prev_kv {
-                                Some(prev) => (prev.create_revision, prev.version + 1),
-                                None => (r.revision, 1),
-                            };
-                            let notify_kv = crate::proto::mvccpb::KeyValue {
-                                key: key.clone(),
-                                create_revision: create_rev,
-                                mod_revision: r.revision,
-                                version: ver,
-                                value: value.clone(),
-                                lease: *lease_id,
-                            };
-                            self.watch_hub.notify(key.clone(), 0, notify_kv, r.prev_kv.clone()).await;
-                        }
-                        (TxnOp::DeleteRange { .. }, TxnOpResponse::DeleteRange(r)) => {
-                            for prev in &r.prev_kvs {
-                                let tombstone = crate::proto::mvccpb::KeyValue {
-                                    key: prev.key.clone(),
-                                    create_revision: 0,
-                                    mod_revision: r.revision,
-                                    version: 0,
-                                    value: vec![],
-                                    lease: 0,
-                                };
-                                self.watch_hub.notify(prev.key.clone(), 1, tombstone, Some(prev.clone())).await;
-                            }
-                        }
-                        _ => {} // Range ops don't need notifications
+                        Ok(Response::new(TxnResponse {
+                            header: self.make_header(txn_result.revision),
+                            succeeded: txn_result.succeeded,
+                            responses,
+                        }))
                     }
+                    _ => Err(Status::internal("unexpected apply result for txn")),
                 }
-
-                // Convert results to proto responses.
-                let responses: Vec<ResponseOp> = result
-                    .responses
-                    .into_iter()
-                    .map(|resp| convert_txn_op_response(resp, self.cluster_id, self.member_id, self.raft_term.load(Ordering::Relaxed)))
-                    .collect();
-
-                Ok(Response::new(TxnResponse {
-                    header: self.make_header(result.revision),
-                    succeeded: result.succeeded,
-                    responses,
-                }))
             }
             ClientProposalResult::NotLeader { .. } => {
                 Err(Status::unavailable("not leader"))
@@ -335,22 +261,27 @@ impl Kv for KvService {
             .map_err(|e| Status::unavailable(format!("raft: {}", e)))?;
 
         match proposal_result {
-            ClientProposalResult::Success { .. } => {
-                // Committed. Apply to store.
-                self.store
-                    .compact(req.revision)
-                    .await
-                    .map_err(|e| Status::internal(format!("compact failed: {}", e)))?;
-
-                let revision = self
-                    .store
-                    .current_revision()
-                    .await
-                    .map_err(|e| Status::internal(format!("revision failed: {}", e)))?;
-
-                Ok(Response::new(CompactionResponse {
-                    header: self.make_header(revision),
-                }))
+            ClientProposalResult::Success { index, .. } => {
+                // Wait for the state machine to apply this entry.
+                let result = self.broker.wait_for_result(index).await;
+                match result {
+                    ApplyResult::Compact { revision } => {
+                        Ok(Response::new(CompactionResponse {
+                            header: self.make_header(revision),
+                        }))
+                    }
+                    _ => {
+                        // Compact still succeeded even if result type is unexpected.
+                        let revision = self
+                            .store
+                            .current_revision()
+                            .await
+                            .map_err(|e| Status::internal(format!("revision failed: {}", e)))?;
+                        Ok(Response::new(CompactionResponse {
+                            header: self.make_header(revision),
+                        }))
+                    }
+                }
             }
             ClientProposalResult::NotLeader { .. } => {
                 Err(Status::unavailable("not leader"))
@@ -400,27 +331,27 @@ fn convert_compare(c: &crate::proto::etcdserverpb::Compare) -> Result<TxnCompare
     })
 }
 
-fn convert_request_op(op: &RequestOp) -> Result<TxnOp, Status> {
+fn convert_request_op(op: &RequestOp) -> Result<Option<TxnOp>, Status> {
     match &op.request {
-        Some(request_op::Request::RequestRange(r)) => Ok(TxnOp::Range {
+        Some(request_op::Request::RequestRange(r)) => Ok(Some(TxnOp::Range {
             key: r.key.clone(),
             range_end: r.range_end.clone(),
             limit: r.limit,
             revision: r.revision,
-        }),
-        Some(request_op::Request::RequestPut(r)) => Ok(TxnOp::Put {
+        })),
+        Some(request_op::Request::RequestPut(r)) => Ok(Some(TxnOp::Put {
             key: r.key.clone(),
             value: r.value.clone(),
             lease_id: r.lease,
-        }),
-        Some(request_op::Request::RequestDeleteRange(r)) => Ok(TxnOp::DeleteRange {
+        })),
+        Some(request_op::Request::RequestDeleteRange(r)) => Ok(Some(TxnOp::DeleteRange {
             key: r.key.clone(),
             range_end: r.range_end.clone(),
-        }),
+        })),
         Some(request_op::Request::RequestTxn(_)) => {
             Err(Status::unimplemented("nested txn not supported"))
         }
-        None => Err(Status::invalid_argument("empty request op")),
+        None => Ok(None), // etcdctl may send empty request ops; skip them
     }
 }
 

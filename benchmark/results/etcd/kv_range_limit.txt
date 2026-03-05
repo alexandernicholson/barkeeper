@@ -1,4 +1,0 @@
-myprefix/key1
-val1
-myprefix/key2
-val2
