@@ -303,7 +303,17 @@ Byte fields (key, value) are base64-encoded in JSON, matching etcd's HTTP gatewa
 cargo test
 ```
 
-200 tests across 20 test files covering Raft consensus, log store, KV store (MVCC, transactions, compaction), etcd HTTP gateway API compatibility, watch notifications (including revision replay), lease expiry, TLS configuration, auth enforcement, multi-node clustering, multi-node data replication, SWIM membership, registry CRDT, Rebar actor handles (KvStore, WatchHub, Auth, Cluster), and gRPC transport.
+257 tests across unit and integration test files covering Raft consensus, log store, KV store (MVCC, transactions, compaction), etcd HTTP gateway API compatibility, watch notifications (including revision replay, progress notifications, compaction errors), lease expiry, TLS/mTLS configuration, auth enforcement (JWT), multi-node clustering, multi-node data replication, SWIM membership, registry CRDT, Rebar actor handles (KvStore, WatchHub, Auth, Cluster), gRPC transport, and kube-apiserver compatibility (range options, nested Txn, Hash/HashKV).
+
+### Kubernetes Integration Test
+
+Barkeeper can serve as a drop-in etcd replacement for Kubernetes. The k3s integration test boots a real cluster against barkeeper and deploys workloads:
+
+```bash
+sudo bash tests/k3s-integration.sh
+```
+
+This starts barkeeper, launches k3s with `--datastore-endpoint=http://127.0.0.1:2379`, then creates and verifies a pod, a 3-replica deployment, and a service with endpoint resolution. Requires sudo (k3s needs kubelet access); k3s is auto-installed if not present.
 
 ## Benchmarks
 
