@@ -745,8 +745,9 @@ async fn handle_put(
     };
 
     let resp = match proposal_result {
-        ClientProposalResult::Success { revision, .. } => {
-            // No broker wait needed — WriteBuffer populated before this response.
+        ClientProposalResult::Success { index, revision } => {
+            // Wait for state-machine apply so subsequent reads see the key.
+            state.broker.wait_for_result(index).await;
             axum::Json(PutResponse {
                 header: state.make_header(revision),
                 prev_kv,

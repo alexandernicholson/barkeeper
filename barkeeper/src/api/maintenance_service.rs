@@ -155,7 +155,7 @@ impl Maintenance for MaintenanceService {
             db_size_in_use: db_size,
             is_learner: false,
             storage_version: "1".to_string(),
-            db_size_quota: 0,
+            db_size_quota: 2 * 1024 * 1024 * 1024, // 2 GiB, matches etcd default
             downgrade_info: None,
         }))
     }

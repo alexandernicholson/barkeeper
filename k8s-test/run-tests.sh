@@ -43,7 +43,7 @@ http_post() {
 }
 
 etcd() {
-  ETCDCTL_API=3 etcdctl --endpoints="$GRPC_EP" "$@" 2>&1
+  etcdctl --endpoints="$GRPC_EP" "$@" 2>/dev/null
 }
 
 # Detect which pod is the leader and set up port-forwards to it

@@ -78,8 +78,8 @@ impl Kv for KvService {
     ) -> Result<Response<RangeResponse>, Status> {
         let req = request.into_inner();
 
-        // Since PUT waits for apply before responding, the store is always
-        // consistent for reads without needing ReadIndex in single-node mode.
+        // PUT and DELETE both wait for state-machine apply before responding,
+        // so the store is consistent for reads without ReadIndex.
 
         let result = self
             .store
@@ -132,8 +132,10 @@ impl Kv for KvService {
             .map_err(|e| Status::unavailable(format!("raft: {}", e)))?;
 
         match proposal_result {
-            ClientProposalResult::Success { revision, .. } => {
-                // No broker wait needed — WriteBuffer populated before this response.
+            ClientProposalResult::Success { index, revision } => {
+                // Wait for the state machine to apply so that subsequent
+                // Range reads see the written key in the KvStore.
+                self.broker.wait_for_result(index).await;
                 Ok(Response::new(PutResponse {
                     header: self.make_header(revision),
                     prev_kv,
