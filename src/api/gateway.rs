@@ -1908,7 +1908,7 @@ async fn handle_watch_sse(
 
     let (watch_id, mut event_rx) = state
         .watch_hub
-        .create_watch(key, range_end, start_revision)
+        .create_watch(key, range_end, start_revision, vec![], false)
         .await;
 
     let stream = async_stream::stream! {

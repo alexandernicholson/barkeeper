@@ -22,6 +22,8 @@ struct Watcher {
     id: i64,
     key: Vec<u8>,
     range_end: Vec<u8>,
+    filters: Vec<i32>,
+    prev_kv: bool,
     tx: mpsc::Sender<WatchEvent>,
 }
 
@@ -45,11 +47,28 @@ pub async fn spawn_watch_hub_actor(
             tokio::select! {
                 Some(cmd) = cmd_rx.recv() => {
                     match cmd {
-                        WatchHubCmd::CreateWatch { key, range_end, start_revision, reply } => {
+                        WatchHubCmd::CreateWatch { key, range_end, start_revision, filters, prev_kv, requested_watch_id, reply } => {
                             let (tx, rx) = mpsc::channel(256);
 
-                            let id = next_id;
-                            next_id += 1;
+                            // Determine watch ID: use requested if non-zero, else auto-assign.
+                            let id = if requested_watch_id != 0 {
+                                // Check for collision with existing watchers.
+                                if watchers.contains_key(&requested_watch_id) {
+                                    // Collision: send reply with the id but drop tx so rx closes immediately.
+                                    let _ = reply.send((requested_watch_id, rx));
+                                    // Drop tx here (it goes out of scope since we don't store it).
+                                    continue;
+                                }
+                                // Bump next_id if the requested id >= next_id.
+                                if requested_watch_id >= next_id {
+                                    next_id = requested_watch_id + 1;
+                                }
+                                requested_watch_id
+                            } else {
+                                let id = next_id;
+                                next_id += 1;
+                                id
+                            };
 
                             // Replay historical events BEFORE sending the reply
                             // so the subscriber doesn't miss events.
@@ -61,6 +80,11 @@ pub async fn spawn_watch_hub_actor(
                                         Ok(changes) => {
                                             for (change_key, event_type, kv) in changes {
                                                 if !key_matches(&key, &range_end, &change_key) {
+                                                    continue;
+                                                }
+
+                                                // Apply filters during historical replay.
+                                                if filters.contains(&event_type) {
                                                     continue;
                                                 }
 
@@ -93,6 +117,8 @@ pub async fn spawn_watch_hub_actor(
                                 id,
                                 key,
                                 range_end,
+                                filters,
+                                prev_kv,
                                 tx,
                             };
                             watchers.insert(id, watcher);
@@ -111,10 +137,22 @@ pub async fn spawn_watch_hub_actor(
                                     continue;
                                 }
 
+                                // Skip delivery when event type matches a filter.
+                                if watcher.filters.contains(&event_type) {
+                                    continue;
+                                }
+
+                                // Only include prev_kv for watchers that requested it.
+                                let event_prev_kv = if watcher.prev_kv {
+                                    prev_kv.clone()
+                                } else {
+                                    None
+                                };
+
                                 let event = mvccpb::Event {
                                     r#type: event_type,
                                     kv: Some(kv.clone()),
-                                    prev_kv: prev_kv.clone(),
+                                    prev_kv: event_prev_kv,
                                 };
 
                                 let watch_event = WatchEvent {
@@ -168,6 +206,27 @@ impl WatchHubActorHandle {
         key: Vec<u8>,
         range_end: Vec<u8>,
         start_revision: i64,
+        filters: Vec<i32>,
+        prev_kv: bool,
+    ) -> (i64, mpsc::Receiver<WatchEvent>) {
+        self.create_watch_with_id(key, range_end, start_revision, filters, prev_kv, 0)
+            .await
+    }
+
+    /// Create a watch with a specific requested watch ID.
+    ///
+    /// If `requested_watch_id` is non-zero, the actor will attempt to use that
+    /// ID. If it collides with an existing watcher, the returned receiver will
+    /// be closed immediately. If `requested_watch_id` is 0, an ID is
+    /// auto-assigned.
+    pub async fn create_watch_with_id(
+        &self,
+        key: Vec<u8>,
+        range_end: Vec<u8>,
+        start_revision: i64,
+        filters: Vec<i32>,
+        prev_kv: bool,
+        requested_watch_id: i64,
     ) -> (i64, mpsc::Receiver<WatchEvent>) {
         let (reply, rx) = oneshot::channel();
         self.cmd_tx
@@ -175,6 +234,9 @@ impl WatchHubActorHandle {
                 key,
                 range_end,
                 start_revision,
+                filters,
+                prev_kv,
+                requested_watch_id,
                 reply,
             })
             .await

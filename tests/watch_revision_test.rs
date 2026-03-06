@@ -70,7 +70,7 @@ async fn test_watchhub_replays_history() {
     handle.put(b"other".to_vec(), b"v3".to_vec(), 0).await.unwrap(); // rev 3
 
     // Watch "hist" from revision 1 — should replay rev 1 and 2.
-    let (_wid, mut rx) = hub.create_watch(b"hist".to_vec(), vec![], 1).await;
+    let (_wid, mut rx) = hub.create_watch(b"hist".to_vec(), vec![], 1, vec![], false).await;
 
     // Should receive 2 historical events.
     let e1 = timeout(Duration::from_secs(1), rx.recv()).await.unwrap().unwrap();

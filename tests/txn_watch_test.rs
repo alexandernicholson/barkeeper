@@ -16,7 +16,7 @@ async fn test_txn_put_fires_watch_notification() {
     let hub = spawn_watch_hub_actor(&runtime, None).await;
 
     // Watch key "txnkey".
-    let (_wid, mut rx) = hub.create_watch(b"txnkey".to_vec(), vec![], 0).await;
+    let (_wid, mut rx) = hub.create_watch(b"txnkey".to_vec(), vec![], 0, vec![], false).await;
 
     // Execute a txn that puts "txnkey".
     let result = store.txn(
@@ -74,7 +74,7 @@ async fn test_txn_delete_fires_watch_notification() {
     store.put(b"delkey", b"val", 0).unwrap();
 
     // Watch key "delkey".
-    let (_wid, mut rx) = hub.create_watch(b"delkey".to_vec(), vec![], 0).await;
+    let (_wid, mut rx) = hub.create_watch(b"delkey".to_vec(), vec![], 0, vec![], false).await;
 
     // Execute a txn that deletes "delkey".
     let result = store.txn(

@@ -19,7 +19,7 @@ async fn test_create_watch_returns_working_receiver() {
     let rt = make_runtime();
     let hub = spawn_watch_hub_actor(&rt, None).await;
 
-    let (watch_id, mut rx) = hub.create_watch(b"foo".to_vec(), vec![], 0).await;
+    let (watch_id, mut rx) = hub.create_watch(b"foo".to_vec(), vec![], 0, vec![], false).await;
     assert!(watch_id > 0, "watch_id should be positive");
 
     let kv = mvccpb::KeyValue {
@@ -51,7 +51,7 @@ async fn test_notify_delivers_to_matching_watcher() {
     let rt = make_runtime();
     let hub = spawn_watch_hub_actor(&rt, None).await;
 
-    let (_wid, mut rx) = hub.create_watch(b"key1".to_vec(), vec![], 0).await;
+    let (_wid, mut rx) = hub.create_watch(b"key1".to_vec(), vec![], 0, vec![], false).await;
 
     let kv = mvccpb::KeyValue {
         key: b"key1".to_vec(),
@@ -76,7 +76,7 @@ async fn test_notify_does_not_deliver_to_non_matching_watcher() {
     let rt = make_runtime();
     let hub = spawn_watch_hub_actor(&rt, None).await;
 
-    let (_wid, mut rx) = hub.create_watch(b"apple".to_vec(), vec![], 0).await;
+    let (_wid, mut rx) = hub.create_watch(b"apple".to_vec(), vec![], 0, vec![], false).await;
 
     let kv = mvccpb::KeyValue {
         key: b"banana".to_vec(),
@@ -99,7 +99,7 @@ async fn test_cancel_watch_stops_delivery() {
     let rt = make_runtime();
     let hub = spawn_watch_hub_actor(&rt, None).await;
 
-    let (watch_id, mut rx) = hub.create_watch(b"cancel_me".to_vec(), vec![], 0).await;
+    let (watch_id, mut rx) = hub.create_watch(b"cancel_me".to_vec(), vec![], 0, vec![], false).await;
 
     // Cancel the watch.
     let existed = hub.cancel_watch(watch_id).await;
@@ -137,7 +137,7 @@ async fn test_range_watcher() {
 
     // Watch prefix "pfx/" — range_end is "pfx0" (next byte after '/')
     let (_wid, mut rx) = hub
-        .create_watch(b"pfx/".to_vec(), b"pfx0".to_vec(), 0)
+        .create_watch(b"pfx/".to_vec(), b"pfx0".to_vec(), 0, vec![], false)
         .await;
 
     // Notify for "pfx/a" — should match.
@@ -179,7 +179,7 @@ async fn test_all_keys_watcher() {
     let hub = spawn_watch_hub_actor(&rt, None).await;
 
     let (_wid, mut rx) = hub
-        .create_watch(b"\x00".to_vec(), b"\x00".to_vec(), 0)
+        .create_watch(b"\x00".to_vec(), b"\x00".to_vec(), 0, vec![], false)
         .await;
 
     let kv = mvccpb::KeyValue {
@@ -216,7 +216,7 @@ async fn test_historical_replay_with_kv_store() {
     store_handle.put(b"other".to_vec(), b"v3".to_vec(), 0).await.unwrap(); // rev 3
 
     // Watch "hist" from revision 1 — should replay rev 1 and 2.
-    let (_wid, mut rx) = hub.create_watch(b"hist".to_vec(), vec![], 1).await;
+    let (_wid, mut rx) = hub.create_watch(b"hist".to_vec(), vec![], 1, vec![], false).await;
 
     // Should receive 2 historical events.
     let e1 = timeout(Duration::from_secs(2), rx.recv())
@@ -239,7 +239,7 @@ async fn test_dead_watcher_cleanup() {
     let rt = make_runtime();
     let hub = spawn_watch_hub_actor(&rt, None).await;
 
-    let (watch_id, rx) = hub.create_watch(b"dead".to_vec(), vec![], 0).await;
+    let (watch_id, rx) = hub.create_watch(b"dead".to_vec(), vec![], 0, vec![], false).await;
 
     // Drop the receiver — this makes the watcher "dead".
     drop(rx);
@@ -270,9 +270,9 @@ async fn test_concurrent_watchers() {
     let hub = spawn_watch_hub_actor(&rt, None).await;
 
     // Create 3 watchers on different keys.
-    let (wid1, mut rx1) = hub.create_watch(b"k1".to_vec(), vec![], 0).await;
-    let (wid2, mut rx2) = hub.create_watch(b"k2".to_vec(), vec![], 0).await;
-    let (wid3, mut rx3) = hub.create_watch(b"k1".to_vec(), vec![], 0).await; // also watches k1
+    let (wid1, mut rx1) = hub.create_watch(b"k1".to_vec(), vec![], 0, vec![], false).await;
+    let (wid2, mut rx2) = hub.create_watch(b"k2".to_vec(), vec![], 0, vec![], false).await;
+    let (wid3, mut rx3) = hub.create_watch(b"k1".to_vec(), vec![], 0, vec![], false).await; // also watches k1
 
     // Notify k1 — should reach watcher 1 and 3, not 2.
     let kv = mvccpb::KeyValue {
@@ -316,10 +316,150 @@ async fn test_watch_ids_are_unique() {
     let rt = make_runtime();
     let hub = spawn_watch_hub_actor(&rt, None).await;
 
-    let (id1, _rx1) = hub.create_watch(b"a".to_vec(), vec![], 0).await;
-    let (id2, _rx2) = hub.create_watch(b"b".to_vec(), vec![], 0).await;
-    let (id3, _rx3) = hub.create_watch(b"c".to_vec(), vec![], 0).await;
+    let (id1, _rx1) = hub.create_watch(b"a".to_vec(), vec![], 0, vec![], false).await;
+    let (id2, _rx2) = hub.create_watch(b"b".to_vec(), vec![], 0, vec![], false).await;
+    let (id3, _rx3) = hub.create_watch(b"c".to_vec(), vec![], 0, vec![], false).await;
 
     assert!(id1 < id2, "IDs should be increasing");
     assert!(id2 < id3, "IDs should be increasing");
+}
+
+/// NOPUT filter (0) should suppress PUT events but deliver DELETE events.
+#[tokio::test]
+async fn test_watch_filter_noput() {
+    let rt = make_runtime();
+    let hub = spawn_watch_hub_actor(&rt, None).await;
+
+    // Create a watch with NOPUT filter (0 = suppress PUT).
+    let (_wid, mut rx) = hub
+        .create_watch(b"filt".to_vec(), vec![], 0, vec![0], false)
+        .await;
+
+    // Send a PUT event — should be suppressed.
+    let kv_put = mvccpb::KeyValue {
+        key: b"filt".to_vec(),
+        create_revision: 1,
+        mod_revision: 1,
+        version: 1,
+        value: b"val".to_vec(),
+        lease: 0,
+    };
+    hub.notify(b"filt".to_vec(), 0, kv_put, None).await;
+
+    // Should NOT receive the PUT.
+    let result = timeout(Duration::from_millis(200), rx.recv()).await;
+    assert!(result.is_err(), "PUT event should be filtered by NOPUT");
+
+    // Send a DELETE event — should be delivered.
+    let kv_del = mvccpb::KeyValue {
+        key: b"filt".to_vec(),
+        create_revision: 0,
+        mod_revision: 2,
+        version: 0,
+        value: vec![],
+        lease: 0,
+    };
+    hub.notify(b"filt".to_vec(), 1, kv_del, None).await;
+
+    let event = timeout(Duration::from_secs(2), rx.recv())
+        .await
+        .expect("timeout waiting for DELETE event")
+        .expect("channel closed");
+    assert_eq!(event.events[0].r#type, 1); // DELETE
+}
+
+/// NODELETE filter (1) should suppress DELETE events but deliver PUT events.
+#[tokio::test]
+async fn test_watch_filter_nodelete() {
+    let rt = make_runtime();
+    let hub = spawn_watch_hub_actor(&rt, None).await;
+
+    // Create a watch with NODELETE filter (1 = suppress DELETE).
+    let (_wid, mut rx) = hub
+        .create_watch(b"filt2".to_vec(), vec![], 0, vec![1], false)
+        .await;
+
+    // Send a DELETE event — should be suppressed.
+    let kv_del = mvccpb::KeyValue {
+        key: b"filt2".to_vec(),
+        create_revision: 0,
+        mod_revision: 1,
+        version: 0,
+        value: vec![],
+        lease: 0,
+    };
+    hub.notify(b"filt2".to_vec(), 1, kv_del, None).await;
+
+    // Should NOT receive the DELETE.
+    let result = timeout(Duration::from_millis(200), rx.recv()).await;
+    assert!(result.is_err(), "DELETE event should be filtered by NODELETE");
+
+    // Send a PUT event — should be delivered.
+    let kv_put = mvccpb::KeyValue {
+        key: b"filt2".to_vec(),
+        create_revision: 1,
+        mod_revision: 2,
+        version: 1,
+        value: b"val".to_vec(),
+        lease: 0,
+    };
+    hub.notify(b"filt2".to_vec(), 0, kv_put, None).await;
+
+    let event = timeout(Duration::from_secs(2), rx.recv())
+        .await
+        .expect("timeout waiting for PUT event")
+        .expect("channel closed");
+    assert_eq!(event.events[0].r#type, 0); // PUT
+}
+
+/// Client-provided non-zero watch_id should be used.
+#[tokio::test]
+async fn test_watch_client_provided_watch_id() {
+    let rt = make_runtime();
+    let hub = spawn_watch_hub_actor(&rt, None).await;
+
+    let (watch_id, mut rx) = hub
+        .create_watch_with_id(b"cid".to_vec(), vec![], 0, vec![], false, 42)
+        .await;
+    assert_eq!(watch_id, 42, "should use client-provided watch_id");
+
+    // Verify it works by sending an event.
+    let kv = mvccpb::KeyValue {
+        key: b"cid".to_vec(),
+        create_revision: 1,
+        mod_revision: 1,
+        version: 1,
+        value: b"val".to_vec(),
+        lease: 0,
+    };
+    hub.notify(b"cid".to_vec(), 0, kv, None).await;
+
+    let event = timeout(Duration::from_secs(2), rx.recv())
+        .await
+        .expect("timeout")
+        .expect("closed");
+    assert_eq!(event.watch_id, 42);
+}
+
+/// Duplicate watch_id should close the channel immediately (collision).
+#[tokio::test]
+async fn test_watch_duplicate_watch_id_collision() {
+    let rt = make_runtime();
+    let hub = spawn_watch_hub_actor(&rt, None).await;
+
+    // Create a watch with id 10.
+    let (wid1, _rx1) = hub
+        .create_watch_with_id(b"dup".to_vec(), vec![], 0, vec![], false, 10)
+        .await;
+    assert_eq!(wid1, 10);
+
+    // Create another watch with the same id 10 — should collide.
+    let (wid2, mut rx2) = hub
+        .create_watch_with_id(b"dup".to_vec(), vec![], 0, vec![], false, 10)
+        .await;
+    assert_eq!(wid2, 10, "should return the requested id even on collision");
+
+    // The receiver should be closed immediately (tx was dropped).
+    let result = rx2.recv().await;
+    assert!(result.is_none(), "channel should be closed on collision");
 }

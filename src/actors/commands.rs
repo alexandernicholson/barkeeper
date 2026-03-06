@@ -34,6 +34,9 @@ pub enum WatchHubCmd {
         key: Vec<u8>,
         range_end: Vec<u8>,
         start_revision: i64,
+        filters: Vec<i32>,
+        prev_kv: bool,
+        requested_watch_id: i64,
         reply: oneshot::Sender<(i64, tokio::sync::mpsc::Receiver<crate::watch::hub::WatchEvent>)>,
     },
     /// Cancel an existing watch. Returns true if the watcher existed and was removed.

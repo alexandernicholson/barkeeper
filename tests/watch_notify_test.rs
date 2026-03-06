@@ -17,7 +17,7 @@ async fn test_watch_hub_receives_put_notification() {
     let hub = spawn_watch_hub_actor(&runtime, None).await;
 
     // Create a watch on key "foo".
-    let (watch_id, mut event_rx) = hub.create_watch(b"foo".to_vec(), vec![], 0).await;
+    let (watch_id, mut event_rx) = hub.create_watch(b"foo".to_vec(), vec![], 0, vec![], false).await;
     assert!(watch_id > 0);
 
     // Simulate what StoreProcess should do after a put: call hub.notify().
@@ -56,7 +56,7 @@ async fn test_watch_hub_receives_delete_notification() {
 
     // Put then create watch.
     store.put(b"delme", b"val", 0).unwrap();
-    let (_watch_id, mut event_rx) = hub.create_watch(b"delme".to_vec(), vec![], 0).await;
+    let (_watch_id, mut event_rx) = hub.create_watch(b"delme".to_vec(), vec![], 0, vec![], false).await;
 
     // Delete and notify.
     let result = store.delete_range(b"delme", b"").unwrap();
@@ -88,7 +88,7 @@ async fn test_watch_hub_prefix_notification() {
 
     // Watch prefix "pfx/" — range_end is "pfx0" (next byte after '/')
     let (_watch_id, mut event_rx) = hub
-        .create_watch(b"pfx/".to_vec(), b"pfx0".to_vec(), 0)
+        .create_watch(b"pfx/".to_vec(), b"pfx0".to_vec(), 0, vec![], false)
         .await;
 
     // Notify for "pfx/a" — should match.
