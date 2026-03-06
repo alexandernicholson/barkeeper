@@ -67,17 +67,6 @@ graph TD
     S --> Reg["Registry<br>OR-Set CRDT distributed process name resolution"]
 ```
 
-**Rebar actor migration status:**
-
-| Component | Status | How |
-|-----------|--------|-----|
-| RaftNode | Migrated | `spawn_raft_node_rebar` — Rebar distributed actor with `ProcessContext` mailbox |
-| LeaseExpiryTimer | Migrated | Supervised `ChildEntry` (Permanent restart) under `BarkeepSupervisor` |
-| KvStore | Migrated | `spawn_kv_store_actor` — Rebar actor with `KvStoreCmd` typed commands, in-memory BTreeMap operations |
-| WatchHub | Migrated | `spawn_watch_hub_actor` — Rebar actor with `WatchHubCmd`, streaming via mpsc channels |
-| ClusterManager | Migrated | `spawn_cluster_actor` — Rebar actor with `ClusterCmd`, SWIM-backed membership |
-| AuthManager | Migrated | `spawn_auth_actor` — Rebar actor with `AuthCmd`, `spawn_blocking` for bcrypt |
-
 Actor command enums are defined in `src/actors/commands.rs`:
 `RaftCmd`, `ClusterCmd`, `AuthCmd`, `KvStoreCmd`, `WatchHubCmd`. Each uses
 `oneshot::Sender` for request-response patterns (except fire-and-forget

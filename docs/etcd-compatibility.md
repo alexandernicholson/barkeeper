@@ -182,6 +182,21 @@ cluster (leader and followers), matching etcd's behavior. Data persists
 across pod restarts and full cluster restarts. The state machine tracks
 `last_applied_raft_index` to prevent double-application on restart.
 
+### Read consistency
+
+Reads are always linearizable (served after state machine apply). The
+`serializable` field in `RangeRequest` is parsed but ignored — all reads
+behave as linearizable. This is stricter than etcd, not weaker.
+
+### Watch gaps
+
+- **Filters:** `NOPUT` and `NODELETE` filter fields are parsed but not
+  enforced — all events are delivered regardless.
+- **prev_kv:** The `prev_kv` field in `WatchCreateRequest` is parsed
+  but ignored — watch events don't include previous values.
+- **ProgressRequest:** Accepted but returns a stub response rather than
+  a real progress notification with the current revision.
+
 ### Nested transactions
 
 Nested `Txn` inside a `Txn` request op returns `UNIMPLEMENTED`.
@@ -192,10 +207,12 @@ Nested `Txn` inside a `Txn` request op returns `UNIMPLEMENTED`.
 return `UNIMPLEMENTED`. `Alarm`, `Defragment`, and `Snapshot` are fully
 implemented.
 
-### Watch ProgressRequest
+### Auth token format
 
-`ProgressRequest` is accepted but returns a stub response rather than a
-real progress notification with the current revision.
+Tokens use a custom format (`{username}.{uuid}`) rather than etcd's JWT.
+The `Authorization` header accepts raw tokens. Most etcd client libraries
+pass the token opaquely and will work, but clients that parse or validate
+the token format may not.
 
 ### Instance-specific differences
 
