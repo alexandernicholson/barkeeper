@@ -261,16 +261,24 @@ entries committed after it was taken.
 
 Each entry in `raft.wal` is a length-prefixed frame:
 
-```
-┌──────────────────┬─────────────────────────────────────┐
-│  payload_len     │  payload (bincode LogEntry)          │
-│  4 bytes (LE)    │  payload_len bytes                   │
-├──────────────────┼─────────────────────────────────────┤
-│  payload_len     │  payload (bincode LogEntry)          │
-│  4 bytes (LE)    │  payload_len bytes                   │
-├──────────────────┼─────────────────────────────────────┤
-│  ...             │  ...                                 │
-└──────────────────┴─────────────────────────────────────┘
+```mermaid
+block-beta
+    columns 4
+    block:f1:2
+        columns 2
+        a1["payload_len<br>4 bytes (LE)"]
+        a2["payload (bincode LogEntry)<br>payload_len bytes"]
+    end
+    block:f2:2
+        columns 2
+        b1["payload_len<br>4 bytes (LE)"]
+        b2["payload (bincode LogEntry)<br>payload_len bytes"]
+    end
+
+    style a1 fill:#4a9eff,color:#fff
+    style b1 fill:#4a9eff,color:#fff
+    style a2 fill:#2d2d2d,color:#fff
+    style b2 fill:#2d2d2d,color:#fff
 ```
 
 - **4-byte little-endian length prefix** followed by bincode-serialized `LogEntry`
