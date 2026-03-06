@@ -1,14 +1,14 @@
 # barkeeper
 
-An etcd-compatible distributed key-value store built on the [Rebar](https://github.com/alexandernicholson/rebar) actor runtime.
+A distributed key-value store built on the [Rebar](https://github.com/alexandernicholson/rebar) actor runtime with full v3 API compatibility (gRPC + HTTP/JSON gateway).
 
-barkeeper implements the etcd v3 API surface -- both gRPC and HTTP/JSON gateway -- on top of a Raft consensus engine written from scratch as Rebar actors, with an in-memory BTreeMap KV store backed by an append-only WAL for durability. No C dependencies, no cgo, single static binary.
+Raft consensus engine written from scratch as Rebar actors, in-memory BTreeMap KV store backed by an append-only WAL for durability. Single static binary, pure Rust.
 
 ## Status
 
 | Component | Status |
 |-----------|--------|
-| etcd v3 API | All KV, Watch, Lease, Cluster, Maintenance, Auth endpoints working |
+| v3 API | All KV, Watch, Lease, Cluster, Maintenance, Auth endpoints working |
 | Raft Consensus | All writes go through Raft; multi-node via Rebar TCP transport |
 | SWIM Membership | Cluster membership and failure detection via SWIM protocol |
 | TLS | Auto-TLS and manual certificate support |
@@ -20,8 +20,8 @@ barkeeper implements the etcd v3 API surface -- both gRPC and HTTP/JSON gateway 
 
 ## Features
 
-- **etcd v3 gRPC API** -- KV (Range, Put, DeleteRange, Txn, Compact), Watch, Lease, Cluster, Maintenance, Auth services
-- **HTTP/JSON gateway** -- REST endpoints matching etcd's grpc-gateway (`/v3/kv/put`, `/v3/kv/range`, `/v3/kv/compaction`, etc.)
+- **v3 gRPC API** -- KV (Range, Put, DeleteRange, Txn, Compact), Watch, Lease, Cluster, Maintenance, Auth services
+- **HTTP/JSON gateway** -- REST endpoints (`/v3/kv/put`, `/v3/kv/range`, `/v3/kv/compaction`, etc.)
 - **Raft consensus on all writes** -- every KV mutation (put, delete, txn, compact) is proposed through Raft before being applied
 - **Multi-node clustering** -- Rebar `DistributedRuntime` with TCP transport for inter-node Raft messaging; SWIM protocol for cluster membership discovery and failure detection
 - **TLS support** -- auto-TLS (self-signed certificates generated at startup) and manual certificate configuration
@@ -40,7 +40,7 @@ barkeeper implements the etcd v3 API surface -- both gRPC and HTTP/JSON gateway 
 - **DNS autodiscovery** -- Kubernetes StatefulSet support via DNS SRV resolution (bare hostname in `--initial-cluster` triggers DNS mode)
 - **NodeDrain** -- three-phase graceful shutdown protocol for safe node removal
 - **Registry** -- OR-Set CRDT for distributed process name resolution
-- **Pure Rust** -- no C dependencies; in-memory BTreeMap + append-only WAL, not boltdb
+- **Pure Rust** -- single static binary, no C dependencies
 
 ## Quick Start
 
@@ -64,7 +64,7 @@ By default, barkeeper listens on:
 ### Test with curl (HTTP gateway)
 
 ```bash
-# Put a key (values are base64-encoded, matching etcd's gateway)
+# Put a key (values are base64-encoded)
 curl -s -X POST http://127.0.0.1:2380/v3/kv/put \
   -d '{"key":"aGVsbG8=","value":"d29ybGQ="}'
 
@@ -136,7 +136,7 @@ graph TD
 
 **SWIM membership** -- cluster membership discovery and failure detection use the SWIM gossip protocol. The `SWIM MembershipList` actor maintains a live view of cluster nodes and drives Raft reconfiguration when members join or leave. On Kubernetes, a bare hostname in `--initial-cluster` triggers DNS SRV resolution against the headless service to seed the SWIM ring.
 
-**Rebar DistributedRuntime** -- inter-node Raft messages travel over TCP using Rebar frames with msgpack serialization, replacing the previous gRPC transport layer. The `Registry` actor provides an OR-Set CRDT for distributed process name resolution across the cluster.
+**Rebar DistributedRuntime** -- inter-node Raft messages travel over TCP using Rebar frames with msgpack serialization. The `Registry` actor provides an OR-Set CRDT for distributed process name resolution across the cluster.
 
 **State machine** receives committed log entries from Raft and applies them to the KV store on **all nodes** (leader and followers). This ensures consistent state across the cluster and data persistence across restarts. An `ApplyResultBroker` connects the state machine back to service handlers so leaders can return results to clients. The state machine also triggers watch notifications and manages lease key attachments.
 
@@ -146,7 +146,7 @@ graph TD
 
 **Lease manager** handles TTL-based key lifecycle. When a lease expires, all keys attached to it are automatically cleaned up. Supports grant, revoke, keepalive, and time-to-live queries.
 
-**Storage** uses an in-memory BTreeMap state machine backed by an append-only WAL for durability. The KV store is a materialized view that can be reconstructed from WAL replay. No C dependencies (unlike boltdb/bbolt used by etcd).
+**Storage** uses an in-memory BTreeMap state machine backed by an append-only WAL for durability. The KV store is a materialized view that can be reconstructed from WAL replay.
 
 ## Kubernetes Deployment
 
@@ -285,7 +285,7 @@ When `--initial-cluster` is a bare hostname (`barkeeper.default.svc.cluster.loca
 | `POST /v3/maintenance/snapshot` | Download database snapshot |
 | `POST /v3/watch` | Watch keys via Server-Sent Events (SSE) |
 
-Byte fields (key, value) are base64-encoded in JSON, matching etcd's HTTP gateway behavior.
+Byte fields (key, value) are base64-encoded in JSON.
 
 ## Documentation
 
@@ -295,7 +295,7 @@ Byte fields (key, value) are base64-encoded in JSON, matching etcd's HTTP gatewa
 | [Deployment Guide](docs/deployment.md) | Deployment, multi-node clustering, TLS, Docker, systemd |
 | [Developer Guide](docs/developer-guide.md) | Building, testing, and contributing |
 | [Extension Guide](docs/extending.md) | Adding new services and actors |
-| [etcd Compatibility Reference](docs/etcd-compatibility.md) | API parity tracking with etcd v3 |
+| [Compatibility Reference](docs/etcd-compatibility.md) | API parity details |
 
 ## Tests
 
@@ -303,11 +303,11 @@ Byte fields (key, value) are base64-encoded in JSON, matching etcd's HTTP gatewa
 cargo test
 ```
 
-257 tests across unit and integration test files covering Raft consensus, log store, KV store (MVCC, transactions, compaction), etcd HTTP gateway API compatibility, watch notifications (including revision replay, progress notifications, compaction errors), lease expiry, TLS/mTLS configuration, auth enforcement (JWT), multi-node clustering, multi-node data replication, SWIM membership, registry CRDT, Rebar actor handles (KvStore, WatchHub, Auth, Cluster), gRPC transport, and kube-apiserver compatibility (range options, nested Txn, Hash/HashKV).
+257 tests across unit and integration test files covering Raft consensus, log store, KV store (MVCC, transactions, compaction), HTTP gateway API compatibility, watch notifications (including revision replay, progress notifications, compaction errors), lease expiry, TLS/mTLS configuration, auth enforcement (JWT), multi-node clustering, multi-node data replication, SWIM membership, registry CRDT, Rebar actor handles (KvStore, WatchHub, Auth, Cluster), gRPC transport, and kube-apiserver compatibility (range options, nested Txn, Hash/HashKV).
 
 ### Kubernetes Integration Test
 
-Barkeeper can serve as a drop-in etcd replacement for Kubernetes. The k3s integration test boots a real cluster against barkeeper and deploys workloads:
+Barkeeper can serve as the backing datastore for Kubernetes. The k3s integration test boots a real cluster against barkeeper and deploys workloads:
 
 ```bash
 sudo bash k8s-test/k3s-integration.sh
@@ -347,7 +347,7 @@ barkeeper is a from-scratch implementation, not a fork of etcd. It aims for API 
 |-|------|-----------|
 | Language | Go | Rust |
 | Concurrency | goroutines | Rebar actor runtime (BEAM-inspired) |
-| Storage | bbolt (cgo) | Append-only WAL + in-memory BTreeMap (pure Rust, no C deps) |
+| Storage | bbolt (cgo) | Append-only WAL + in-memory BTreeMap (pure Rust) |
 
 ## Building from Source
 

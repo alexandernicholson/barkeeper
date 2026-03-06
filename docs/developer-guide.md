@@ -1,6 +1,6 @@
 # Barkeeper Developer Guide
 
-An etcd-compatible distributed key-value store built on the Rebar actor runtime.
+A distributed key-value store built on the Rebar actor runtime.
 
 ---
 
@@ -105,8 +105,7 @@ Example with custom settings:
 
 ## Testing with etcdctl
 
-Barkeeper implements the etcd v3 gRPC API, so standard `etcdctl` commands
-work out of the box.
+Standard `etcdctl` commands work out of the box.
 
 **Put a key:**
 
@@ -136,8 +135,8 @@ etcdctl --endpoints=127.0.0.1:2379 get "" --prefix
 
 ## Testing with curl (HTTP Gateway)
 
-The HTTP gateway on port 2380 exposes the etcd v3 JSON API. All byte fields
-(keys and values) are base64-encoded, matching etcd's grpc-gateway behavior.
+The HTTP gateway on port 2380 exposes the v3 JSON API. All byte fields
+(keys and values) are base64-encoded.
 
 ### Encode keys and values
 
@@ -244,7 +243,7 @@ The test suite contains **200 tests** across 20 test files:
 | `auth_test.rs`                    | 1     | Auth enforcement (unauthenticated rejection, token validation)  |
 | `cluster_actor_test.rs`           | 12    | ClusterActor handle tests (add, remove, update, promote members)|
 | `cluster_test.rs`                 | 3     | Multi-node Raft cluster integration tests (election, leader)    |
-| `compat_test.rs`                  | 30    | End-to-end etcd compatibility tests against the HTTP gateway    |
+| `compat_test.rs`                  | 30    | End-to-end compatibility tests against the HTTP gateway         |
 | `integration_test.rs`             | 5     | State machine and KvStore actor integration tests               |
 | `kv_store_actor_test.rs`          | 12    | KvStoreActor handle tests (put, range, delete, txn, compact)    |
 | `kv_store_test.rs`                | 8     | MVCC key-value store unit tests (put, get, range, delete, compact) |
@@ -277,7 +276,7 @@ barkeeper/
 |-- README.md               # Project overview
 |
 |-- proto/                  # Protocol Buffer definitions
-|   |-- etcdserverpb/       # etcd server proto files
+|   |-- etcdserverpb/       # Server proto files (v3 API)
 |   |   |-- rpc.proto       #   KV, Watch, Lease, Cluster, Maintenance, Auth services
 |   |   |-- kv.proto        #   KeyValue and Event message types (mvccpb)
 |   |-- authpb/
@@ -291,7 +290,7 @@ barkeeper/
 |   |
 |   |-- api/                # Network-facing API layer
 |   |   |-- server.rs       #   BarkeepServer: wires up all services, starts gRPC + HTTP + TLS
-|   |   |-- gateway.rs      #   HTTP/JSON gateway (axum router, auth middleware, etcd compat)
+|   |   |-- gateway.rs      #   HTTP/JSON gateway (axum router, auth middleware)
 |   |   |-- kv_service.rs   #   gRPC KV service (Range, Put, DeleteRange, Txn, Compact via Raft)
 |   |   |-- watch_service.rs#   gRPC Watch service (bidirectional streaming)
 |   |   |-- lease_service.rs#   gRPC Lease service (Grant, Revoke, KeepAlive, TimeToLive)
@@ -339,7 +338,7 @@ barkeeper/
 |
 |-- tests/                  # Integration and unit test files (see table above)
 |
-|-- bench/                  # Performance benchmark (barkeeper vs etcd)
+|-- bench/                  # Performance benchmarks
 |   |-- harness/
 |   |   |-- run.sh          #   Entry point: Docker + oha load tests
 |   |   |-- report.py       #   Parse oha JSON → markdown tables + CSV

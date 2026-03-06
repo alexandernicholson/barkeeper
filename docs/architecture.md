@@ -2,16 +2,14 @@
 
 ## System Overview
 
-Barkeeper is an etcd-compatible distributed key-value store built on the
-[Rebar](https://github.com/alexandernicholson/rebar) actor runtime. It aims to
-provide full wire-level compatibility with etcd's gRPC and HTTP/JSON APIs while
-using a fundamentally different internal architecture: supervised actor
-processes communicating over typed channels rather than tightly-coupled
-goroutines.
+Barkeeper is a distributed key-value store built on the
+[Rebar](https://github.com/alexandernicholson/rebar) actor runtime. It provides
+wire-level compatibility with the v3 gRPC and HTTP/JSON APIs using supervised
+actor processes communicating over typed channels.
 
 **Goals:**
 
-- Drop-in replacement for etcd clients (gRPC + HTTP gateway)
+- Drop-in replacement for existing clients (gRPC + HTTP gateway)
 - Raft consensus for linearizable writes
 - MVCC storage with revision-based history
 - Watch API for real-time change notification
@@ -19,7 +17,7 @@ goroutines.
 - RBAC authentication
 - Crash recovery via Rebar supervision trees
 
-**etcd API Surface Implemented:**
+**API Surface Implemented:**
 
 | API       | gRPC | HTTP Gateway |
 |-----------|------|--------------|
@@ -91,8 +89,8 @@ restarts.
 
 ```mermaid
 graph TD
-    Client["Client<br>(etcdctl / HTTP)"]
-    Client --> Service["gRPC / HTTP<br>KvService.put()"]
+    Client["Client<br>(gRPC / HTTP)"]
+    Client --> Service["KvService.put()"]
     Service --> Raft["RaftHandle.propose(data)<br>propose(serialized KvCommand)"]
     Raft -->|"single-node: commits immediately<br>multi-node: replicates, waits for quorum"| SM["StateMachine<br>(on all nodes)"]
     SM --> KV["KvStore.put()<br>(in-memory BTreeMap)"]
@@ -114,13 +112,13 @@ double-application when Raft replays committed entries.
 
 ## Read Path
 
-Reads are served directly from the KV store without going through Raft.
-This matches etcd's serializable read behaviour (the default for `Range`).
+Reads are served directly from the KV store without going through Raft
+(serializable read semantics).
 
 ```mermaid
 graph TD
-    Client["Client<br>(etcdctl / HTTP)"]
-    Client --> Service["gRPC / HTTP<br>KvService.range()"]
+    Client["Client<br>(gRPC / HTTP)"]
+    Client --> Service["KvService.range()"]
     Service --> KV["KvStore.range()<br>in-memory BTreeMap read<br>supports revision parameter"]
     KV --> Result["RangeResult<br>kvs: Vec&lt;KeyValue&gt;<br>count: i64<br>more: bool"]
 ```
@@ -451,12 +449,12 @@ pub trait RaftTransport: Send + Sync {
 Inter-node Raft messages are serialized with msgpack and carried over Rebar
 TCP frames by the `RebarTcpTransport`. The Rebar `DistributedRuntime` manages
 the underlying TCP connections and multiplexes frames from different message
-types on the same connection. This replaces the previous gRPC-based transport.
+types on the same connection.
 
 ### SWIM Membership Flow
 
-Cluster membership is maintained by the SWIM protocol rather than static
-`--initial-cluster` peer lists (except during initial bootstrap):
+Cluster membership is maintained by the SWIM protocol. On initial bootstrap,
+`--initial-cluster` peer addresses seed the SWIM ring:
 
 1. On startup, each node seeds its SWIM ring from `--initial-cluster` peer
    addresses (or DNS SRV records when a bare hostname is supplied).
@@ -549,9 +547,8 @@ CLI entry point using clap. Parses `--name`, `--data-dir`,
   `UserAdd`, `UserDelete`, `UserChangePassword`, `UserGrant`, `UserRevoke`,
   `UserList`, `UserGet`, `RoleAdd`, `RoleDelete`, `RoleGrant`, `RoleRevoke`,
   `RoleList`, `RoleGet`, `Authenticate`.
-- **`gateway.rs`** -- HTTP/JSON gateway on port+1, matching etcd's
-  grpc-gateway. Base64 key/value encoding, proto3 JSON rules (int64 as strings,
-  default value omission).
+- **`gateway.rs`** -- HTTP/JSON gateway on port+1. Base64 key/value encoding,
+  proto3 JSON rules (int64 as strings, default value omission).
 
 ### `src/raft/`
 
@@ -654,7 +651,7 @@ Module declarations and protobuf includes via `tonic::include_proto!` for
 
 ```mermaid
 graph TD
-    Client["Client (etcdctl)"]
+    Client["Client"]
     Client -->|"gRPC :2379"| GRPC["tonic gRPC<br>services"]
     Client -->|"HTTP :2380"| HTTP["axum HTTP<br>gateway"]
     GRPC -->|"propose via RaftHandle"| Raft["RaftNode"]

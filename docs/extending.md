@@ -344,9 +344,9 @@ a `HashMap<u64, ProcessId>` shared via `Arc<Mutex<...>>`
 
 ## 4. Adding HTTP Gateway Endpoints
 
-The HTTP/JSON gateway in `src/api/gateway.rs` mirrors etcd's grpc-gateway,
-accepting JSON POST requests and returning proto3-compatible JSON responses.
-It is built with [axum](https://github.com/tokio-rs/axum).
+The HTTP/JSON gateway in `src/api/gateway.rs` accepts JSON POST requests and
+returns proto3-compatible JSON responses. It is built with
+[axum](https://github.com/tokio-rs/axum).
 
 ### Handler pattern
 
@@ -382,13 +382,12 @@ Key helpers:
 - `parse_json(&body)` -- Deserializes JSON without requiring a Content-Type
   header. Returns `T::default()` for empty bodies.
 - `decode_b64(&option_string)` -- Decodes a base64-encoded `Option<String>`
-  to `Vec<u8>`, matching etcd's convention for byte fields.
+  to `Vec<u8>`.
 - `proto_kv_to_json(&kv)` -- Converts a proto `KeyValue` to the JSON
   representation with base64-encoded key/value fields.
 - `state.make_header(revision)` -- Builds a `JsonResponseHeader` with
   current cluster ID, member ID, and Raft term.
-- `json_error(status, msg)` -- Returns a JSON error body matching etcd's
-  error format.
+- `json_error(status, msg)` -- Returns a JSON error body.
 
 ### GatewayState
 
@@ -431,7 +430,7 @@ pub fn create_router(/* ... */) -> Router {
 
 ### Proto3 JSON conventions
 
-Barkeeper follows etcd's proto3 canonical JSON mapping. When adding new
+Barkeeper follows the proto3 canonical JSON mapping. When adding new
 response types, apply these rules:
 
 - **int64/uint64 fields**: Serialize as strings using `#[serde(serialize_with = "ser_str_i64")]`
@@ -459,7 +458,7 @@ struct MyResponse {
 
 ### Path conventions
 
-Follow etcd's grpc-gateway URL structure:
+Follow the existing URL structure:
 
 ```
 /v3/kv/range          -- KV Range
@@ -484,16 +483,14 @@ Follow etcd's grpc-gateway URL structure:
 /v3/auth/user/add     -- User Add
 ```
 
-All endpoints use `POST` method. This matches etcd's grpc-gateway behavior
-where even read operations use POST with a JSON body.
+All endpoints use `POST` method with a JSON body, even read operations.
 
 ---
 
 ## 5. Writing Compatibility Tests
 
-Compatibility tests in `tests/compat_test.rs` verify behavioral parity with
-etcd's v3 HTTP API. Each test starts a full barkeeper instance and makes HTTP
-requests against it.
+Compatibility tests in `tests/compat_test.rs` verify the v3 HTTP API behavior.
+Each test starts a full barkeeper instance and makes HTTP requests against it.
 
 ### Test instance setup
 
@@ -632,7 +629,7 @@ When writing assertions, keep these proto3 rules in mind:
 ### Performance benchmarking
 
 The `bench/` directory contains a performance benchmark harness comparing
-barkeeper against etcd using [oha](https://github.com/hatoo/oha):
+barkeeper using [oha](https://github.com/hatoo/oha):
 
 - `bench/harness/run.sh` -- Main entry point. Runs Docker containers and
   oha load tests against the HTTP/JSON gateway.

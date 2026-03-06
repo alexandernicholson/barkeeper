@@ -297,7 +297,7 @@ Example systemd unit file for running barkeeper as a service:
 
 ```ini
 [Unit]
-Description=barkeeper etcd-compatible KV store
+Description=barkeeper distributed KV store
 After=network-online.target
 Wants=network-online.target
 
@@ -639,6 +639,6 @@ curl -s http://127.0.0.1:2380/v3/maintenance/defragment -d '{}' | jq .
 
 | Port | Protocol | Purpose |
 |------|----------|---------|
-| 2379 | gRPC | Client API (etcdctl, gRPC clients) |
+| 2379 | gRPC | Client API (gRPC clients, etcdctl) |
 | 2380 | HTTP | HTTP/JSON gateway |
 | 2380 | TCP | Peer Raft traffic (Rebar TCP frames, msgpack) + SWIM gossip |
