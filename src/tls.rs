@@ -108,6 +108,61 @@ pub fn build_tonic_tls(
     Ok(tonic::transport::ServerTlsConfig::new().identity(identity))
 }
 
+/// Build a tonic `ServerTlsConfig` with mutual TLS (client certificate validation).
+///
+/// Used when `--client-cert-auth` is enabled. kube-apiserver passes client certs
+/// via `--etcd-certfile`/`--etcd-keyfile` and expects the server to validate them
+/// against the trusted CA.
+pub fn build_tonic_tls_with_client_auth(
+    cert_path: &str,
+    key_path: &str,
+    ca_cert_pem: &str,
+) -> Result<tonic::transport::ServerTlsConfig, Box<dyn std::error::Error>> {
+    let cert = std::fs::read_to_string(cert_path)?;
+    let key = std::fs::read_to_string(key_path)?;
+    let identity = tonic::transport::Identity::from_pem(cert, key);
+    let client_ca = tonic::transport::Certificate::from_pem(ca_cert_pem);
+    Ok(tonic::transport::ServerTlsConfig::new()
+        .identity(identity)
+        .client_ca_root(client_ca))
+}
+
+/// Build a `tokio-rustls` TLS acceptor with mutual TLS (client certificate validation).
+///
+/// Used for the HTTP/JSON gateway when `--client-cert-auth` is enabled.
+pub fn build_tls_acceptor_with_client_auth(
+    cert_path: &str,
+    key_path: &str,
+    ca_cert_pem: &[u8],
+) -> Result<TlsAcceptor, Box<dyn std::error::Error>> {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
+    let cert_pem = std::fs::read(cert_path)?;
+    let key_pem = std::fs::read(key_path)?;
+
+    let certs: Vec<_> = rustls_pemfile::certs(&mut &cert_pem[..])
+        .collect::<Result<Vec<_>, _>>()?;
+    let key = rustls_pemfile::private_key(&mut &key_pem[..])?
+        .ok_or("no private key found in PEM file")?;
+
+    // Parse CA certificates for client verification.
+    let mut root_store = rustls::RootCertStore::empty();
+    for ca_cert in rustls_pemfile::certs(&mut &ca_cert_pem[..]) {
+        root_store.add(ca_cert?)?;
+    }
+
+    let client_verifier = tokio_rustls::rustls::server::WebPkiClientVerifier::builder(
+        Arc::new(root_store),
+    )
+    .build()?;
+
+    let config = ServerConfig::builder()
+        .with_client_cert_verifier(client_verifier)
+        .with_single_cert(certs, key)?;
+
+    Ok(TlsAcceptor::from(Arc::new(config)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

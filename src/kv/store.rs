@@ -592,7 +592,10 @@ impl KvStore {
     pub fn compact(&self, revision: i64) -> Result<(), StoreError> {
         let mut inner = self.inner.write().unwrap();
         do_compact(&mut inner, revision);
-        inner.compacted_revision = revision;
+        // Only advance the floor forward — never regress.
+        if revision > inner.compacted_revision {
+            inner.compacted_revision = revision;
+        }
         Ok(())
     }
 

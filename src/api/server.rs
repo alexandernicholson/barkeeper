@@ -456,7 +456,17 @@ impl BarkeepServer {
         let mut server = Server::builder();
 
         if let Some((ref cert_path, ref key_path)) = tls_paths {
-            let tonic_tls = crate::tls::build_tonic_tls(cert_path, key_path)?;
+            let tonic_tls = if tls_config.client_cert_auth {
+                if let Some(ref ca_file) = tls_config.trusted_ca_file {
+                    let ca_pem = std::fs::read_to_string(ca_file)?;
+                    crate::tls::build_tonic_tls_with_client_auth(cert_path, key_path, &ca_pem)?
+                } else {
+                    tracing::warn!("client-cert-auth enabled but no trusted-ca-file set; falling back to server-only TLS");
+                    crate::tls::build_tonic_tls(cert_path, key_path)?
+                }
+            } else {
+                crate::tls::build_tonic_tls(cert_path, key_path)?
+            };
             server = server.tls_config(tonic_tls)?;
         }
 
