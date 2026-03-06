@@ -4,12 +4,10 @@ RUN apt-get update && apt-get install -y protobuf-compiler && rm -rf /var/lib/ap
 
 WORKDIR /build
 COPY Cargo.toml Cargo.lock ./
-COPY build.rs ./
-COPY proto/ proto/
-COPY src/ src/
-COPY benches/ benches/
+COPY barkeeper/ barkeeper/
+COPY bkctl/ bkctl/
 
-RUN cargo build --release
+RUN cargo build --release --bin barkeeper
 
 FROM debian:bookworm-slim
 
