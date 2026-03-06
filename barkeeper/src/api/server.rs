@@ -93,48 +93,13 @@ impl BarkeepServer {
         // Replay any unapplied WAL entries to restore KV state after restart.
         {
             use crate::raft::log_store::LogStore;
-            use crate::raft::messages::LogEntryData;
-            use crate::kv::state_machine::KvCommand;
+            use crate::kv::wal_replay::replay_wal;
 
             let log_store = LogStore::open(&config.data_dir)?;
-            let last_applied = kv_store.last_applied_raft_index().unwrap_or(0);
-            let last_log_index = log_store.last_index()?;
-
-            if last_applied < last_log_index {
-                tracing::info!(
-                    last_applied,
-                    last_log_index,
-                    "replaying WAL entries to restore KV state"
-                );
-                let entries = log_store.get_range(last_applied + 1, last_log_index)?;
-                let mut commands: Vec<(KvCommand, i64)> = Vec::new();
-                for entry in &entries {
-                    if let LogEntryData::Command { data, revision } = &entry.data {
-                        if let Ok(cmd) = bincode::deserialize::<KvCommand>(data)
-                            .or_else(|_| {
-                                serde_json::from_slice::<KvCommand>(data)
-                                    .map_err(|e| Box::new(bincode::ErrorKind::Custom(e.to_string())))
-                            })
-                        {
-                            commands.push((cmd, *revision));
-                        } else {
-                            tracing::warn!(index = entry.index, "skipping undeserializable WAL entry");
-                        }
-                    }
-                }
-                if !commands.is_empty() {
-                    kv_store.batch_apply_with_index(&commands, last_log_index)?;
-                    // Save snapshot so future restarts skip already-replayed entries.
-                    kv_store.snapshot()?;
-                    tracing::info!(
-                        entries = commands.len(),
-                        last_log_index,
-                        "WAL replay complete, snapshot saved"
-                    );
-                } else {
-                    // No command entries, but update applied index to avoid re-scanning.
-                    kv_store.set_last_applied_raft_index(last_log_index)?;
-                }
+            match replay_wal(&log_store, &kv_store) {
+                Ok(0) => {}
+                Ok(n) => tracing::info!(entries = n, "WAL replay complete, snapshot saved"),
+                Err(e) => return Err(e),
             }
         }
 
