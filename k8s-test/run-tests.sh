@@ -326,7 +326,7 @@ fi
 # Grant via etcdctl
 OUT=$(etcd lease grant 120)
 if echo "$OUT" | grep -q "granted"; then
-  ETCD_LEASE_ID=$(echo "$OUT" | grep -oP '\d+' | head -1)
+  ETCD_LEASE_ID=$(echo "$OUT" | sed 's/[^0-9]/ /g' | tr ' ' '\n' | grep -v '^$' | head -1)
   pass "Lease Grant via etcdctl (ID=$ETCD_LEASE_ID)"
   etcd lease revoke "$ETCD_LEASE_ID" >/dev/null 2>&1 || true
 else
@@ -415,7 +415,7 @@ OUT=$(curl -sf --max-time 10 "$HTTP_EP/v3/maintenance/snapshot" -d '{}' -o /dev/
 if [ "$OUT" = "200" ]; then pass "Maintenance Snapshot"; else skip "Maintenance Snapshot" "HTTP $OUT"; fi
 
 # Status via etcdctl
-OUT=$(etcd endpoint status --write-out=table 2>&1)
+OUT=$(etcdctl --endpoints="$GRPC_EP" endpoint status --write-out=table 2>&1 || true)
 if echo "$OUT" | grep -q "ENDPOINT\|127"; then pass "Endpoint status via etcdctl"; else fail "Endpoint status via etcdctl" "$OUT"; fi
 
 # Health via etcdctl

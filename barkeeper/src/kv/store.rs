@@ -301,12 +301,20 @@ impl KvStore {
         })
     }
 
-    /// Get the database file size in bytes (snapshot size, or 0 if no snapshot).
+    /// Get the database file size in bytes.
+    /// Returns snapshot file size, or an estimate from in-memory state.
+    /// Never returns 0 to prevent divide-by-zero in etcdctl.
     pub fn db_file_size(&self) -> Result<i64, std::io::Error> {
         let snapshot_path = self.db_path.join("kv.snapshot");
         match std::fs::metadata(&snapshot_path) {
-            Ok(m) => Ok(m.len() as i64),
-            Err(_) => Ok(0),
+            Ok(m) if m.len() > 0 => Ok(m.len() as i64),
+            _ => {
+                // Estimate from in-memory state: count keys * average entry size.
+                // Minimum 4096 (one page) to prevent divide-by-zero in etcdctl.
+                let inner = self.inner.read().unwrap();
+                let estimate = (inner.kv.len() as i64 * 128).max(4096);
+                Ok(estimate)
+            }
         }
     }
 

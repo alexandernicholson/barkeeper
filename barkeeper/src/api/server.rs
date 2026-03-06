@@ -532,6 +532,11 @@ impl BarkeepServer {
         let node_id = config.node_id;
         let peer_addr = cluster_config.listen_peer_addr.unwrap_or(addr);
 
+        // Listen for SIGTERM (Kubernetes pod shutdown) in addition to SIGINT.
+        let mut sigterm = tokio::signal::unix::signal(
+            tokio::signal::unix::SignalKind::terminate(),
+        ).expect("register SIGTERM handler");
+
         // Run the gRPC server, outbound message loop, and signal handler
         // concurrently. The distributed_runtime stays owned here so it is
         // accessible for the drain protocol on shutdown.
@@ -549,34 +554,41 @@ impl BarkeepServer {
                     }
                 }
             } => {}
-            _ = tokio::signal::ctrl_c() => {
-                tracing::info!("received shutdown signal, initiating graceful drain");
-
-                // Phase 1: Announce departure via SWIM Leave gossip and
-                // unregister all names owned by this node from the registry.
-                let drain = NodeDrain::new(DrainConfig::default());
-                let mut gossip = GossipQueue::new();
-                let names_removed = {
-                    let mut reg = registry.lock().unwrap();
-                    drain.announce(node_id, peer_addr, &mut gossip, &mut reg)
-                };
-                tracing::info!(
-                    names_removed,
-                    "phase 1: announced departure via SWIM Leave gossip"
-                );
-
-                // Phase 2 is skipped — the outbound loop has already stopped
-                // because we exited the select!.
-
-                // Phase 3: Close all peer connections.
-                let cm = distributed_runtime.connection_manager_mut();
-                let closed = cm.drain_connections().await;
-                tracing::info!(
-                    connections_closed = closed,
-                    "phase 3: connections drained, shutdown complete"
-                );
-            }
+            _ = tokio::signal::ctrl_c() => {}
+            _ = sigterm.recv() => {}
         }
+        // Shared shutdown logic (reached by any signal branch above).
+        tracing::info!("received shutdown signal, initiating graceful drain");
+
+        // Phase 0: Snapshot KV state to disk so data survives restart.
+        match kv_store.snapshot() {
+            Ok(()) => tracing::info!("phase 0: KV snapshot written"),
+            Err(e) => tracing::error!(error = %e, "phase 0: KV snapshot failed"),
+        }
+
+        // Phase 1: Announce departure via SWIM Leave gossip and
+        // unregister all names owned by this node from the registry.
+        let drain = NodeDrain::new(DrainConfig::default());
+        let mut gossip = GossipQueue::new();
+        let names_removed = {
+            let mut reg = registry.lock().unwrap();
+            drain.announce(node_id, peer_addr, &mut gossip, &mut reg)
+        };
+        tracing::info!(
+            names_removed,
+            "phase 1: announced departure via SWIM Leave gossip"
+        );
+
+        // Phase 2 is skipped — the outbound loop has already stopped
+        // because we exited the select!.
+
+        // Phase 3: Close all peer connections.
+        let cm = distributed_runtime.connection_manager_mut();
+        let closed = cm.drain_connections().await;
+        tracing::info!(
+            connections_closed = closed,
+            "phase 3: connections drained, shutdown complete"
+        );
 
         Ok(())
     }
