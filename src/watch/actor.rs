@@ -76,38 +76,75 @@ pub async fn spawn_watch_hub_actor(
                                 if let Some(ref store) = store {
                                     // changes_since is exclusive, so pass start_revision - 1
                                     // to include events AT start_revision.
-                                    match store.changes_since(start_revision - 1).await {
-                                        Ok(changes) => {
-                                            for (change_key, event_type, kv) in changes {
-                                                if !key_matches(&key, &range_end, &change_key) {
-                                                    continue;
-                                                }
+                                    if prev_kv {
+                                        match store.changes_since_with_prev(start_revision - 1).await {
+                                            Ok(changes) => {
+                                                for (change_key, event_type, kv, prev) in changes {
+                                                    if !key_matches(&key, &range_end, &change_key) {
+                                                        continue;
+                                                    }
 
-                                                // Apply filters during historical replay.
-                                                if filters.contains(&event_type) {
-                                                    continue;
-                                                }
+                                                    // Apply filters during historical replay.
+                                                    if filters.contains(&event_type) {
+                                                        continue;
+                                                    }
 
-                                                let event = mvccpb::Event {
-                                                    r#type: event_type,
-                                                    kv: Some(kv),
-                                                    prev_kv: None,
-                                                };
+                                                    let event = mvccpb::Event {
+                                                        r#type: event_type,
+                                                        kv: Some(kv),
+                                                        prev_kv: prev,
+                                                    };
 
-                                                let watch_event = WatchEvent {
-                                                    watch_id: id,
-                                                    events: vec![event],
-                                                    compact_revision: 0,
-                                                };
+                                                    let watch_event = WatchEvent {
+                                                        watch_id: id,
+                                                        events: vec![event],
+                                                        compact_revision: 0,
+                                                    };
 
-                                                // If the receiver is gone, stop replaying.
-                                                if tx.send(watch_event).await.is_err() {
-                                                    break;
+                                                    // If the receiver is gone, stop replaying.
+                                                    if tx.send(watch_event).await.is_err() {
+                                                        break;
+                                                    }
                                                 }
                                             }
+                                            Err(e) => {
+                                                tracing::warn!("failed to replay watch history: {}", e);
+                                            }
                                         }
-                                        Err(e) => {
-                                            tracing::warn!("failed to replay watch history: {}", e);
+                                    } else {
+                                        match store.changes_since(start_revision - 1).await {
+                                            Ok(changes) => {
+                                                for (change_key, event_type, kv) in changes {
+                                                    if !key_matches(&key, &range_end, &change_key) {
+                                                        continue;
+                                                    }
+
+                                                    // Apply filters during historical replay.
+                                                    if filters.contains(&event_type) {
+                                                        continue;
+                                                    }
+
+                                                    let event = mvccpb::Event {
+                                                        r#type: event_type,
+                                                        kv: Some(kv),
+                                                        prev_kv: None,
+                                                    };
+
+                                                    let watch_event = WatchEvent {
+                                                        watch_id: id,
+                                                        events: vec![event],
+                                                        compact_revision: 0,
+                                                    };
+
+                                                    // If the receiver is gone, stop replaying.
+                                                    if tx.send(watch_event).await.is_err() {
+                                                        break;
+                                                    }
+                                                }
+                                            }
+                                            Err(e) => {
+                                                tracing::warn!("failed to replay watch history: {}", e);
+                                            }
                                         }
                                     }
                                 }

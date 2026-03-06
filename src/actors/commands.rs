@@ -239,6 +239,11 @@ pub enum KvStoreCmd {
         after_revision: i64,
         reply: oneshot::Sender<Result<Vec<(Vec<u8>, i32, mvccpb::KeyValue)>, String>>,
     },
+    /// Return all mutations since a revision (exclusive), including previous key-values.
+    ChangesSinceWithPrev {
+        after_revision: i64,
+        reply: oneshot::Sender<Result<Vec<(Vec<u8>, i32, mvccpb::KeyValue, Option<mvccpb::KeyValue>)>, String>>,
+    },
     /// Get the database file size in bytes.
     DbFileSize {
         reply: oneshot::Sender<Result<i64, String>>,

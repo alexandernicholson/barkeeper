@@ -79,6 +79,13 @@ pub async fn spawn_kv_store_actor(runtime: &Runtime, store: Arc<KvStore>) -> KvS
                             }).await.expect("kv store spawn_blocking panicked");
                             let _ = reply.send(result);
                         }
+                        KvStoreCmd::ChangesSinceWithPrev { after_revision, reply } => {
+                            let s = Arc::clone(&store);
+                            let result = tokio::task::spawn_blocking(move || {
+                                s.changes_since_with_prev(after_revision).map_err(|e| e.to_string())
+                            }).await.expect("kv store spawn_blocking panicked");
+                            let _ = reply.send(result);
+                        }
                         KvStoreCmd::DbFileSize { reply } => {
                             let s = Arc::clone(&store);
                             let result = tokio::task::spawn_blocking(move || {
@@ -246,6 +253,22 @@ impl KvStoreActorHandle {
         let (reply, rx) = oneshot::channel();
         self.cmd_tx
             .send(KvStoreCmd::ChangesSince {
+                after_revision,
+                reply,
+            })
+            .await
+            .expect("kv store actor dead");
+        rx.await.expect("kv store actor dropped")
+    }
+
+    /// Return all mutations since `after_revision` (exclusive), including previous key-values.
+    pub async fn changes_since_with_prev(
+        &self,
+        after_revision: i64,
+    ) -> Result<Vec<(Vec<u8>, i32, mvccpb::KeyValue, Option<mvccpb::KeyValue>)>, String> {
+        let (reply, rx) = oneshot::channel();
+        self.cmd_tx
+            .send(KvStoreCmd::ChangesSinceWithPrev {
                 after_revision,
                 reply,
             })

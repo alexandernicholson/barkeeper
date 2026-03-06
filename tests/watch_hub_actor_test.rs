@@ -463,3 +463,39 @@ async fn test_watch_duplicate_watch_id_collision() {
     let result = rx2.recv().await;
     assert!(result.is_none(), "channel should be closed on collision");
 }
+
+/// Historical replay with prev_kv=true should include the previous key-value.
+#[tokio::test]
+async fn test_watch_prev_kv_historical_replay() {
+    let rt = make_runtime();
+    let dir = tempfile::tempdir().unwrap();
+    let store_raw = KvStore::open(dir.path()).unwrap();
+
+    // Put foo=bar at revision 1, then foo=baz at revision 2.
+    store_raw.put(b"foo", b"bar", 0).unwrap();
+    store_raw.put(b"foo", b"baz", 0).unwrap();
+
+    let store = spawn_kv_store_actor(&rt, std::sync::Arc::new(store_raw)).await;
+    let hub = spawn_watch_hub_actor(&rt, Some(store)).await;
+
+    // Create watch with prev_kv=true, replay from revision 2.
+    let (_wid, mut rx) = hub
+        .create_watch(b"foo".to_vec(), vec![], 2, vec![], true)
+        .await;
+
+    let event = timeout(Duration::from_secs(2), rx.recv())
+        .await
+        .expect("timeout")
+        .expect("channel closed");
+
+    assert_eq!(event.events[0].r#type, 0); // PUT
+    let kv = event.events[0].kv.as_ref().unwrap();
+    assert_eq!(kv.value, b"baz");
+
+    // prev_kv should contain the old value "bar"
+    let prev = event.events[0]
+        .prev_kv
+        .as_ref()
+        .expect("prev_kv should be set");
+    assert_eq!(prev.value, b"bar");
+}

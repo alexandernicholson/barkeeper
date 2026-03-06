@@ -563,6 +563,49 @@ impl KvStore {
         Ok(results)
     }
 
+    /// Return watch events (key, event_type, kv, prev_kv) since `after_revision`.
+    /// Like `changes_since` but also looks up the previous revision's value for each key.
+    pub fn changes_since_with_prev(
+        &self,
+        after_revision: i64,
+    ) -> Result<Vec<(Vec<u8>, i32, mvccpb::KeyValue, Option<mvccpb::KeyValue>)>, StoreError> {
+        let inner = self.inner.read().unwrap();
+        let start_rev = (after_revision + 1) as u64;
+        let mut results = Vec::new();
+
+        for (&rev, entries) in inner.revisions.range(start_rev..) {
+            for re in entries {
+                let event_type = match re.event_type {
+                    EventType::Put => 0,
+                    EventType::Delete => 1,
+                };
+                let compound = make_compound_key(&re.key, rev);
+                let kv = match inner.kv.get(&compound) {
+                    Some(ikv) => ikv.to_proto(),
+                    None => mvccpb::KeyValue {
+                        key: re.key.clone(),
+                        mod_revision: rev as i64,
+                        ..Default::default()
+                    },
+                };
+
+                // Look up the previous revision's value for this key.
+                let prev_kv = {
+                    let range_start = make_compound_key(&re.key, 0);
+                    let range_end = make_compound_key(&re.key, rev);
+                    inner
+                        .kv
+                        .range(range_start..range_end)
+                        .next_back()
+                        .map(|(_, ikv)| ikv.to_proto())
+                };
+
+                results.push((re.key.clone(), event_type, kv, prev_kv));
+            }
+        }
+        Ok(results)
+    }
+
     /// Apply a batch of commands atomically within a single write lock.
     /// Updates `raft_applied_index` at the end.
     pub fn batch_apply_with_index(
