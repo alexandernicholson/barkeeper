@@ -10,7 +10,7 @@ use crossterm::{
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 
-use bkctl::app::{App, ClusterStatus, EventType, Tab, WatchEvent};
+use bkctl::app::{App, ClusterStatus, EventType, PendingAction, Tab, WatchEvent};
 use bkctl::client::BkClient;
 use bkctl::event::handle_key_event;
 use bkctl::ui;
@@ -92,27 +92,37 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             if let Event::Key(key) = event::read()? {
                 handle_key_event(&mut app, key.code, key.modifiers);
 
-                // Handle actions that need async RPCs.
-                match key.code {
-                    KeyCode::Enter if app.active_tab() == Tab::Keys => {
-                        // Fetch value for selected key.
-                        if let Some(full_key) = app.selected_full_key() {
-                            if let Ok(Some(kv)) = client.get(full_key.as_bytes()).await {
-                                app.set_selected_value(Some(kv.value.clone()));
-                                app.set_selected_key_meta(Some(bkctl::app::KeyMeta {
-                                    revision: kv.create_revision,
-                                    mod_revision: kv.mod_revision,
-                                    version: kv.version,
-                                    lease: kv.lease,
-                                }));
-                            }
+                // Fetch value when Enter is pressed on a leaf key.
+                if key.code == KeyCode::Enter && app.active_tab() == Tab::Keys {
+                    if let Some(full_key) = app.selected_full_key() {
+                        if let Ok(Some(kv)) = client.get(full_key.as_bytes()).await {
+                            app.set_selected_value(Some(kv.value.clone()));
+                            app.set_selected_key_meta(Some(bkctl::app::KeyMeta {
+                                revision: kv.create_revision,
+                                mod_revision: kv.mod_revision,
+                                version: kv.version,
+                                lease: kv.lease,
+                            }));
                         }
                     }
-                    KeyCode::Char('r') => {
-                        refresh_dashboard(&client, &mut app).await;
-                        refresh_keys(&client, &mut app).await;
+                }
+
+                // Handle pending actions from dialogs/keybindings.
+                if let Some(action) = app.take_pending_action() {
+                    match action {
+                        PendingAction::Put { key, value } => {
+                            let _ = client.put(key.as_bytes(), value.as_bytes()).await;
+                            refresh_keys(&client, &mut app).await;
+                        }
+                        PendingAction::Delete { key } => {
+                            let _ = client.delete(key.as_bytes()).await;
+                            refresh_keys(&client, &mut app).await;
+                        }
+                        PendingAction::Refresh => {
+                            refresh_dashboard(&client, &mut app).await;
+                            refresh_keys(&client, &mut app).await;
+                        }
                     }
-                    _ => {}
                 }
             }
         }

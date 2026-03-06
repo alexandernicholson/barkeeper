@@ -42,6 +42,24 @@ pub struct ClusterStatus {
 pub enum DialogKind {
     Put,
     DeleteConfirm,
+    Search,
+}
+
+/// Actions the main loop should perform after an event.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PendingAction {
+    /// Put key=dialog_key, value=dialog_value
+    Put { key: String, value: String },
+    /// Delete the given key
+    Delete { key: String },
+    /// Refresh all data
+    Refresh,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DialogField {
+    Key,
+    Value,
 }
 
 const MAX_WATCH_EVENTS: usize = 1000;
@@ -69,6 +87,11 @@ pub struct App {
     dialog: Option<DialogKind>,
     dialog_key: String,
     dialog_value: String,
+    dialog_field: DialogField,
+    search_input: String,
+
+    // Pending action for the main loop to execute
+    pub pending_action: Option<PendingAction>,
 
     // Connection
     pub endpoint: String,
@@ -102,6 +125,9 @@ impl App {
             dialog: None,
             dialog_key: String::new(),
             dialog_value: String::new(),
+            dialog_field: DialogField::Key,
+            search_input: String::new(),
+            pending_action: None,
             endpoint: String::new(),
             watch_prefix: "/".to_string(),
             should_quit: false,
@@ -320,10 +346,16 @@ impl App {
         self.dialog = Some(DialogKind::Put);
         self.dialog_key.clear();
         self.dialog_value.clear();
+        self.dialog_field = DialogField::Key;
     }
 
     pub fn open_delete_confirm(&mut self) {
         self.dialog = Some(DialogKind::DeleteConfirm);
+    }
+
+    pub fn open_search_dialog(&mut self) {
+        self.dialog = Some(DialogKind::Search);
+        self.search_input.clear();
     }
 
     pub fn close_dialog(&mut self) {
@@ -348,5 +380,86 @@ impl App {
 
     pub fn set_dialog_value(&mut self, value: &str) {
         self.dialog_value = value.to_string();
+    }
+
+    pub fn dialog_field(&self) -> DialogField {
+        self.dialog_field
+    }
+
+    pub fn toggle_dialog_field(&mut self) {
+        self.dialog_field = match self.dialog_field {
+            DialogField::Key => DialogField::Value,
+            DialogField::Value => DialogField::Key,
+        };
+    }
+
+    pub fn search_input(&self) -> &str {
+        &self.search_input
+    }
+
+    /// Append a char to the active dialog field.
+    pub fn dialog_type_char(&mut self, c: char) {
+        match self.dialog {
+            Some(DialogKind::Put) => match self.dialog_field {
+                DialogField::Key => self.dialog_key.push(c),
+                DialogField::Value => self.dialog_value.push(c),
+            },
+            Some(DialogKind::Search) => self.search_input.push(c),
+            _ => {}
+        }
+    }
+
+    /// Backspace in the active dialog field.
+    pub fn dialog_backspace(&mut self) {
+        match self.dialog {
+            Some(DialogKind::Put) => match self.dialog_field {
+                DialogField::Key => { self.dialog_key.pop(); }
+                DialogField::Value => { self.dialog_value.pop(); }
+            },
+            Some(DialogKind::Search) => { self.search_input.pop(); }
+            _ => {}
+        }
+    }
+
+    /// Confirm the put dialog. Returns a PendingAction and closes the dialog.
+    pub fn confirm_put(&mut self) -> Option<PendingAction> {
+        if self.dialog_key.is_empty() {
+            return None;
+        }
+        let action = PendingAction::Put {
+            key: self.dialog_key.clone(),
+            value: self.dialog_value.clone(),
+        };
+        self.dialog = None;
+        self.pending_action = Some(action.clone());
+        Some(action)
+    }
+
+    /// Confirm the delete dialog. Returns a PendingAction and closes the dialog.
+    pub fn confirm_delete(&mut self) -> Option<PendingAction> {
+        if let Some(key) = self.selected_full_key() {
+            let action = PendingAction::Delete { key };
+            self.dialog = None;
+            self.pending_action = Some(action.clone());
+            Some(action)
+        } else {
+            self.dialog = None;
+            None
+        }
+    }
+
+    /// Confirm the search dialog. Applies the filter and closes the dialog.
+    pub fn confirm_search(&mut self) {
+        if self.search_input.is_empty() {
+            self.clear_search();
+        } else {
+            self.set_search(&self.search_input.clone());
+        }
+        self.dialog = None;
+    }
+
+    /// Take the pending action (returns it and clears it).
+    pub fn take_pending_action(&mut self) -> Option<PendingAction> {
+        self.pending_action.take()
     }
 }

@@ -259,6 +259,16 @@ fn draw_dialog(f: &mut Frame, app: &App, kind: DialogKind) {
                 .wrap(Wrap { trim: false });
             f.render_widget(dialog, area);
         }
+        DialogKind::Search => {
+            let text = format!(
+                "Search: {}\n\n[Enter] apply  [Esc] cancel",
+                app.search_input()
+            );
+            let dialog = Paragraph::new(text)
+                .block(Block::default().borders(Borders::ALL).title("Search Keys"))
+                .wrap(Wrap { trim: false });
+            f.render_widget(dialog, area);
+        }
     }
 }
 

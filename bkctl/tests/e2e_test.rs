@@ -30,8 +30,10 @@ use barkeeper::watch::actor::spawn_watch_hub_actor;
 use rebar_core::runtime::Runtime;
 use tonic::transport::Server;
 
-use bkctl::app::{App, ClusterStatus, EventType, Tab, WatchEvent};
+use bkctl::app::{App, ClusterStatus, EventType, PendingAction, Tab, WatchEvent};
 use bkctl::client::BkClient;
+use bkctl::event::handle_key_event;
+use crossterm::event::{KeyCode, KeyModifiers};
 
 struct TestServer {
     endpoint: String,
@@ -279,4 +281,151 @@ async fn test_e2e_tab_switching_preserves_state() {
 
     app.toggle_tab();
     assert_eq!(app.current_prefix(), "/x/");
+}
+
+/// Put a key via the put dialog flow, then verify it exists in the server.
+#[tokio::test]
+async fn test_e2e_put_via_dialog() {
+    let server = TestServer::start().await;
+    let client = BkClient::connect(&server.endpoint).await.unwrap();
+    let mut app = App::new();
+    app.toggle_tab(); // Switch to Keys tab.
+
+    // Open put dialog with 'p'.
+    handle_key_event(&mut app, KeyCode::Char('p'), KeyModifiers::NONE);
+    assert!(app.is_dialog_open());
+
+    // Type key: "/dialog/put".
+    for c in "/dialog/put".chars() {
+        handle_key_event(&mut app, KeyCode::Char(c), KeyModifiers::NONE);
+    }
+    assert_eq!(app.dialog_key(), "/dialog/put");
+
+    // Tab to value field.
+    handle_key_event(&mut app, KeyCode::Tab, KeyModifiers::NONE);
+
+    // Type value: "hello".
+    for c in "hello".chars() {
+        handle_key_event(&mut app, KeyCode::Char(c), KeyModifiers::NONE);
+    }
+    assert_eq!(app.dialog_value(), "hello");
+
+    // Confirm with Enter.
+    handle_key_event(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+    assert!(!app.is_dialog_open());
+
+    // Take the pending action and execute it.
+    let action = app.take_pending_action().unwrap();
+    match action {
+        PendingAction::Put { key, value } => {
+            client.put(key.as_bytes(), value.as_bytes()).await.unwrap();
+        }
+        _ => panic!("expected Put action"),
+    }
+
+    // Verify the key was written.
+    let kv = client.get(b"/dialog/put").await.unwrap().unwrap();
+    assert_eq!(kv.value, b"hello");
+}
+
+/// Delete a key via the delete confirmation dialog flow.
+#[tokio::test]
+async fn test_e2e_delete_via_dialog() {
+    let server = TestServer::start().await;
+    let client = BkClient::connect(&server.endpoint).await.unwrap();
+    let mut app = App::new();
+
+    // Seed a key.
+    client.put(b"/delme", b"gone").await.unwrap();
+    let kvs = client.get_prefix(b"/").await.unwrap();
+    app.set_keys(kvs.iter().map(|kv| kv.key.clone()).collect());
+
+    app.toggle_tab(); // Keys tab.
+
+    // Select the leaf key "/delme".
+    assert_eq!(app.selected_full_key(), Some("/delme".to_string()));
+
+    // Open delete confirm with 'd'.
+    handle_key_event(&mut app, KeyCode::Char('d'), KeyModifiers::NONE);
+    assert!(app.is_dialog_open());
+
+    // Confirm with 'y'.
+    handle_key_event(&mut app, KeyCode::Char('y'), KeyModifiers::NONE);
+    assert!(!app.is_dialog_open());
+
+    // Execute the pending action.
+    let action = app.take_pending_action().unwrap();
+    match action {
+        PendingAction::Delete { key } => {
+            client.delete(key.as_bytes()).await.unwrap();
+        }
+        _ => panic!("expected Delete action"),
+    }
+
+    // Verify key is gone.
+    let kv = client.get(b"/delme").await.unwrap();
+    assert!(kv.is_none());
+}
+
+/// Search dialog filters keys.
+#[tokio::test]
+async fn test_e2e_search_flow() {
+    let server = TestServer::start().await;
+    let client = BkClient::connect(&server.endpoint).await.unwrap();
+    let mut app = App::new();
+
+    client.put(b"/app/nginx", b"1").await.unwrap();
+    client.put(b"/app/redis", b"2").await.unwrap();
+    client.put(b"/sys/kube", b"3").await.unwrap();
+
+    let kvs = client.get_prefix(b"/").await.unwrap();
+    app.set_keys(kvs.iter().map(|kv| kv.key.clone()).collect());
+    app.toggle_tab(); // Keys tab.
+
+    // Open search dialog with '/'.
+    handle_key_event(&mut app, KeyCode::Char('/'), KeyModifiers::NONE);
+    assert!(app.is_dialog_open());
+
+    // Type "nginx".
+    for c in "nginx".chars() {
+        handle_key_event(&mut app, KeyCode::Char(c), KeyModifiers::NONE);
+    }
+
+    // Confirm with Enter.
+    handle_key_event(&mut app, KeyCode::Enter, KeyModifiers::NONE);
+    assert!(!app.is_dialog_open());
+    assert_eq!(app.search_query(), Some("nginx"));
+
+    // Filtered keys should only include nginx.
+    let filtered = app.filtered_keys();
+    assert_eq!(filtered.len(), 1);
+    assert_eq!(filtered[0], b"/app/nginx");
+}
+
+/// Refresh action reloads data from server.
+#[tokio::test]
+async fn test_e2e_refresh() {
+    let server = TestServer::start().await;
+    let client = BkClient::connect(&server.endpoint).await.unwrap();
+    let mut app = App::new();
+
+    // Initially no keys.
+    let kvs = client.get_prefix(b"/").await.unwrap();
+    app.set_keys(kvs.iter().map(|kv| kv.key.clone()).collect());
+    assert_eq!(app.visible_count(), 0);
+
+    // Add a key on the server side.
+    client.put(b"/new", b"val").await.unwrap();
+
+    // Press 'r' to trigger refresh.
+    handle_key_event(&mut app, KeyCode::Char('r'), KeyModifiers::NONE);
+    let action = app.take_pending_action().unwrap();
+    assert_eq!(action, PendingAction::Refresh);
+
+    // Simulate what main.rs does on refresh.
+    let kvs = client.get_prefix(b"/").await.unwrap();
+    app.set_keys(kvs.iter().map(|kv| kv.key.clone()).collect());
+
+    assert!(app.visible_count() > 0);
+    assert!(app.visible_keys().contains(&"new".to_string()));
 }

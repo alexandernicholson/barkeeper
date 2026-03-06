@@ -60,6 +60,7 @@ Split pane layout:
 | `Backspace` | Go up one level |
 | `p` | Open put dialog (Keys tab) |
 | `d` | Open delete confirmation (Keys tab) |
+| `/` | Search keys (Keys tab) |
 | `r` | Refresh data |
 | `q` / `Esc` | Quit |
 | `Ctrl+C` | Quit |
@@ -89,13 +90,13 @@ Three-layer design with full test coverage:
 cargo test -p bkctl
 ```
 
-28 tests across 4 test files:
+39 tests across 4 test files:
 
 | File | Tests | What it covers |
 |------|-------|----------------|
-| `tests/app_test.rs` | 11 | Pure state transitions (no I/O) |
+| `tests/app_test.rs` | 18 | Pure state transitions, dialog flows, search (no I/O) |
 | `tests/client_test.rs` | 7 | gRPC RPCs against a real barkeeper |
 | `tests/ui_test.rs` | 5 | Ratatui rendering via TestBackend |
-| `tests/e2e_test.rs` | 5 | Full flows: put → browse → select → read value |
+| `tests/e2e_test.rs` | 9 | Full flows: put/delete via dialog, search, refresh, browse |
 
 Client and e2e tests start a real barkeeper instance (Raft + state machine + gRPC server) on random ports using `portpicker`.

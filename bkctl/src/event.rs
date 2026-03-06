@@ -3,7 +3,7 @@
 use crossterm::event::KeyCode;
 use crossterm::event::KeyModifiers;
 
-use crate::app::{App, Tab};
+use crate::app::{App, DialogKind, PendingAction, Tab};
 
 /// Handle a key event, mutating app state. Returns true if the event was consumed.
 pub fn handle_key_event(app: &mut App, code: KeyCode, modifiers: KeyModifiers) -> bool {
@@ -59,6 +59,16 @@ pub fn handle_key_event(app: &mut App, code: KeyCode, modifiers: KeyModifiers) -
             }
             true
         }
+        KeyCode::Char('/') => {
+            if app.active_tab() == Tab::Keys {
+                app.open_search_dialog();
+            }
+            true
+        }
+        KeyCode::Char('r') => {
+            app.pending_action = Some(PendingAction::Refresh);
+            true
+        }
         KeyCode::Char('c') if modifiers.contains(KeyModifiers::CONTROL) => {
             app.should_quit = true;
             true
@@ -68,15 +78,72 @@ pub fn handle_key_event(app: &mut App, code: KeyCode, modifiers: KeyModifiers) -
 }
 
 fn handle_dialog_key(app: &mut App, code: KeyCode) -> bool {
+    match app.dialog_kind() {
+        Some(DialogKind::Put) => handle_put_dialog_key(app, code),
+        Some(DialogKind::DeleteConfirm) => handle_delete_dialog_key(app, code),
+        Some(DialogKind::Search) => handle_search_dialog_key(app, code),
+        None => false,
+    }
+}
+
+fn handle_put_dialog_key(app: &mut App, code: KeyCode) -> bool {
     match code {
         KeyCode::Esc => {
             app.close_dialog();
             true
         }
         KeyCode::Enter => {
-            // Confirm action — the main loop handles the actual RPC.
+            app.confirm_put();
             true
         }
-        _ => true, // consume all keys in dialog mode
+        KeyCode::Tab => {
+            app.toggle_dialog_field();
+            true
+        }
+        KeyCode::Backspace => {
+            app.dialog_backspace();
+            true
+        }
+        KeyCode::Char(c) => {
+            app.dialog_type_char(c);
+            true
+        }
+        _ => true,
+    }
+}
+
+fn handle_delete_dialog_key(app: &mut App, code: KeyCode) -> bool {
+    match code {
+        KeyCode::Char('y') => {
+            app.confirm_delete();
+            true
+        }
+        KeyCode::Char('n') | KeyCode::Esc => {
+            app.close_dialog();
+            true
+        }
+        _ => true,
+    }
+}
+
+fn handle_search_dialog_key(app: &mut App, code: KeyCode) -> bool {
+    match code {
+        KeyCode::Esc => {
+            app.close_dialog();
+            true
+        }
+        KeyCode::Enter => {
+            app.confirm_search();
+            true
+        }
+        KeyCode::Backspace => {
+            app.dialog_backspace();
+            true
+        }
+        KeyCode::Char(c) => {
+            app.dialog_type_char(c);
+            true
+        }
+        _ => true,
     }
 }
