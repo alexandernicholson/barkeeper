@@ -270,10 +270,14 @@ SUCCEEDED=$(echo "$OUT" | jq -r '.succeeded // "false"')
 if [ "$SUCCEEDED" = "false" ] || [ "$SUCCEEDED" = "null" ]; then pass "Txn failure branch"; else fail "Txn failure branch" "$OUT"; fi
 
 # Txn via etcdctl (interactive=false to avoid heredoc EOF issues)
+# Note: etcdctl non-interactive txn needs 3 sections separated by blank lines:
+#   compares, success ops, failure ops.  An extra blank line is needed for the
+#   empty failure block, otherwise etcdctl returns EOF.
 OUT=$(etcd txn --interactive=false <<'TXNEOF'
 value("txnkey") = "txnval_new"
 
 put txnkey txnval_etcdctl
+
 
 TXNEOF
 )
