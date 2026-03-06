@@ -24,6 +24,7 @@ struct Watcher {
     range_end: Vec<u8>,
     filters: Vec<i32>,
     prev_kv: bool,
+    progress_notify: bool,
     tx: mpsc::Sender<WatchEvent>,
 }
 
@@ -42,12 +43,15 @@ pub async fn spawn_watch_hub_actor(
     runtime.spawn(move |mut ctx| async move {
         let mut watchers: HashMap<i64, Watcher> = HashMap::new();
         let mut next_id: i64 = 1;
+        // Progress notification interval (10 seconds for kube-apiserver compat).
+        let mut progress_interval = tokio::time::interval(std::time::Duration::from_secs(10));
+        progress_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
         loop {
             tokio::select! {
                 Some(cmd) = cmd_rx.recv() => {
                     match cmd {
-                        WatchHubCmd::CreateWatch { key, range_end, start_revision, filters, prev_kv, requested_watch_id, reply } => {
+                        WatchHubCmd::CreateWatch { key, range_end, start_revision, filters, prev_kv, progress_notify, requested_watch_id, reply } => {
                             let (tx, rx) = mpsc::channel(256);
 
                             // Determine watch ID: use requested if non-zero, else auto-assign.
@@ -76,40 +80,33 @@ pub async fn spawn_watch_hub_actor(
                                 if let Some(ref store) = store {
                                     // changes_since is exclusive, so pass start_revision - 1
                                     // to include events AT start_revision.
-                                    if prev_kv {
+                                    let replay_result: Result<(), String> = if prev_kv {
                                         match store.changes_since_with_prev(start_revision - 1).await {
                                             Ok(changes) => {
                                                 for (change_key, event_type, kv, prev) in changes {
                                                     if !key_matches(&key, &range_end, &change_key) {
                                                         continue;
                                                     }
-
-                                                    // Apply filters during historical replay.
                                                     if filters.contains(&event_type) {
                                                         continue;
                                                     }
-
                                                     let event = mvccpb::Event {
                                                         r#type: event_type,
                                                         kv: Some(kv),
                                                         prev_kv: prev,
                                                     };
-
                                                     let watch_event = WatchEvent {
                                                         watch_id: id,
                                                         events: vec![event],
                                                         compact_revision: 0,
                                                     };
-
-                                                    // If the receiver is gone, stop replaying.
                                                     if tx.send(watch_event).await.is_err() {
                                                         break;
                                                     }
                                                 }
+                                                Ok(())
                                             }
-                                            Err(e) => {
-                                                tracing::warn!("failed to replay watch history: {}", e);
-                                            }
+                                            Err(e) => Err(e),
                                         }
                                     } else {
                                         match store.changes_since(start_revision - 1).await {
@@ -118,34 +115,45 @@ pub async fn spawn_watch_hub_actor(
                                                     if !key_matches(&key, &range_end, &change_key) {
                                                         continue;
                                                     }
-
-                                                    // Apply filters during historical replay.
                                                     if filters.contains(&event_type) {
                                                         continue;
                                                     }
-
                                                     let event = mvccpb::Event {
                                                         r#type: event_type,
                                                         kv: Some(kv),
                                                         prev_kv: None,
                                                     };
-
                                                     let watch_event = WatchEvent {
                                                         watch_id: id,
                                                         events: vec![event],
                                                         compact_revision: 0,
                                                     };
-
-                                                    // If the receiver is gone, stop replaying.
                                                     if tx.send(watch_event).await.is_err() {
                                                         break;
                                                     }
                                                 }
+                                                Ok(())
                                             }
-                                            Err(e) => {
-                                                tracing::warn!("failed to replay watch history: {}", e);
-                                            }
+                                            Err(e) => Err(e),
                                         }
+                                    };
+
+                                    if let Err(e) = replay_result {
+                                        if e.contains("compacted") {
+                                            // Send compaction error event and cancel watch.
+                                            let compact_rev = store.compacted_revision().await.unwrap_or(0);
+                                            let error_event = WatchEvent {
+                                                watch_id: id,
+                                                events: vec![],
+                                                compact_revision: compact_rev,
+                                            };
+                                            let _ = tx.send(error_event).await;
+                                            // Drop tx so the channel closes after the error.
+                                            drop(tx);
+                                            let _ = reply.send((id, rx));
+                                            continue;
+                                        }
+                                        tracing::warn!("failed to replay watch history: {}", e);
                                     }
                                 }
                             }
@@ -156,6 +164,7 @@ pub async fn spawn_watch_hub_actor(
                                 range_end,
                                 filters,
                                 prev_kv,
+                                progress_notify,
                                 tx,
                             };
                             watchers.insert(id, watcher);
@@ -211,6 +220,32 @@ pub async fn spawn_watch_hub_actor(
                         }
                     }
                 }
+                // Periodic progress notifications for watchers with progress_notify=true.
+                _ = progress_interval.tick() => {
+                    let mut dead_ids = Vec::new();
+                    // Get current revision from store if available.
+                    let _current_rev = if let Some(ref store) = store {
+                        store.current_revision().await.unwrap_or(0)
+                    } else {
+                        0
+                    };
+                    for (id, watcher) in watchers.iter() {
+                        if !watcher.progress_notify {
+                            continue;
+                        }
+                        let progress_event = WatchEvent {
+                            watch_id: watcher.id,
+                            events: vec![],
+                            compact_revision: 0,
+                        };
+                        if watcher.tx.send(progress_event).await.is_err() {
+                            dead_ids.push(*id);
+                        }
+                    }
+                    for id in dead_ids {
+                        watchers.remove(&id);
+                    }
+                }
                 // Also listen on Rebar mailbox for future distributed messages.
                 Some(_msg) = ctx.recv() => {
                     // Reserved for future distributed watch coordination.
@@ -246,7 +281,21 @@ impl WatchHubActorHandle {
         filters: Vec<i32>,
         prev_kv: bool,
     ) -> (i64, mpsc::Receiver<WatchEvent>) {
-        self.create_watch_with_id(key, range_end, start_revision, filters, prev_kv, 0)
+        self.create_watch_full(key, range_end, start_revision, filters, prev_kv, false, 0)
+            .await
+    }
+
+    /// Create a watch with progress_notify support.
+    pub async fn create_watch_with_progress(
+        &self,
+        key: Vec<u8>,
+        range_end: Vec<u8>,
+        start_revision: i64,
+        filters: Vec<i32>,
+        prev_kv: bool,
+        progress_notify: bool,
+    ) -> (i64, mpsc::Receiver<WatchEvent>) {
+        self.create_watch_full(key, range_end, start_revision, filters, prev_kv, progress_notify, 0)
             .await
     }
 
@@ -265,6 +314,21 @@ impl WatchHubActorHandle {
         prev_kv: bool,
         requested_watch_id: i64,
     ) -> (i64, mpsc::Receiver<WatchEvent>) {
+        self.create_watch_full(key, range_end, start_revision, filters, prev_kv, false, requested_watch_id)
+            .await
+    }
+
+    /// Full-featured watch creation with all options.
+    pub async fn create_watch_full(
+        &self,
+        key: Vec<u8>,
+        range_end: Vec<u8>,
+        start_revision: i64,
+        filters: Vec<i32>,
+        prev_kv: bool,
+        progress_notify: bool,
+        requested_watch_id: i64,
+    ) -> (i64, mpsc::Receiver<WatchEvent>) {
         let (reply, rx) = oneshot::channel();
         self.cmd_tx
             .send(WatchHubCmd::CreateWatch {
@@ -273,6 +337,7 @@ impl WatchHubActorHandle {
                 start_revision,
                 filters,
                 prev_kv,
+                progress_notify,
                 requested_watch_id,
                 reply,
             })

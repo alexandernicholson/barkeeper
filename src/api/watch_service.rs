@@ -68,12 +68,13 @@ impl Watch for WatchService {
                 match req.request_union {
                     Some(RequestUnion::CreateRequest(create)) => {
                         let (watch_id, mut event_rx) = hub
-                            .create_watch_with_id(
+                            .create_watch_full(
                                 create.key,
                                 create.range_end,
                                 create.start_revision,
                                 create.filters,
                                 create.prev_kv,
+                                create.progress_notify,
                                 create.watch_id,
                             )
                             .await;

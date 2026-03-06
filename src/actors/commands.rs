@@ -36,6 +36,7 @@ pub enum WatchHubCmd {
         start_revision: i64,
         filters: Vec<i32>,
         prev_kv: bool,
+        progress_notify: bool,
         requested_watch_id: i64,
         reply: oneshot::Sender<(i64, tokio::sync::mpsc::Receiver<crate::watch::hub::WatchEvent>)>,
     },
@@ -232,6 +233,10 @@ pub enum KvStoreCmd {
     },
     /// Get the current revision number.
     CurrentRevision {
+        reply: oneshot::Sender<Result<i64, String>>,
+    },
+    /// Return the compacted revision floor.
+    CompactedRevision {
         reply: oneshot::Sender<Result<i64, String>>,
     },
     /// Return all mutations since a revision (exclusive).

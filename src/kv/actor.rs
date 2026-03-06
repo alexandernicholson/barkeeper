@@ -72,6 +72,13 @@ pub async fn spawn_kv_store_actor(runtime: &Runtime, store: Arc<KvStore>) -> KvS
                             }).await.expect("kv store spawn_blocking panicked");
                             let _ = reply.send(result);
                         }
+                        KvStoreCmd::CompactedRevision { reply } => {
+                            let s = Arc::clone(&store);
+                            let result = tokio::task::spawn_blocking(move || {
+                                s.compacted_revision().map_err(|e| e.to_string())
+                            }).await.expect("kv store spawn_blocking panicked");
+                            let _ = reply.send(result);
+                        }
                         KvStoreCmd::ChangesSince { after_revision, reply } => {
                             let s = Arc::clone(&store);
                             let result = tokio::task::spawn_blocking(move || {
@@ -254,6 +261,16 @@ impl KvStoreActorHandle {
         let (reply, rx) = oneshot::channel();
         self.cmd_tx
             .send(KvStoreCmd::CurrentRevision { reply })
+            .await
+            .expect("kv store actor dead");
+        rx.await.expect("kv store actor dropped")
+    }
+
+    /// Get the compacted revision floor.
+    pub async fn compacted_revision(&self) -> Result<i64, String> {
+        let (reply, rx) = oneshot::channel();
+        self.cmd_tx
+            .send(KvStoreCmd::CompactedRevision { reply })
             .await
             .expect("kv store actor dead");
         rx.await.expect("kv store actor dropped")

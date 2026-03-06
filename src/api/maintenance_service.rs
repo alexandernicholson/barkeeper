@@ -145,7 +145,7 @@ impl Maintenance for MaintenanceService {
 
         Ok(Response::new(StatusResponse {
             header: self.make_header().await,
-            version: env!("CARGO_PKG_VERSION").to_string(),
+            version: crate::etcd_version().to_string(),
             db_size,
             leader: self.raft_handle.leader_id(),
             raft_index: 0,
@@ -224,7 +224,7 @@ impl Maintenance for MaintenanceService {
 
         let (tx, rx) = tokio::sync::mpsc::channel(4);
         let header = self.make_header().await;
-        let version = env!("CARGO_PKG_VERSION").to_string();
+        let version = crate::etcd_version().to_string();
 
         tokio::spawn(async move {
             let total = data.len();

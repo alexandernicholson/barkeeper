@@ -17,6 +17,7 @@ use super::state_machine::KvCommand;
 pub enum StoreError {
     Io(io::Error),
     Serialization(String),
+    Compacted { compacted_revision: i64 },
 }
 
 impl std::fmt::Display for StoreError {
@@ -24,6 +25,7 @@ impl std::fmt::Display for StoreError {
         match self {
             StoreError::Io(e) => write!(f, "io error: {}", e),
             StoreError::Serialization(e) => write!(f, "serialization error: {}", e),
+            StoreError::Compacted { compacted_revision } => write!(f, "mvcc: required revision has been compacted (compacted_revision: {})", compacted_revision),
         }
     }
 }
@@ -243,6 +245,8 @@ struct KvInner {
     revision: i64,
     /// Last applied Raft log index
     raft_applied_index: u64,
+    /// Compacted revision floor — revisions at or below this have been purged.
+    compacted_revision: i64,
 }
 
 // ── KvStore ─────────────────────────────────────────────────────────────────
@@ -276,6 +280,7 @@ impl KvStore {
                 latest: snap.latest.into_iter().collect(),
                 revision: snap.revision,
                 raft_applied_index: snap.raft_applied_index,
+                compacted_revision: 0,
             }
         } else {
             KvInner {
@@ -284,6 +289,7 @@ impl KvStore {
                 latest: HashMap::new(),
                 revision: 0,
                 raft_applied_index: 0,
+                compacted_revision: 0,
             }
         };
 
@@ -417,6 +423,35 @@ impl KvStore {
             };
             Ok(RangeResult { count: total_count, kvs, more })
         }
+    }
+
+    /// Range query with count_only and keys_only options.
+    ///
+    /// Used by kube-apiserver for:
+    /// - `CountOnly`: polling etcd_object_counts metric (returns count, no kvs)
+    /// - `KeysOnly`: corrupted object deletion scan (returns keys with empty values)
+    pub fn range_with_options(
+        &self,
+        key: &[u8],
+        range_end: &[u8],
+        limit: i64,
+        revision: i64,
+        count_only: bool,
+        keys_only: bool,
+    ) -> Result<RangeResult, StoreError> {
+        if count_only {
+            // Count matching keys without returning their data.
+            let result = self.range(key, range_end, 0, revision)?;
+            return Ok(RangeResult { count: result.count, kvs: vec![], more: false });
+        }
+        if keys_only {
+            let mut result = self.range(key, range_end, limit, revision)?;
+            for kv in &mut result.kvs {
+                kv.value.clear();
+            }
+            return Ok(result);
+        }
+        self.range(key, range_end, limit, revision)
     }
 
     /// Delete a key or range of keys. Returns the number deleted and prev values.
@@ -557,15 +592,29 @@ impl KvStore {
     pub fn compact(&self, revision: i64) -> Result<(), StoreError> {
         let mut inner = self.inner.write().unwrap();
         do_compact(&mut inner, revision);
+        inner.compacted_revision = revision;
         Ok(())
     }
 
+    /// Return the compacted revision floor. Revisions at or below this have been purged.
+    pub fn compacted_revision(&self) -> Result<i64, StoreError> {
+        let inner = self.inner.read().unwrap();
+        Ok(inner.compacted_revision)
+    }
+
     /// Return watch events (key, event_type, kv) since `after_revision`.
+    ///
+    /// Returns an error if `after_revision` is below the compacted floor.
     pub fn changes_since(
         &self,
         after_revision: i64,
     ) -> Result<Vec<(Vec<u8>, i32, mvccpb::KeyValue)>, StoreError> {
         let inner = self.inner.read().unwrap();
+        if inner.compacted_revision > 0 && after_revision < inner.compacted_revision {
+            return Err(StoreError::Compacted {
+                compacted_revision: inner.compacted_revision,
+            });
+        }
         let start_rev = (after_revision + 1) as u64;
         let mut results = Vec::new();
 
@@ -597,6 +646,11 @@ impl KvStore {
         after_revision: i64,
     ) -> Result<Vec<(Vec<u8>, i32, mvccpb::KeyValue, Option<mvccpb::KeyValue>)>, StoreError> {
         let inner = self.inner.read().unwrap();
+        if inner.compacted_revision > 0 && after_revision < inner.compacted_revision {
+            return Err(StoreError::Compacted {
+                compacted_revision: inner.compacted_revision,
+            });
+        }
         let start_rev = (after_revision + 1) as u64;
         let mut results = Vec::new();
 
