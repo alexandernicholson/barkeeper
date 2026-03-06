@@ -4,3 +4,33 @@ version = "0.1.0"
 edition = "2021"
 license = "Apache-2.0"
 description = "TUI for exploring barkeeper clusters"
+
+[dependencies]
+# TUI
+ratatui = "0.29"
+crossterm = "0.28"
+
+# gRPC client
+tonic = "0.12"
+prost = "0.13"
+
+# Async
+tokio = { version = "1", features = ["full"] }
+tokio-stream = "0.1"
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Serialization (for pretty-printing JSON values)
+serde_json = "1"
+
+[dev-dependencies]
+# For TestServer — starts a real barkeeper instance
+barkeeper = { path = "../barkeeper" }
+tempfile = "3"
+portpicker = "0.1"
+rebar-core = { git = "https://github.com/alexandernicholson/rebar.git", branch = "main" }
+axum = "0.7"
+
+[build-dependencies]
+tonic-build = "0.12"
