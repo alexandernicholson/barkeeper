@@ -16,14 +16,14 @@ Tested against: **etcd 3.5.17**
 | Range | Yes | `POST /v3/kv/range` | Full | Prefix ranges, limit, revision queries |
 | Put | Yes | `POST /v3/kv/put` | Full | Supports prev_kv, lease attachment |
 | DeleteRange | Yes | `POST /v3/kv/deleterange` | Full | Prefix deletes, prev_kv |
-| Txn | Yes | `POST /v3/kv/txn` | Full | All compare targets (Value, Version, Create, Mod, Lease) and result operators (Equal, Greater, Less, NotEqual) supported. Nested txn returns UNIMPLEMENTED. Watch notifications fire for mutations inside txns. |
+| Txn | Yes | `POST /v3/kv/txn` | Full | All compare targets (Value, Version, Create, Mod, Lease) and result operators (Equal, Greater, Less, NotEqual) supported. One level of nested Txn supported (matching etcd). Watch notifications fire for mutations inside txns. |
 | Compact | Yes | `POST /v3/kv/compaction` | Full | In-memory compaction (removes old revisions from BTreeMaps) via both gRPC and HTTP gateway. |
 
 ### Watch Service (`etcdserverpb.Watch`)
 
 | RPC | gRPC | HTTP Gateway | Status | Notes |
 |-----|------|-------------|--------|-------|
-| Watch | Yes | `POST /v3/watch` (SSE) | Full | gRPC bidirectional streaming + HTTP SSE. Supports CreateRequest, CancelRequest, ProgressRequest (stub response), and revision-based history replay via start_revision. |
+| Watch | Yes | `POST /v3/watch` (SSE) | Full | gRPC bidirectional streaming + HTTP SSE. Supports CreateRequest (with filters, prev_kv, watch_id), CancelRequest, ProgressRequest (returns current revision), and revision-based history replay via start_revision. |
 
 ### Lease Service (`etcdserverpb.Lease`)
 
@@ -52,8 +52,8 @@ Tested against: **etcd 3.5.17**
 | Status | Yes | `POST /v3/maintenance/status` | Full | Reports version, dbSize, leader, raft term |
 | Alarm | Yes | `POST /v3/maintenance/alarm` | Full | GET/ACTIVATE/DEACTIVATE with in-memory AlarmMember store (NOSPACE, CORRUPT) |
 | Defragment | Yes | `POST /v3/maintenance/defragment` | Full | No-op (in-memory store has no disk fragmentation); kept for API compatibility |
-| Hash | Yes | Not exposed | Stub | Returns zero hash |
-| HashKV | Yes | Not exposed | Stub | Returns zero hash |
+| Hash | Yes | Not exposed | Full | CRC32 hash over sorted KV data |
+| HashKV | Yes | Not exposed | Full | CRC32 hash bounded by revision |
 | Snapshot | Yes | `POST /v3/maintenance/snapshot` | Full | Chunked 64KB streaming snapshot of the database file |
 | MoveLeader | Yes | Not exposed | Stub | Returns UNIMPLEMENTED (single-node) |
 | Downgrade | Yes | Not exposed | Stub | Returns UNIMPLEMENTED |
@@ -65,7 +65,7 @@ Tested against: **etcd 3.5.17**
 | AuthEnable | Yes | `POST /v3/auth/enable` | Full | Enables auth flag; enforces token validation on all subsequent requests |
 | AuthDisable | Yes | `POST /v3/auth/disable` | Full | Disables auth flag |
 | AuthStatus | Yes | `POST /v3/auth/status` | Full | Reports enabled state, auth_revision=0 |
-| Authenticate | Yes | `POST /v3/auth/authenticate` | Full | Returns token on valid credentials (bcrypt password hashing) |
+| Authenticate | Yes | `POST /v3/auth/authenticate` | Full | Returns JWT token on valid credentials (bcrypt password hashing, HMAC-SHA256 signing) |
 | UserAdd | Yes | `POST /v3/auth/user/add` | Full | |
 | UserGet | Yes | Not exposed | Full | Returns user's roles |
 | UserList | Yes | Not exposed | Full | |
@@ -134,8 +134,17 @@ Watch is implemented as a gRPC bidirectional stream on the `Watch` RPC.
 - **CancelRequest** returns a `WatchResponse` with `canceled=true`.
   The forwarding task is aborted and the watcher is removed from the hub.
 
-- **ProgressRequest** is accepted but returns a stub response (empty
-  events, `watch_id=-1`). Full progress notification is not implemented.
+- **ProgressRequest** returns a response with `watch_id=0` and the
+  current store revision in the header, matching etcd behavior.
+
+- **Filters** are supported via the `filters` field in
+  `WatchCreateRequest`. `NOPUT` (value 0) suppresses PUT events,
+  `NODELETE` (value 1) suppresses DELETE events. Filters apply to both
+  live events and historical replay.
+
+- **Client watch_id** is supported. If `watch_id` is non-zero in
+  `WatchCreateRequest`, the server uses that ID. Collisions return
+  `created=false, canceled=true` with a descriptive cancel_reason.
 
 - **Txn watch notifications** fire for put and delete mutations inside
   transactions. The service layer zips the executed ops with their responses
@@ -188,31 +197,10 @@ Reads are always linearizable (served after state machine apply). The
 `serializable` field in `RangeRequest` is parsed but ignored — all reads
 behave as linearizable. This is stricter than etcd, not weaker.
 
-### Watch gaps
-
-- **Filters:** `NOPUT` and `NODELETE` filter fields are parsed but not
-  enforced — all events are delivered regardless.
-- **prev_kv:** The `prev_kv` field in `WatchCreateRequest` is parsed
-  but ignored — watch events don't include previous values.
-- **ProgressRequest:** Accepted but returns a stub response rather than
-  a real progress notification with the current revision.
-
-### Nested transactions
-
-Nested `Txn` inside a `Txn` request op returns `UNIMPLEMENTED`.
-
 ### Maintenance stubs
 
-`Hash` and `HashKV` return zero hashes. `MoveLeader` and `Downgrade`
-return `UNIMPLEMENTED`. `Alarm`, `Defragment`, and `Snapshot` are fully
-implemented.
-
-### Auth token format
-
-Tokens use a custom format (`{username}.{uuid}`) rather than etcd's JWT.
-The `Authorization` header accepts raw tokens. Most etcd client libraries
-pass the token opaquely and will work, but clients that parse or validate
-the token format may not.
+`MoveLeader` and `Downgrade` return `UNIMPLEMENTED` (single-node only).
+All other maintenance RPCs are fully implemented.
 
 ### Instance-specific differences
 
