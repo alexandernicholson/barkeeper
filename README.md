@@ -100,6 +100,17 @@ ETCDCTL_API=3 etcdctl --endpoints=127.0.0.1:2379 put hello world
 ETCDCTL_API=3 etcdctl --endpoints=127.0.0.1:2379 get hello
 ```
 
+### Browse with bkctl (TUI)
+
+bkctl is a terminal UI for exploring barkeeper clusters. Build and run:
+
+```bash
+cargo build --release -p bkctl
+./target/release/bkctl --endpoints http://127.0.0.1:2379
+```
+
+Dashboard tab shows cluster status and live watch events. Keys tab lets you browse the key space as a prefix tree with value inspection. See [bkctl/README.md](bkctl/README.md) for full documentation.
+
 ## Architecture
 
 barkeeper is structured as a Rebar actor tree with supervised processes:
