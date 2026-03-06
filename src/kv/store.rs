@@ -151,6 +151,11 @@ pub enum TxnOp {
         key: Vec<u8>,
         range_end: Vec<u8>,
     },
+    Txn {
+        compares: Vec<TxnCompare>,
+        success: Vec<TxnOp>,
+        failure: Vec<TxnOp>,
+    },
 }
 
 /// Result of a single operation in a Txn.
@@ -159,6 +164,7 @@ pub enum TxnOpResponse {
     Range(RangeResult),
     Put(PutResult),
     DeleteRange(DeleteResult),
+    Txn(TxnResult),
 }
 
 /// Result of an entire Txn.
@@ -448,7 +454,23 @@ impl KvStore {
         failure: &[TxnOp],
     ) -> Result<TxnResult, StoreError> {
         let mut inner = self.inner.write().unwrap();
-        let succeeded = evaluate_compares(&inner, compares);
+        self.txn_inner(&mut inner, compares, success, failure, 0)
+    }
+
+    /// Inner recursive implementation of txn. `depth` tracks nesting level.
+    fn txn_inner(
+        &self,
+        inner: &mut KvInner,
+        compares: &[TxnCompare],
+        success: &[TxnOp],
+        failure: &[TxnOp],
+        depth: u32,
+    ) -> Result<TxnResult, StoreError> {
+        if depth > 1 {
+            return Err(StoreError::Serialization("nested txn depth exceeds limit".to_string()));
+        }
+
+        let succeeded = evaluate_compares(inner, compares);
         let ops = if succeeded { success } else { failure };
         let mut responses = Vec::new();
 
@@ -459,7 +481,7 @@ impl KvStore {
                     inner.revision = new_rev;
                     self.revision_atomic.store(new_rev, Ordering::SeqCst);
 
-                    let prev = find_latest_kv(&inner, key, new_rev as u64);
+                    let prev = find_latest_kv(inner, key, new_rev as u64);
                     let (create_revision, version) = match &prev {
                         Some(p) if p.version > 0 => (p.create_revision, p.version + 1),
                         _ => (new_rev, 1),
@@ -482,14 +504,14 @@ impl KvStore {
                     let new_rev = inner.revision + 1;
                     inner.revision = new_rev;
                     self.revision_atomic.store(new_rev, Ordering::SeqCst);
-                    let result = do_delete_range(&mut inner, key, range_end, new_rev)?;
+                    let result = do_delete_range(inner, key, range_end, new_rev)?;
                     responses.push(TxnOpResponse::DeleteRange(result));
                 }
                 TxnOp::Range { key, range_end, limit, revision } => {
                     let max_rev = inner.revision;
                     let query_rev = if *revision > 0 { *revision } else { max_rev };
                     if range_end.is_empty() {
-                        let kv = find_latest_kv_at_rev(&inner, key, query_rev as u64);
+                        let kv = find_latest_kv_at_rev(inner, key, query_rev as u64);
                         match kv {
                             Some(ikv) if ikv.version > 0 => {
                                 responses.push(TxnOpResponse::Range(RangeResult {
@@ -503,10 +525,10 @@ impl KvStore {
                             }
                         }
                     } else {
-                        let all_keys = collect_unique_keys_in_range(&inner, key, range_end, query_rev as u64);
+                        let all_keys = collect_unique_keys_in_range(inner, key, range_end, query_rev as u64);
                         let mut kvs = Vec::new();
                         for user_key in &all_keys {
-                            if let Some(ikv) = find_latest_kv_at_rev(&inner, user_key, query_rev as u64) {
+                            if let Some(ikv) = find_latest_kv_at_rev(inner, user_key, query_rev as u64) {
                                 if ikv.version > 0 { kvs.push(ikv.to_proto()); }
                             }
                         }
@@ -519,6 +541,10 @@ impl KvStore {
                         };
                         responses.push(TxnOpResponse::Range(RangeResult { count: total_count, kvs, more }));
                     }
+                }
+                TxnOp::Txn { compares, success, failure } => {
+                    let inner_result = self.txn_inner(inner, compares, success, failure, depth + 1)?;
+                    responses.push(TxnOpResponse::Txn(inner_result));
                 }
             }
         }
@@ -1020,6 +1046,14 @@ fn batch_txn(
                     };
                     responses.push(TxnOpResponse::Range(RangeResult { count: total_count, kvs, more }));
                 }
+            }
+            TxnOp::Txn { compares: inner_compares, success: inner_success, failure: inner_failure } => {
+                let inner_result = batch_txn(inner, revision_atomic, inner_compares, inner_success, inner_failure, 0)?;
+                all_watch_events.extend(inner_result.watch_events);
+                responses.push(TxnOpResponse::Txn(match inner_result.apply_result {
+                    ApplyResultData::Txn(r) => r,
+                    _ => unreachable!(),
+                }));
             }
         }
     }

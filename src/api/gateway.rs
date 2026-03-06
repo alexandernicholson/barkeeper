@@ -949,6 +949,11 @@ async fn handle_txn(
                                     prev_kvs: r.prev_kvs.iter().map(proto_kv_to_json).collect(),
                                 }),
                             },
+                            TxnOpResponse::Txn(_) => TxnResponseOp {
+                                response_range: None,
+                                response_put: None,
+                                response_delete_range: None,
+                            },
                         })
                         .collect();
 

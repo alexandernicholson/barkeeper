@@ -208,6 +208,64 @@ fn test_compact() {
     assert_eq!(r3.kvs[0].value, b"v3");
 }
 
+/// Nested txn should execute inner txn ops.
+#[test]
+fn test_nested_txn_success() {
+    let dir = tempdir().unwrap();
+    let store = KvStore::open(dir.path()).unwrap();
+
+    store.put(b"flag", b"on", 0).unwrap();
+
+    let inner_txn = TxnOp::Txn {
+        compares: vec![],
+        success: vec![TxnOp::Put {
+            key: b"nested".to_vec(),
+            value: b"yes".to_vec(),
+            lease_id: 0,
+        }],
+        failure: vec![],
+    };
+
+    let result = store
+        .txn(
+            &[TxnCompare {
+                key: b"flag".to_vec(),
+                range_end: vec![],
+                target: TxnCompareTarget::Value(b"on".to_vec()),
+                result: TxnCompareResult::Equal,
+            }],
+            &[inner_txn],
+            &[],
+        )
+        .unwrap();
+
+    assert!(result.succeeded);
+
+    let range = store.range(b"nested", &[], 0, 0).unwrap();
+    assert_eq!(range.kvs.len(), 1);
+    assert_eq!(range.kvs[0].value, b"yes");
+}
+
+/// Deeply nested txn (depth > 1) should fail.
+#[test]
+fn test_deeply_nested_txn_rejected() {
+    let dir = tempdir().unwrap();
+    let store = KvStore::open(dir.path()).unwrap();
+
+    let deep_txn = TxnOp::Txn {
+        compares: vec![],
+        success: vec![TxnOp::Txn {
+            compares: vec![],
+            success: vec![],
+            failure: vec![],
+        }],
+        failure: vec![],
+    };
+
+    let result = store.txn(&[], &[deep_txn], &[]);
+    assert!(result.is_err(), "deeply nested txn should be rejected");
+}
+
 #[test]
 fn test_compact_multiple_keys() {
     let dir = tempdir().unwrap();

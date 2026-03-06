@@ -362,8 +362,27 @@ fn convert_request_op(op: &RequestOp) -> Result<Option<TxnOp>, Status> {
             key: r.key.clone(),
             range_end: r.range_end.clone(),
         })),
-        Some(request_op::Request::RequestTxn(_)) => {
-            Err(Status::unimplemented("nested txn not supported"))
+        Some(request_op::Request::RequestTxn(t)) => {
+            let compares = t
+                .compare
+                .iter()
+                .map(|c| convert_compare(c))
+                .collect::<Result<Vec<_>, _>>()?;
+            let success = t
+                .success
+                .iter()
+                .filter_map(|op| convert_request_op(op).transpose())
+                .collect::<Result<Vec<_>, _>>()?;
+            let failure = t
+                .failure
+                .iter()
+                .filter_map(|op| convert_request_op(op).transpose())
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(Some(TxnOp::Txn {
+                compares,
+                success,
+                failure,
+            }))
         }
         None => Ok(None), // etcdctl may send empty request ops; skip them
     }
@@ -408,5 +427,19 @@ fn convert_txn_op_response(
                 },
             )),
         },
+        TxnOpResponse::Txn(t) => {
+            let inner_responses: Vec<ResponseOp> = t
+                .responses
+                .into_iter()
+                .map(|resp| convert_txn_op_response(resp, cluster_id, member_id, raft_term))
+                .collect();
+            ResponseOp {
+                response: Some(response_op::Response::ResponseTxn(TxnResponse {
+                    header: make_header(t.revision),
+                    succeeded: t.succeeded,
+                    responses: inner_responses,
+                })),
+            }
+        }
     }
 }
