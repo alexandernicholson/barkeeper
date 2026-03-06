@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, RwLock};
 
+use crc32fast::Hasher;
 use serde::{Deserialize, Serialize};
 
 use crate::proto::mvccpb;
@@ -667,6 +668,38 @@ impl KvStore {
     pub fn db_path(&self) -> &Path {
         &self.db_path
     }
+
+    /// Compute CRC32 hash over all KV data (sorted by compound key).
+    pub fn hash(&self) -> Result<u32, StoreError> {
+        let inner = self.inner.read().unwrap();
+        let mut hasher = Hasher::new();
+        for (compound_key, ikv) in inner.kv.iter() {
+            hasher.update(compound_key);
+            hasher.update(&ikv.value);
+        }
+        Ok(hasher.finalize())
+    }
+
+    /// Compute CRC32 hash over KV data up to and including `revision`.
+    pub fn hash_kv(&self, revision: i64) -> Result<(u32, i64), StoreError> {
+        let inner = self.inner.read().unwrap();
+        let mut hasher = Hasher::new();
+        let max_rev = revision as u64;
+
+        for (compound_key, ikv) in inner.kv.iter() {
+            // Extract revision from the last 8 bytes of compound key.
+            if compound_key.len() >= 8 {
+                let rev_bytes: [u8; 8] = compound_key[compound_key.len() - 8..].try_into().unwrap();
+                let entry_rev = u64::from_be_bytes(rev_bytes);
+                if entry_rev > max_rev {
+                    continue;
+                }
+            }
+            hasher.update(compound_key);
+            hasher.update(&ikv.value);
+        }
+        Ok((hasher.finalize(), 0))
+    }
 }
 
 // ── Free functions for operations on KvInner ────────────────────────────────
@@ -1038,4 +1071,42 @@ fn evaluate_compares(inner: &KvInner, compares: &[TxnCompare]) -> bool {
         }
     }
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_hash_changes_after_put() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = KvStore::open(dir.path()).unwrap();
+        let hash1 = store.hash().unwrap();
+        store.put(b"foo", b"bar", 0).unwrap();
+        let hash2 = store.hash().unwrap();
+        assert_ne!(hash1, hash2, "hash should change after put");
+    }
+
+    #[test]
+    fn test_hash_deterministic() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = KvStore::open(dir.path()).unwrap();
+        store.put(b"foo", b"bar", 0).unwrap();
+        let hash1 = store.hash().unwrap();
+        let hash2 = store.hash().unwrap();
+        assert_eq!(hash1, hash2, "hash should be deterministic");
+    }
+
+    #[test]
+    fn test_hash_kv_at_revision() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = KvStore::open(dir.path()).unwrap();
+        store.put(b"foo", b"bar", 0).unwrap(); // rev 1
+        let (hash_rev1, _) = store.hash_kv(1).unwrap();
+        store.put(b"foo", b"baz", 0).unwrap(); // rev 2
+        let (hash_rev2, _) = store.hash_kv(2).unwrap();
+        let (hash_rev1_again, _) = store.hash_kv(1).unwrap();
+        assert_eq!(hash_rev1, hash_rev1_again, "hash at rev 1 should be stable");
+        assert_ne!(hash_rev1, hash_rev2, "different revisions should produce different hashes");
+    }
 }

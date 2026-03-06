@@ -265,4 +265,13 @@ pub enum KvStoreCmd {
         index: u64,
         reply: oneshot::Sender<Result<(), String>>,
     },
+    /// Compute CRC32 hash over all KV data.
+    Hash {
+        reply: oneshot::Sender<Result<u32, String>>,
+    },
+    /// Compute CRC32 hash over KV data up to a revision.
+    HashKv {
+        revision: i64,
+        reply: oneshot::Sender<Result<(u32, i64), String>>,
+    },
 }

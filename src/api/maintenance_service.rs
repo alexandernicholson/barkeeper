@@ -187,23 +187,26 @@ impl Maintenance for MaintenanceService {
         &self,
         _request: Request<HashRequest>,
     ) -> Result<Response<HashResponse>, Status> {
-        // Stub: return zero hash
+        let hash = self.store.hash().await
+            .map_err(|e| Status::internal(format!("hash: {}", e)))?;
         Ok(Response::new(HashResponse {
             header: self.make_header().await,
-            hash: 0,
+            hash,
         }))
     }
 
     async fn hash_kv(
         &self,
-        _request: Request<HashKvRequest>,
+        request: Request<HashKvRequest>,
     ) -> Result<Response<HashKvResponse>, Status> {
-        // Stub: return zero hash
+        let revision = request.into_inner().revision;
+        let (hash, compact_revision) = self.store.hash_kv(revision).await
+            .map_err(|e| Status::internal(format!("hash_kv: {}", e)))?;
         Ok(Response::new(HashKvResponse {
             header: self.make_header().await,
-            hash: 0,
-            compact_revision: 0,
-            hash_revision: 0,
+            hash,
+            compact_revision,
+            hash_revision: revision,
         }))
     }
 

@@ -121,6 +121,20 @@ pub async fn spawn_kv_store_actor(runtime: &Runtime, store: Arc<KvStore>) -> KvS
                             }).await.expect("kv store spawn_blocking panicked");
                             let _ = reply.send(result);
                         }
+                        KvStoreCmd::Hash { reply } => {
+                            let s = Arc::clone(&store);
+                            let result = tokio::task::spawn_blocking(move || {
+                                s.hash().map_err(|e| e.to_string())
+                            }).await.expect("kv store spawn_blocking panicked");
+                            let _ = reply.send(result);
+                        }
+                        KvStoreCmd::HashKv { revision, reply } => {
+                            let s = Arc::clone(&store);
+                            let result = tokio::task::spawn_blocking(move || {
+                                s.hash_kv(revision).map_err(|e| e.to_string())
+                            }).await.expect("kv store spawn_blocking panicked");
+                            let _ = reply.send(result);
+                        }
                     }
                 }
                 // Also listen on Rebar mailbox for future distributed messages.
@@ -322,6 +336,26 @@ impl KvStoreActorHandle {
         let (reply, rx) = oneshot::channel();
         self.cmd_tx
             .send(KvStoreCmd::SetLastAppliedRaftIndex { index, reply })
+            .await
+            .expect("kv store actor dead");
+        rx.await.expect("kv store actor dropped")
+    }
+
+    /// Compute CRC32 hash over all KV data.
+    pub async fn hash(&self) -> Result<u32, String> {
+        let (reply, rx) = oneshot::channel();
+        self.cmd_tx
+            .send(KvStoreCmd::Hash { reply })
+            .await
+            .expect("kv store actor dead");
+        rx.await.expect("kv store actor dropped")
+    }
+
+    /// Compute CRC32 hash over KV data up to a revision.
+    pub async fn hash_kv(&self, revision: i64) -> Result<(u32, i64), String> {
+        let (reply, rx) = oneshot::channel();
+        self.cmd_tx
+            .send(KvStoreCmd::HashKv { revision, reply })
             .await
             .expect("kv store actor dead");
         rx.await.expect("kv store actor dropped")
