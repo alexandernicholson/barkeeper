@@ -310,6 +310,26 @@ impl KvStore {
         }
     }
 
+    /// Total bytes on the filesystem containing the data directory.
+    /// Used as db_size_quota so etcdctl can display usage percentage.
+    /// Falls back to 8 GiB if statvfs is unavailable.
+    pub fn disk_total_bytes(&self) -> i64 {
+        #[cfg(unix)]
+        {
+            use std::ffi::CString;
+            use std::os::unix::ffi::OsStrExt;
+            if let Ok(path) = CString::new(self.db_path.as_os_str().as_bytes()) {
+                unsafe {
+                    let mut stat: libc::statvfs = std::mem::zeroed();
+                    if libc::statvfs(path.as_ptr(), &mut stat) == 0 {
+                        return (stat.f_blocks as i64) * (stat.f_frsize as i64);
+                    }
+                }
+            }
+        }
+        8 * 1024 * 1024 * 1024 // 8 GiB fallback
+    }
+
     /// Read the snapshot file into memory for sending to followers.
     pub fn snapshot_bytes(&self) -> Result<Vec<u8>, std::io::Error> {
         // Generate a fresh snapshot and return its bytes

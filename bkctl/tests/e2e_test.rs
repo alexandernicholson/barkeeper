@@ -102,7 +102,7 @@ impl TestServer {
             cluster_manager, 1, 1, Arc::clone(&raft_term),
         );
         let maintenance_service = MaintenanceService::new(
-            store.clone(), 1, 1, Arc::clone(&raft_term), raft_handle.clone(),
+            store.clone(), Arc::clone(&kv_store), 1, 1, Arc::clone(&raft_term), raft_handle.clone(),
         );
         let auth_service = AuthService::new(
             auth_manager, 1, 1, Arc::clone(&raft_term),

@@ -410,7 +410,7 @@ impl BarkeepServer {
 
         // Create the Maintenance gRPC service.
         let maintenance_service =
-            MaintenanceService::new(store.clone(), cluster_id, member_id, Arc::clone(&raft_term), raft_handle.clone());
+            MaintenanceService::new(store.clone(), Arc::clone(&kv_store), cluster_id, member_id, Arc::clone(&raft_term), raft_handle.clone());
         let alarms = maintenance_service.alarms();
 
         // Register lease expiry timer as a supervised Rebar child process.

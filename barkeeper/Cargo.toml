@@ -62,6 +62,7 @@ rustls-pemfile = "2"
 time = "0.3"
 
 # Utilities
+libc = "0.2"
 rand = "0.8"
 uuid = { version = "1", features = ["v4"] }
 bytes = "1"

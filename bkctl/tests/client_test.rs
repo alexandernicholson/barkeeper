@@ -115,6 +115,7 @@ impl TestServer {
         );
         let maintenance_service = MaintenanceService::new(
             store.clone(),
+            Arc::clone(&kv_store),
             1, 1,
             Arc::clone(&raft_term),
             raft_handle.clone(),

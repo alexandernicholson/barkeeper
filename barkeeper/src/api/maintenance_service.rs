@@ -5,6 +5,7 @@ use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
 
 use crate::kv::actor::KvStoreActorHandle;
+use crate::kv::store::KvStore;
 use crate::proto::etcdserverpb::maintenance_server::Maintenance;
 use crate::proto::etcdserverpb::{
     alarm_request::AlarmAction, AlarmMember, AlarmRequest, AlarmResponse, AlarmType,
@@ -17,6 +18,7 @@ use crate::raft::node::RaftHandle;
 /// gRPC Maintenance service implementing the etcd Maintenance API.
 pub struct MaintenanceService {
     store: KvStoreActorHandle,
+    store_direct: Arc<KvStore>,
     cluster_id: u64,
     member_id: u64,
     raft_term: Arc<AtomicU64>,
@@ -27,6 +29,7 @@ pub struct MaintenanceService {
 impl MaintenanceService {
     pub fn new(
         store: KvStoreActorHandle,
+        store_direct: Arc<KvStore>,
         cluster_id: u64,
         member_id: u64,
         raft_term: Arc<AtomicU64>,
@@ -34,6 +37,7 @@ impl MaintenanceService {
     ) -> Self {
         MaintenanceService {
             store,
+            store_direct,
             cluster_id,
             member_id,
             raft_term,
@@ -155,7 +159,7 @@ impl Maintenance for MaintenanceService {
             db_size_in_use: db_size,
             is_learner: false,
             storage_version: "1".to_string(),
-            db_size_quota: 2 * 1024 * 1024 * 1024, // 2 GiB, matches etcd default
+            db_size_quota: self.store_direct.disk_total_bytes(),
             downgrade_info: None,
         }))
     }
