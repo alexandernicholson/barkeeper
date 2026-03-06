@@ -287,7 +287,7 @@ impl BarkeepServer {
         let member_id = config.node_id;
         let watch_runtime = rebar_core::runtime::Runtime::new(config.node_id);
         let watch_hub = spawn_watch_hub_actor(&watch_runtime, Some(store.clone())).await;
-        let watch_service = WatchService::new(watch_hub.clone(), cluster_id, member_id, Arc::clone(&raft_term));
+        let watch_service = WatchService::new(watch_hub.clone(), store.clone(), cluster_id, member_id, Arc::clone(&raft_term));
 
         // Create the Lease manager and gRPC service.
         let lease_manager = Arc::new(LeaseManager::new());

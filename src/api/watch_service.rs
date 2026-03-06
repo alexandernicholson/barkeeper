@@ -9,20 +9,23 @@ use tonic::{Request, Response, Status, Streaming};
 use crate::proto::etcdserverpb::watch_request::RequestUnion;
 use crate::proto::etcdserverpb::watch_server::Watch;
 use crate::proto::etcdserverpb::{ResponseHeader, WatchRequest, WatchResponse};
+use crate::kv::actor::KvStoreActorHandle;
 use crate::watch::actor::WatchHubActorHandle;
 
 /// gRPC Watch service implementing the etcd Watch API.
 pub struct WatchService {
     hub: WatchHubActorHandle,
+    store: KvStoreActorHandle,
     cluster_id: u64,
     member_id: u64,
     raft_term: Arc<AtomicU64>,
 }
 
 impl WatchService {
-    pub fn new(hub: WatchHubActorHandle, cluster_id: u64, member_id: u64, raft_term: Arc<AtomicU64>) -> Self {
+    pub fn new(hub: WatchHubActorHandle, store: KvStoreActorHandle, cluster_id: u64, member_id: u64, raft_term: Arc<AtomicU64>) -> Self {
         WatchService {
             hub,
+            store,
             cluster_id,
             member_id,
             raft_term,
@@ -42,6 +45,7 @@ impl Watch for WatchService {
         let (resp_tx, resp_rx) = mpsc::channel(256);
 
         let hub = self.hub.clone();
+        let store_clone = self.store.clone();
         let cluster_id = self.cluster_id;
         let member_id = self.member_id;
         let raft_term = Arc::clone(&self.raft_term);
@@ -186,16 +190,15 @@ impl Watch for WatchService {
                         }
                     }
                     Some(RequestUnion::ProgressRequest(_)) => {
-                        // Progress requests are not yet implemented.
-                        // Send an empty response.
+                        let revision = store_clone.current_revision().await.unwrap_or(0);
                         let progress_resp = WatchResponse {
                             header: Some(ResponseHeader {
                                 cluster_id,
                                 member_id,
-                                revision: 0,
+                                revision,
                                 raft_term: raft_term.load(Ordering::Relaxed),
                             }),
-                            watch_id: -1,
+                            watch_id: 0,
                             created: false,
                             canceled: false,
                             compact_revision: 0,
