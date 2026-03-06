@@ -74,6 +74,33 @@ impl Watch for WatchService {
                             )
                             .await;
 
+                        // Detect collision: if the channel is already closed,
+                        // the actor rejected the requested watch_id.
+                        match event_rx.try_recv() {
+                            Err(mpsc::error::TryRecvError::Disconnected) => {
+                                let error_resp = WatchResponse {
+                                    header: Some(ResponseHeader {
+                                        cluster_id,
+                                        member_id,
+                                        revision: 0,
+                                        raft_term: raft_term.load(Ordering::Relaxed),
+                                    }),
+                                    watch_id,
+                                    created: false,
+                                    canceled: true,
+                                    compact_revision: 0,
+                                    cancel_reason: "watch id already exists".to_string(),
+                                    fragment: false,
+                                    events: vec![],
+                                };
+                                if resp_tx.send(Ok(error_resp)).await.is_err() {
+                                    break;
+                                }
+                                continue;
+                            }
+                            _ => {} // Empty or has data — watch was created successfully.
+                        }
+
                         // Send the "created" response.
                         let created_resp = WatchResponse {
                             header: Some(ResponseHeader {
