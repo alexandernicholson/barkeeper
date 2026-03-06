@@ -310,7 +310,7 @@ cargo test
 Barkeeper can serve as a drop-in etcd replacement for Kubernetes. The k3s integration test boots a real cluster against barkeeper and deploys workloads:
 
 ```bash
-sudo bash tests/k3s-integration.sh
+sudo bash k8s-test/k3s-integration.sh
 ```
 
 This starts barkeeper, launches k3s with `--datastore-endpoint=http://127.0.0.1:2379`, then creates and verifies a pod, a 3-replica deployment, and a service with endpoint resolution. Requires sudo (k3s needs kubelet access); k3s is auto-installed if not present.

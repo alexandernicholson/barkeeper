@@ -73,3 +73,4 @@ kind cluster (single control-plane node)
 | `kind-config.yaml` | kind cluster configuration |
 | `barkeeper.yaml` | Kubernetes manifests (Services + StatefulSet) |
 | `results.md` | Auto-generated test results from last run |
+| `k3s-integration.sh` | Single-node k3s integration test (requires sudo) |

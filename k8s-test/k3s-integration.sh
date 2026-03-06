@@ -7,7 +7,7 @@
 # Prerequisites: sudo access, curl, no existing k3s or barkeeper on
 # ports 2379/6443.
 #
-# Usage: sudo bash tests/k3s-integration.sh
+# Usage: sudo bash k8s-test/k3s-integration.sh
 
 set -euo pipefail
 
@@ -115,7 +115,7 @@ echo ""
 # Check we're running as root (k3s needs it for kubelet).
 if [[ $EUID -ne 0 ]]; then
     fail "This script must be run as root (k3s needs kubelet access)."
-    fail "Usage: sudo bash tests/k3s-integration.sh"
+    fail "Usage: sudo bash k8s-test/k3s-integration.sh"
     exit 1
 fi
 
