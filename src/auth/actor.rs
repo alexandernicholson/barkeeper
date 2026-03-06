@@ -6,12 +6,21 @@
 
 use std::collections::HashMap;
 
+use jsonwebtoken::{encode, decode, Header, Algorithm, Validation, EncodingKey, DecodingKey};
+use serde::{Serialize, Deserialize};
 use tokio::sync::{mpsc, oneshot};
 
 use rebar_core::runtime::Runtime;
 
 use crate::actors::commands::AuthCmd;
 use crate::auth::manager::{Permission, Role, User};
+
+#[derive(Debug, Serialize, Deserialize)]
+struct Claims {
+    sub: String,
+    exp: u64,
+    iat: u64,
+}
 
 /// Spawn the authentication actor on the Rebar runtime.
 ///
@@ -25,7 +34,12 @@ pub async fn spawn_auth_actor(runtime: &Runtime) -> AuthActorHandle {
         let mut enabled: bool = false;
         let mut users: HashMap<String, User> = HashMap::new();
         let mut roles: HashMap<String, Role> = HashMap::new();
-        let mut tokens: HashMap<String, String> = HashMap::new();
+        let jwt_secret: Vec<u8> = {
+            use rand::Rng;
+            let mut key = vec![0u8; 32];
+            rand::thread_rng().fill(&mut key[..]);
+            key
+        };
 
         loop {
             tokio::select! {
@@ -43,38 +57,36 @@ pub async fn spawn_auth_actor(runtime: &Runtime) -> AuthActorHandle {
                             let _ = reply.send(enabled);
                         }
                         AuthCmd::Authenticate { name, password, reply } => {
-                            // Look up the user and clone needed data before
-                            // spawning the blocking bcrypt verify.
                             let user_data = users.get(&name).map(|u| {
                                 (u.password_hash.clone(), name.clone())
                             });
 
                             match user_data {
                                 Some((password_hash, user_name)) => {
-                                    // bcrypt::verify is CPU-intensive — run it
-                                    // on the blocking thread pool.
+                                    let secret = jwt_secret.clone();
                                     let result = tokio::task::spawn_blocking(move || {
                                         if bcrypt::verify(&password, &password_hash).unwrap_or(false) {
-                                            let token = format!(
-                                                "{}.{}",
-                                                user_name,
-                                                uuid::Uuid::new_v4().to_string().replace('-', "")
-                                            );
-                                            Some((token, user_name))
+                                            let now = std::time::SystemTime::now()
+                                                .duration_since(std::time::UNIX_EPOCH)
+                                                .unwrap()
+                                                .as_secs();
+                                            let claims = Claims {
+                                                sub: user_name.clone(),
+                                                iat: now,
+                                                exp: now + 300,
+                                            };
+                                            let token = encode(
+                                                &Header::default(),
+                                                &claims,
+                                                &EncodingKey::from_secret(&secret),
+                                            ).expect("JWT encoding should not fail");
+                                            Some(token)
                                         } else {
                                             None
                                         }
                                     }).await.expect("bcrypt verify task panicked");
 
-                                    match result {
-                                        Some((token, user_name)) => {
-                                            tokens.insert(token.clone(), user_name);
-                                            let _ = reply.send(Some(token));
-                                        }
-                                        None => {
-                                            let _ = reply.send(None);
-                                        }
-                                    }
+                                    let _ = reply.send(result);
                                 }
                                 None => {
                                     let _ = reply.send(None);
@@ -82,7 +94,21 @@ pub async fn spawn_auth_actor(runtime: &Runtime) -> AuthActorHandle {
                             }
                         }
                         AuthCmd::ValidateToken { token, reply } => {
-                            let _ = reply.send(tokens.get(&token).cloned());
+                            let mut validation = Validation::new(Algorithm::HS256);
+                            validation.validate_exp = true;
+                            match decode::<Claims>(&token, &DecodingKey::from_secret(&jwt_secret), &validation) {
+                                Ok(token_data) => {
+                                    let username = token_data.claims.sub;
+                                    if users.contains_key(&username) {
+                                        let _ = reply.send(Some(username));
+                                    } else {
+                                        let _ = reply.send(None);
+                                    }
+                                }
+                                Err(_) => {
+                                    let _ = reply.send(None);
+                                }
+                            }
                         }
                         AuthCmd::UserAdd { name, password, reply } => {
                             if users.contains_key(&name) {

@@ -96,7 +96,10 @@ async fn test_authenticate_valid() {
     handle.user_add("root".into(), "secret".into()).await;
     let token = handle.authenticate("root", "secret").await;
     assert!(token.is_some());
-    assert!(token.unwrap().starts_with("root."));
+    // JWT tokens have 3 dot-separated parts: header.payload.signature
+    let t = token.unwrap();
+    let parts: Vec<&str> = t.split('.').collect();
+    assert_eq!(parts.len(), 3, "token should be a JWT with 3 parts, got: {}", t);
 }
 
 #[tokio::test]
@@ -370,4 +373,21 @@ async fn test_handle_is_clone_and_send() {
     handle.user_add("alice".into(), "p".into()).await;
     let users = handle2.user_list().await;
     assert_eq!(users.len(), 1);
+}
+
+// ---------------------------------------------------------------------------
+// JWT token format
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_authenticate_returns_jwt() {
+    let handle = make_handle().await;
+    handle.user_add("alice".into(), "password123".into()).await;
+
+    let token = handle.authenticate("alice", "password123").await
+        .expect("authenticate should succeed");
+
+    // JWT tokens have 3 dot-separated parts: header.payload.signature
+    let parts: Vec<&str> = token.split('.').collect();
+    assert_eq!(parts.len(), 3, "token should be a JWT with 3 parts, got: {}", token);
 }

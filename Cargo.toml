@@ -52,6 +52,7 @@ async-stream = "0.3"
 
 # Auth
 bcrypt = "0.15"
+jsonwebtoken = "9"
 
 # TLS
 rcgen = "0.13"
