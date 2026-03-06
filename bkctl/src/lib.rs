@@ -1,6 +1,7 @@
 pub mod client;
 pub mod app;
 pub mod ui;
+pub mod event;
 
 pub mod proto {
     pub mod mvccpb {
