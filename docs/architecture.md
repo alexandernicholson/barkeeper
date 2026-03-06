@@ -245,6 +245,121 @@ After compact(3):
 
 ---
 
+## Write-Ahead Log (WAL) and Recovery
+
+Barkeeper persists all state to three files in the data directory. On restart,
+the KV store is reconstructed by loading the snapshot and replaying any WAL
+entries committed after it was taken.
+
+### On-Disk Files
+
+| File | Format | Purpose |
+|------|--------|---------|
+| `raft.wal` | Append-only frame log | Durable Raft log entries |
+| `raft.meta` | Bincode blob (atomic rename) | Raft hard state (term, votedFor) |
+| `kv.snapshot` | Bincode blob (atomic rename) | Materialized KV store state |
+
+### WAL Frame Format
+
+Each entry in `raft.wal` is a length-prefixed frame:
+
+```
+┌──────────────────┬─────────────────────────────────────┐
+│  payload_len     │  payload (bincode LogEntry)          │
+│  4 bytes (LE)    │  payload_len bytes                   │
+├──────────────────┼─────────────────────────────────────┤
+│  payload_len     │  payload (bincode LogEntry)          │
+│  4 bytes (LE)    │  payload_len bytes                   │
+├──────────────────┼─────────────────────────────────────┤
+│  ...             │  ...                                 │
+└──────────────────┴─────────────────────────────────────┘
+```
+
+- **4-byte little-endian length prefix** followed by bincode-serialized `LogEntry`
+- Entries are appended sequentially; `fsync` is called after every write batch
+- On open, the WAL is scanned front-to-back to rebuild an in-memory index
+  (`Vec<WalEntry>`) mapping each Raft index to its `(file_offset, len, term)`
+- Partial or corrupt frames at the tail are truncated on open (crash recovery)
+
+### In-Memory WAL Index
+
+```rust
+WalEntry {
+    offset: u64,   // byte offset in raft.wal (start of length prefix)
+    len: u32,      // payload length (excludes 4-byte header)
+    index: u64,    // Raft log index
+    term: u64,     // Raft term
+}
+```
+
+Reads use the in-memory index for O(1) lookup by Raft index, then seek + read
+from the file. Range reads batch multiple seeks.
+
+### Startup and Recovery Flow
+
+```mermaid
+graph TD
+    Start["Server start"]
+    Start --> OpenKV["KvStore::open(data_dir)<br>loads kv.snapshot if present"]
+    OpenKV --> OpenWAL["LogStore::open(data_dir)<br>scans raft.wal, builds index"]
+    OpenWAL --> Compare{"last_applied_raft_index<br>< last_log_index?"}
+    Compare -->|"No"| Done["Skip replay<br>start Raft + services"]
+    Compare -->|"Yes"| Replay["get_range(last_applied+1, last_log_index)"]
+    Replay --> Deser["Deserialize KvCommand from each<br>LogEntryData::Command entry<br>(bincode, JSON fallback)"]
+    Deser --> Apply["batch_apply_with_index(commands, last_log_index)<br>single write-lock, atomic"]
+    Apply --> Snap["kv_store.snapshot()<br>persist replayed state"]
+    Snap --> Done
+```
+
+**Key points:**
+
+- `last_applied_raft_index` is stored in the snapshot's meta table and tracks
+  which WAL entries have already been materialized into the KV store
+- `batch_apply_with_index` applies all recovered commands under a single write
+  lock and updates `raft_applied_index` atomically
+- After replay, a new snapshot is saved so future restarts skip already-replayed
+  entries
+- The state machine also checks `last_applied_raft_index` at runtime to skip
+  entries Raft re-delivers after recovery
+
+### Snapshot Format
+
+The `kv.snapshot` file contains a bincode-serialized `Snapshot` struct:
+
+```rust
+Snapshot {
+    kv: BTreeMap<Vec<u8>, InternalKeyValue>,   // MVCC compound key → value
+    revisions: BTreeMap<u64, Vec<RevisionEntry>>, // revision → changed keys
+    latest: HashMap<Vec<u8>, u64>,             // user key → latest revision
+    revision: i64,                             // global revision counter
+    raft_applied_index: u64,                   // last WAL entry applied
+}
+```
+
+Snapshots are written atomically: serialize to `kv.snapshot.tmp`, then rename
+to `kv.snapshot`. Hard state (`raft.meta`) uses the same temp-then-rename
+pattern.
+
+### WAL Truncation
+
+When a follower's log diverges from the leader, entries after the conflict
+point are removed:
+
+1. Find the file offset of the first entry to discard
+2. `file.set_len(offset)` to truncate the WAL file
+3. Truncate the in-memory `Vec<WalEntry>` to match
+
+### Durability Guarantees
+
+| Operation | Durability |
+|-----------|-----------|
+| Log append | `fsync` after each batch |
+| Hard state | Atomic rename (crash-safe) |
+| KV snapshot | Atomic rename (crash-safe) |
+| WAL open | Truncates partial trailing frame |
+
+---
+
 ## Raft Consensus
 
 ### Event-Action Pure State Machine
@@ -308,10 +423,9 @@ RaftState {
 
 ### Log Store
 
-The durable Raft log uses an append-only WAL (`raft.wal`):
-
-- `raft_log`: `u64 (index) -> JSON LogEntry`
-- `raft_meta`: `"hard_state" -> JSON PersistentState`
+The durable Raft log uses an append-only WAL (`raft.wal`) with length-prefixed
+bincode frames. See [WAL and Recovery](#write-ahead-log-wal-and-recovery) for
+the file format, frame layout, recovery flow, and durability guarantees.
 
 Operations: `append`, `get`, `get_range`, `truncate_after`, `last_index`,
 `last_term`, `save_hard_state`, `load_hard_state`.
